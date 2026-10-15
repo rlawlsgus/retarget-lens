@@ -1,0 +1,24 @@
+# motion data and generated outputs stay out of git
+data/
+reports/
+*.usd
+*.usda
+*.usdc
+!assets/**/*.usd*
+
+# body-model files are licence-gated (SMPL / SMPL-X / MANO)
+models/
+
+# project documents kept next to the code (internal; the kick-off deck is also
+# over GitHub's 100 MB file limit)
+/*.pptx
+/*.pdf
+
+# machine-specific Claude Code settings (launch.json has local paths)
+.claude/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/
+_isaac_sim
