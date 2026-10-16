@@ -19,8 +19,9 @@ FAKE_REPLAY = textwrap.dedent("""
     import argparse, json, os, sys, time
     import numpy as np
     ap = argparse.ArgumentParser()
-    for k in ("--robot-motion", "--check-out", "--assist"):
+    for k in ("--robot-motion", "--check-out", "--assist", "--video", "--human"):
         ap.add_argument(k)
+    ap.add_argument("--physics", action="store_true")
     a, _ = ap.parse_known_args()
     mode = os.environ.get("FAKE_REPLAY_MODE", "ok")
     print("Starting kit application", flush=True)
@@ -31,6 +32,11 @@ FAKE_REPLAY = textwrap.dedent("""
         print(f"[isaac_replay] progress simulate {i + 1}/10", flush=True)
         time.sleep(0.5 if mode == "slow" else 0.0)
     print("[isaac_replay] simulated 10 frames in 0.1s", flush=True)
+    if a.video:
+        os.makedirs(os.path.dirname(a.video), exist_ok=True)
+        with open(a.video, "w") as f:
+            json.dump({"human": a.human, "physics": a.physics, "assist": a.assist}, f)
+        sys.exit(0)
     name = os.path.splitext(os.path.basename(a.robot_motion))[0]
     base = os.path.join(a.check_out, name + "_sim")
     np.savez(base + ".npz", **dict(np.load(a.robot_motion)))
@@ -77,8 +83,32 @@ def test_run_progress_and_cache(tmp_path, fake):
     again = _runner(tmp_path, fake)  # a new session finds it on disk
     hit = []
     j2 = again.request(m, 1.0, on_done=hit.append)
-    assert j2.state == "done" and j2.result == job.result and hit == [j2] and j2.stage == "완료 (캐시)"
+    assert j2.state == "done" and j2.result == job.result and hit == [j2] and j2.stage == "완료 (이미 있음)"
     again.shutdown()
+
+
+def test_video_jobs_share_the_queue(tmp_path, fake):
+    import json
+
+    m = g1_motion(seconds=0.5)
+    human = tmp_path / "walk.bvh"
+    human.write_text("HIERARCHY", encoding="utf-8")
+    runner = _runner(tmp_path, fake)
+    phys = runner.request(m, 1.0)
+    kin = runner.request_video(m, str(tmp_path / "videos" / "walk_kin.mp4"), human=str(human))
+    sim = runner.request_video(m, str(tmp_path / "videos" / "walk_phys.mp4"), human=str(human), physics=True, assist=0.0)
+    assert kin.key != sim.key and kin.kind == "video"
+    for job in (phys, kin, sim):
+        _wait(job)
+    assert phys.state == kin.state == sim.state == "done"
+    assert phys.finished <= kin.started and kin.finished <= sim.started  # one Isaac at a time, in order
+    with open(kin.result) as f:
+        assert json.load(f) == {"human": str(human), "physics": False, "assist": None}
+    with open(sim.result) as f:
+        assert json.load(f) == {"human": str(human), "physics": True, "assist": "0"}
+    again = runner.request_video(m, str(tmp_path / "videos" / "walk_kin.mp4"), human=str(human))
+    assert again is kin  # the same video is not rendered twice
+    runner.shutdown()
 
 
 def test_key_follows_motion_harness_and_config(tmp_path, fake):

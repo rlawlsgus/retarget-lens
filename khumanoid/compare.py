@@ -29,6 +29,53 @@ HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
 PIPELINE_VERSION = 3  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config
+MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",)
+# folders the viewer lists motions from (relative to ROOT); uploads land in data/uploads
+LIBRARY_ROOTS = ("data/raw", "data/samples", "data/retargeted", "data/uploads", "reports")
+UPLOADS = os.path.join(ROOT, "data", "uploads")
+
+
+def is_motion_file(path: str) -> bool:
+    """A file the viewer can open: motion extensions, minus AMASS body-shape files
+    (*_stagei.npz), anything under a cache folder, and report tables (only the
+    physics results *_sim.npz count under reports/)."""
+    rel = os.path.relpath(os.path.abspath(path), ROOT).replace(os.sep, "/").lower()
+    name = os.path.basename(rel)
+    if not name.endswith(MOTION_EXT) or name.endswith("_stagei.npz") or "/cache/" in f"/{rel}":
+        return False
+    return not rel.startswith("reports/") or name.endswith("_sim.npz")
+
+
+def library_files(roots=LIBRARY_ROOTS) -> dict[str, list[str]]:
+    """{folder (relative to ROOT, '/'-separated): sorted motion file paths} for the viewer's picker."""
+    out: dict[str, list[str]] = {}
+    for root in roots:
+        top = os.path.normpath(root if os.path.isabs(root) else os.path.join(ROOT, root))
+        for d, dirs, files in os.walk(top):
+            dirs[:] = sorted(x for x in dirs if x.lower() != "cache")
+            paths = [os.path.join(d, f) for f in sorted(files) if is_motion_file(os.path.join(d, f))]
+            if paths:
+                rel = os.path.relpath(d, ROOT).replace(os.sep, "/")
+                out[rel if not rel.startswith("..") else d] = paths
+    return out
+
+
+def save_upload(name: str, content: bytes, folder: str = UPLOADS) -> str:
+    """Store a file picked in the browser under its own name (name_2, ... when a different
+    file already has it; the same content reuses the earlier copy)."""
+    os.makedirs(folder, exist_ok=True)
+    stem, ext = os.path.splitext(os.path.basename(name) or "upload")
+    stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in stem) or "upload"
+    for n in range(1, 1000):
+        path = os.path.join(folder, f"{stem}{'' if n == 1 else f'_{n}'}{ext.lower()}")
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                f.write(content)
+            return path
+        with open(path, "rb") as f:
+            if f.read() == content:
+                return path
+    raise RuntimeError(f"too many uploads named {name}")
 
 
 @dataclass

@@ -1,18 +1,20 @@
-"""Background PhysX runs of robot motions, cached by content.
+"""Background Isaac Sim runs of robot motions: PhysX simulation and videos.
 
-The physics is tools/isaac_replay.py --physics run as its own process. Isaac Sim is
-a separate install (tens of GB, an NVIDIA RTX GPU, its own EULA) that the viewer
-(and later the packaged program) calls rather than bundles, so this module only
-finds it, runs one clip at a time in a worker thread, reports progress and keeps
+Both are tools/isaac_replay.py run as its own process. Isaac Sim is a separate
+install (tens of GB, an NVIDIA RTX GPU, its own EULA) that the viewer (and later the
+packaged program) calls rather than bundles, so this module only finds it, runs one
+job at a time in a worker thread (one Isaac on the GPU), reports progress and keeps
 the results:
 
     runner = PhysicsRunner(cache_dir)
-    job = runner.request(motion, assist=1.0, on_done=lambda job: ...)
+    job = runner.request(motion, assist=1.0, on_done=lambda job: ...)     # --physics
+    job = runner.request_video(motion, "videos/02_01.mp4", human="02_01.bvh")  # --video
     job.state, job.stage, job.progress   # "running", "시뮬레이션", 0.4
-    job.result                           # <cache>/<clip>_<key>_a1/<clip>_sim.npz once done
+    job.result                           # the simulated npz / the video, once done
 
-Results are keyed by the motion's arrays, the physics config, the harness scale and
-CACHE_VERSION, so the same clip comes back instantly next time.
+Physics results are keyed by the motion's arrays, the physics config, the harness
+scale and CACHE_VERSION, so the same clip comes back instantly next time; a video
+that already exists is returned as is.
 
 Finding Isaac Sim (first match):
   1. the KHUMANOID_ISAAC_PYTHON environment variable (python.bat / python.sh of a
@@ -52,7 +54,8 @@ ISAAC_ENV = "KHUMANOID_ISAAC_PYTHON"
 ISAAC_DIRS = [r"C:\isaacsim"] if os.name == "nt" else [os.path.expanduser("~/isaacsim")]
 
 # stage name in the "[isaac_replay] progress <stage> i/n" lines -> (label, start, end of the overall bar)
-STAGES = {"reference": ("기준 자세 기록", 0.25, 0.35), "simulate": ("시뮬레이션", 0.35, 0.95)}
+STAGES = {"reference": ("기준 자세 기록", 0.25, 0.35), "simulate": ("시뮬레이션", 0.35, 0.95),
+          "render": ("렌더링", 0.25, 0.95), "replay": ("재생", 0.25, 0.95)}
 STARTING = ("Isaac 시작 중", 0.0, 0.25)
 PROGRESS_RE = re.compile(r"\[isaac_replay\] progress (\w+) (\d+)/(\d+)")
 
@@ -83,6 +86,13 @@ def motion_key(motion: RobotMotion, assist: float, config_text: str = "") -> str
     return h.hexdigest()[:12]
 
 
+def _file_id(path: str | None) -> list:
+    if not path:
+        return []
+    st = os.stat(path)
+    return [os.path.abspath(path), st.st_size, int(st.st_mtime)]
+
+
 def _safe(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "clip"
 
@@ -92,12 +102,15 @@ class PhysicsJob:
     key: str
     name: str
     assist: float
-    out_dir: str
+    out_dir: str  # working folder: the input npz, run.log, the check / sim json
+    kind: str = "physics"  # physics | video
+    args: list = field(default_factory=list)  # isaac_replay arguments
+    outputs: list = field(default_factory=list)  # first existing one is the result
     state: str = "queued"  # queued | running | done | failed | cancelled
     stage: str = "대기"
     progress: float = 0.0  # 0..1 over the whole run (start-up included)
     message: str = ""
-    result: str | None = None  # <out_dir>/<name>_sim.npz
+    result: str | None = None
     started: float = 0.0
     finished: float = 0.0
     log_tail: collections.deque = field(default_factory=lambda: collections.deque(maxlen=40))
@@ -111,6 +124,13 @@ class PhysicsJob:
     @property
     def input_path(self) -> str:
         return os.path.join(self.out_dir, f"{self.name}.npz")
+
+    def found(self) -> str | None:
+        """The finished output, if it is there (a physics result also needs its json)."""
+        for p in self.outputs:
+            if os.path.isfile(p) and (self.kind != "physics" or os.path.isfile(p[:-4] + ".json")):
+                return p
+        return None
 
 
 class PhysicsRunner:
@@ -129,57 +149,62 @@ class PhysicsRunner:
         self._worker.start()
 
     # ------------------------------------------------------------ public
-    def key(self, motion: RobotMotion, assist: float) -> str:
+    def _config_text(self) -> str:
         try:
             with open(self.physics_config, encoding="utf-8") as f:
-                cfg = f.read()
+                return f.read()
         except OSError:
-            cfg = ""
-        return motion_key(motion, assist, cfg)
+            return ""
+
+    def key(self, motion: RobotMotion, assist: float) -> str:
+        return motion_key(motion, assist, self._config_text())
 
     def out_dir(self, motion: RobotMotion, assist: float) -> str:
         return os.path.join(self.cache_dir, f"{_safe(motion.name)}_{self.key(motion, assist)}_a{assist:g}")
 
     def cached(self, motion: RobotMotion, assist: float) -> str | None:
         """Path of the simulated motion if this run was done before."""
-        d = self.out_dir(motion, assist)
-        npz = os.path.join(d, f"{_safe(motion.name)}_sim.npz")
+        npz = os.path.join(self.out_dir(motion, assist), f"{_safe(motion.name)}_sim.npz")
         return npz if os.path.isfile(npz) and os.path.isfile(npz[:-4] + ".json") else None
 
     def request(self, motion: RobotMotion, assist: float = 1.0,
                 on_done: Callable[[PhysicsJob], None] | None = None) -> PhysicsJob:
-        """The job for this motion and harness scale: finished at once when cached, else
-        queued (or the one already queued / running). on_done(job) runs on the worker
+        """The physics job for this motion and harness scale: finished at once when cached,
+        else queued (or the one already queued / running). on_done(job) runs on the worker
         thread when the job ends (done, failed or cancelled); at once when cached."""
-        key = self.key(motion, assist)
-        with self._lock:
-            job = self.jobs.get(key)
-            if job is not None and (job.active or job.state == "done"):
-                if job.active:
-                    if on_done:
-                        job.callbacks.append(on_done)
-                    return job
-                if job.result and os.path.isfile(job.result):
-                    if on_done:
-                        on_done(job)
-                    return job
-            name = _safe(motion.name)
-            job = PhysicsJob(key=key, name=name, assist=float(assist), out_dir=self.out_dir(motion, assist))
-            self.jobs[key] = job
-            hit = self.cached(motion, assist)
-            if hit:
-                job.state, job.stage, job.progress, job.result = "done", "완료 (캐시)", 1.0, hit
-                if on_done:
-                    on_done(job)
-                return job
-            os.makedirs(job.out_dir, exist_ok=True)
-            motion.save_npz(job.input_path)
-            if on_done:
-                job.callbacks.append(on_done)
-            self._queue.append(job)
-            self._wake.set()
-            self.log(f"physics queued: {name} (harness x{assist:g})")
-            return job
+        name = _safe(motion.name)
+        out_dir = self.out_dir(motion, assist)
+        job = PhysicsJob(key=self.key(motion, assist), name=name, assist=float(assist), out_dir=out_dir,
+                         outputs=[os.path.join(out_dir, f"{name}_sim.npz")])
+        job.args = ["--robot-motion", job.input_path, "--physics", "--assist", f"{assist:g}",
+                    "--physics-config", self.physics_config, "--check-out", out_dir, "--snapshots", "0"]
+        return self._submit(job, motion, on_done)
+
+    def request_video(self, motion: RobotMotion, video: str, human: str | None = None, physics: bool = False,
+                      assist: float = 1.0, smpl_model_dir: str | None = None,
+                      on_done: Callable[[PhysicsJob], None] | None = None) -> PhysicsJob:
+        """Record the motion (with the human file next to it, if given) like
+        `isaac_replay.py --human ... --robot-motion ... --video` (--physics: as simulated).
+        video: the .mp4 to write (a .gif next to it when ffmpeg is missing); returned as is
+        when it already exists."""
+        cfg = self._config_text() if physics else ""
+        key = hashlib.sha1(json.dumps([motion_key(motion, assist if physics else -1.0, cfg), _file_id(human),
+                                       "video", physics]).encode()).hexdigest()[:12]
+        name = _safe(motion.name)
+        out_dir = os.path.join(self.cache_dir, f"video_{name}_{key}")
+        base = os.path.splitext(os.path.abspath(video))[0]
+        job = PhysicsJob(key=key, name=name, assist=float(assist), out_dir=out_dir, kind="video",
+                         outputs=[base + ".mp4", base + ".gif"])
+        # a huge stride: replay only the frames the video needs (a 120 fps human otherwise steps 4x as many)
+        job.args = ["--robot-motion", job.input_path, "--video", base + ".mp4", "--check-out", out_dir,
+                    "--snapshots", "0", "--stride", "1000000"]
+        if human:
+            job.args += ["--human", os.path.abspath(human)]
+            if smpl_model_dir:
+                job.args += ["--smpl-model-dir", smpl_model_dir]
+        if physics:
+            job.args += ["--physics", "--assist", f"{assist:g}", "--physics-config", self.physics_config]
+        return self._submit(job, motion, on_done)
 
     def cancel(self, job: PhysicsJob) -> None:
         with self._lock:
@@ -206,6 +231,33 @@ class PhysicsRunner:
         self._wake.set()
 
     # ------------------------------------------------------------ worker
+    def _submit(self, job: PhysicsJob, motion: RobotMotion, on_done) -> PhysicsJob:
+        with self._lock:
+            old = self.jobs.get(job.key)
+            if old is not None and old.active:
+                if on_done:
+                    old.callbacks.append(on_done)
+                return old
+            if old is not None and old.state == "done" and old.result and os.path.isfile(old.result):
+                if on_done:
+                    on_done(old)
+                return old
+            self.jobs[job.key] = job
+            hit = job.found()
+            if hit:
+                job.state, job.stage, job.progress, job.result = "done", "완료 (이미 있음)", 1.0, hit
+                if on_done:
+                    on_done(job)
+                return job
+            os.makedirs(job.out_dir, exist_ok=True)
+            motion.save_npz(job.input_path)
+            if on_done:
+                job.callbacks.append(on_done)
+            self._queue.append(job)
+            self._wake.set()
+            self.log(f"{job.kind} queued: {job.name}" + (f" (harness x{job.assist:g})" if job.kind == "physics" else ""))
+            return job
+
     def _loop(self) -> None:
         while not self._closed:
             self._wake.wait(0.5)
@@ -221,9 +273,7 @@ class PhysicsRunner:
                     self._finish(job, "failed", f"{type(e).__name__}: {e}")
 
     def _run(self, job: PhysicsJob) -> None:
-        cmd = (self.command or isaac_command()) + [
-            self.script, "--robot-motion", job.input_path, "--physics", "--assist", f"{job.assist:g}",
-            "--physics-config", self.physics_config, "--check-out", job.out_dir, "--snapshots", "0", "--progress"]
+        cmd = (self.command or isaac_command()) + [self.script] + job.args + ["--progress"]
         env = dict(os.environ, PYTHONUNBUFFERED="1")
         if self.accept_eula:
             env["OMNI_KIT_ACCEPT_EULA"] = "YES"
@@ -235,7 +285,7 @@ class PhysicsRunner:
             job.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                         env=env, cwd=ROOT, text=True, encoding="utf-8", errors="replace",
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        self.log(f"physics running: {job.name} (harness x{job.assist:g})")
+        self.log(f"{job.kind} running: {job.name}")
         with open(os.path.join(job.out_dir, "run.log"), "w", encoding="utf-8") as logf:
             for line in job.proc.stdout:
                 logf.write(line)
@@ -247,9 +297,9 @@ class PhysicsRunner:
         if job.state == "cancelled":
             self._finish(job, "cancelled", "취소됨")
             return
-        npz = os.path.join(job.out_dir, f"{job.name}_sim.npz")
-        if code == 0 and os.path.isfile(npz) and os.path.isfile(npz[:-4] + ".json"):
-            job.result = npz
+        hit = job.found() if code == 0 else None
+        if hit:
+            job.result = hit
             self._finish(job, "done", "완료")
         else:
             self._finish(job, "failed", _failure(code, job.log_tail))
@@ -263,8 +313,8 @@ class PhysicsRunner:
         if m and m.group(1) in STAGES:
             label, a, b = STAGES[m.group(1)]
             job.stage, job.progress = label, a + (b - a) * int(m.group(2)) / max(int(m.group(3)), 1)
-        elif "simulated " in line:
-            job.stage, job.progress = "결과 저장", 0.96
+        elif "simulated " in line or "replayed " in line:
+            job.stage, job.progress = ("영상 인코딩" if job.kind == "video" else "결과 저장"), 0.96
 
     def _finish(self, job: PhysicsJob, state: str, message: str) -> None:
         with self._lock:
@@ -274,12 +324,12 @@ class PhysicsRunner:
             else:
                 job.stage = {"failed": "실패", "cancelled": "취소됨"}[state]
             callbacks, job.callbacks = job.callbacks, []
-        self.log(f"physics {state}: {job.name} {message if state != 'done' else ''}".rstrip())
+        self.log(f"{job.kind} {state}: {job.name} {message if state != 'done' else job.result}".rstrip())
         for cb in callbacks:
             try:
                 cb(job)
             except Exception as e:
-                self.log(f"physics callback failed: {type(e).__name__}: {e}")
+                self.log(f"{job.kind} callback failed: {type(e).__name__}: {e}")
 
 
 def _failure(code: int, tail) -> str:

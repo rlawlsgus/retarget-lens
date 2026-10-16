@@ -809,6 +809,7 @@ def run_check(clock: Clock, show, focus, robot, human_qc, robot_qc, bad: np.ndar
     t0 = time.perf_counter()
     frames = sorted(set(range(f0, f1, max(args.stride, 1))) | snap_frames | video_frames)
     for k, f in enumerate(frames):
+        progress("render" if args.video else "replay", k, len(frames))
         show(f)
         simulation_app.update()
         if robot is not None and robot.feet is not None:

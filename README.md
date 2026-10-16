@@ -241,11 +241,24 @@ python tools\compare_viewer.py data\raw\lafan1_bvh\dance1_subject1.bvh data\raw\
   - 켜면 각 로봇을 관절각대로 그리지 않고, Isaac Sim PhysX가 시뮬레이션한 결과로 바꿔 그립니다(중력, 마찰 바닥, 관절 토크 한계, 골반 보조 힘). 끄면 원래 기구학 재생으로 돌아옵니다.
   - 결과가 없는 클립은 Isaac을 창 없이 백그라운드로 돌려 만듭니다. 한 번에 한 클립씩 돌고, 짧은 클립은 1분 남짓(대부분 Isaac 시작 시간), 11초 클립은 약 1분 30초입니다. 진행률은 패널과 각 로봇 이름표에 나옵니다.
   - 결과는 모션 내용, `configs/physics.yaml`, 보조 힘 설정으로 키를 만들어 `data/cache/physics/`에 저장합니다. 다음에 켜거나 같은 동작을 다시 열면 바로 나옵니다.
-  - "골반 보조 힘"을 끄면(`--assist 0`) 따로 계산합니다. "물리 계산 취소"는 대기 중이거나 도는 중인 Isaac 프로세스를 멈춥니다.
+  - "골반 보조 힘"을 끄면(`--assist 0`) 따로 계산합니다. "Isaac 작업 취소"는 대기 중이거나 도는 중인 Isaac 프로세스(물리 계산·동영상 녹화)를 멈춥니다.
   - 물리 모드에서는 분석 탭의 그래프·표도 시뮬레이션된 동작으로 잽니다("재생 방식" 행). 넘어진 클립은 이름표에 넘어진 시각과 1차 원인이 원인 시작부터 넘어진 뒤 0.5초까지 나옵니다(예: "넘어짐 2.07s · 발끝 걸림 1.47s부터").
   - Isaac Sim의 EULA(NVIDIA Omniverse License Agreement)에 동의해야 돌아갑니다. 동의한 사용자만 `--isaac-accept-eula`로 실행하세요. 없으면 "EULA에 동의하지 않은 상태" 메시지로 실패합니다.
   - Isaac 위치는 환경변수 `KHUMANOID_ISAAC_PYTHON`(설치 폴더의 `python.bat`), 그다음 지금 파이썬(k-humanoid 환경), 그다음 `C:\isaacsim` 순서로 찾습니다(`khumanoid/physics_runner.py`).
-- **입력:** 사람 모션(BVH, FBX, AMASS SMPL-X npz)은 리타게팅해서 불러옵니다(기본 `--smooth 6`, 결과는 `data/cache/retarget/`에 캐시). 로봇 모션(npz, Unitree csv, GMR pkl)은 그대로 불러옵니다. Isaac 물리 결과(`*_sim.npz`)는 옆의 json에서 물리 지표를 읽어 함께 보여 줍니다. 실행 중에 "모션" 탭에서 파일을 추가하거나 제거할 수 있습니다.
+- **입력:** 사람 모션(BVH, FBX, AMASS SMPL-X npz)은 리타게팅해서 불러옵니다(기본 `--smooth 6`, 결과는 `data/cache/retarget/`에 캐시). 로봇 모션(npz, Unitree csv, GMR pkl)은 그대로 불러옵니다. Isaac 물리 결과(`*_sim.npz`)는 옆의 json에서 물리 지표를 읽어 함께 보여 줍니다.
+  - 물리 결과 파일은 로봇 관절각만 있어서 사람 스켈레톤이 없고, 이미 물리 결과라 물리 모드를 켜고 꺼도 그대로입니다. 사람과 물리 결과를 나란히 보려면 원본 사람 모션을 추가하고 물리 모드를 켭니다.
+- **모션 고르기** ("모션" 탭): 경로를 입력하지 않고 클릭으로 고릅니다.
+  - **폴더 → 파일:** `data/raw`, `data/samples`, `data/retargeted`, `data/uploads`, `reports`(물리 결과 `*_sim.npz`만) 아래의 모션 파일을 폴더별로 보여 줍니다. AMASS 체형 파일(`*_stagei.npz`)과 캐시 폴더는 뺍니다. 다른 폴더는 `--library DIR`로 추가합니다.
+  - **이름 검색:** 이름 일부(예: `143_11`)를 넣으면 모든 폴더에서 찾습니다. 같은 촬영의 BVH, FBX, SMPL-X, 리타겟, 물리 결과가 한 번에 나옵니다. 그 번호로 시작하는 파일이 먼저 나옵니다(`05_02`가 `105_02`보다 앞).
+  - **어떤 번호가 무슨 동작인지**는 [docs/cmu_motion_labels.md](docs/cmu_motion_labels.md)에 있습니다. CMU 전체 2,548개 시도의 설명, 길이, 이 PC에 있는 형식과 동작 종류별 대표 시도를 담았고, `python tools\cmu_motion_index.py`로 다시 만듭니다.
+  - **파일 열기 (내 PC):** 브라우저의 파일 선택 창으로 PC의 파일을 엽니다. 고른 파일은 `data/uploads/`에 복사해 엽니다. 같은 이름의 다른 파일이면 `_2`를 붙이고, 같은 파일이면 다시 복사하지 않습니다.
+  - 경로를 직접 넣는 칸은 "경로 직접 입력" 아래에 있습니다. 추가한 모션은 "목록"에서 숨기거나 제거합니다.
+- **동영상 저장** ("모션" 탭의 각 모션 아래 버튼):
+  - `isaac_replay.py --human ... --robot-motion ... --video`와 같은 방식입니다. Isaac Sim에서 사람 스켈레톤(원본이 있으면)과 로봇을 나란히 녹화해 MP4로 저장합니다(960×540, 30 fps, ffmpeg가 없으면 GIF).
+  - 로봇은 뷰어에 보이는 그 동작입니다(리타게팅·평활화·스윙 보정 설정 그대로). 물리 모드가 켜져 있으면 그 보조 힘 설정의 물리 시뮬레이션 결과를 녹화합니다(`--physics`).
+  - 파일은 `reports/videos/viewer/<모션 이름>_kinematic.mp4` 또는 `_physics_x1.mp4`입니다(`--video-dir`로 바꿈). 같은 동작과 설정의 영상이 이미 있으면 다시 만들지 않습니다.
+  - 다 되면 "동영상 내려받기" 버튼이 나타나서 브라우저로 받을 수 있습니다.
+  - 녹화도 물리 계산과 같은 대기열에서 한 번에 하나씩 돕니다. 2.9초 클립이 약 1분 걸렸고, 대부분 Isaac 시작 시간입니다. "Isaac 작업 취소"로 멈춥니다.
 - **3D:** 모션마다 다른 색의 G1을 나란히 또는 겹쳐서 보여 줍니다. 기본으로 각자의 시작 골반을 원점에, 진행 방향을 +x로 맞춥니다(소스마다 월드 좌표가 달라서). 리타게팅한 모션은 원본 사람을 로봇 크기로 줄여 옆에 그립니다(겹치기, 로봇 반투명 선택 가능). 사람은 기본이 막대 인형이고, SMPL-X 입력은 "사람 표시: 몸 메시"(또는 `--body-mesh`)로 몸 표면을 그립니다. 선형 블렌드 스키닝이며 자세별 보정 블렌드셰이프는 넣지 않았습니다. BVH·FBX에는 몸 표면 정보가 없어서 막대로만 그립니다.
 - **재생:** 재생과 일시정지, 시간 슬라이더, ±1 프레임, 속도, 반복을 지원합니다. 모션별 시간 오프셋을 직접 넣거나, 기준 모션에 자동 정렬합니다(다리 관절각 차이가 가장 작은 오프셋).
 - **분석:** 관절각·골반 높이·골반 속도 그래프(현재 시점 앞뒤 구간), 모션별 지표 표(관절 가속도·저크·최대 속도, 발바닥 미끄러짐, 바닥 관통, 발 최저점, 스윙 발 바닥 근접, 기준 대비 다리·전체 RMSE, QC, 물리 결과면 보조 힘·넘어짐·토크 한계 초과·판정), 기준 대비 관절별 RMSE 막대그래프를 보여 줍니다.
@@ -448,13 +461,14 @@ khumanoid/          모션 로더, 공통 데이터 구조, QC (numpy만 사용 
   analysis.py       모션 비교 지표 (시간 정렬, 관절 RMSE, 매끄러움, 발바닥·균형 지표, 바닥 추적)
   stability.py      균형: 전신 CoM, cart-table ZMP, 발 지지다각형, 부호 있는 여유, 정적 불균형
   diagnosis.py      물리 재생에서 넘어짐의 첫 원인 진단
-  physics_runner.py Isaac 물리 실행을 백그라운드 프로세스로 돌리고 결과 캐시 (뷰어 물리 모드, 캐시: data/cache/physics/)
+  physics_runner.py Isaac 작업(물리 실행·동영상 녹화)을 백그라운드 프로세스로 하나씩 돌리고 결과 캐시 (뷰어, 캐시: data/cache/physics/)
   compare.py        여러 포맷을 같은 로봇으로 불러오기 (리타게팅 캐시: data/cache/retarget/)
   io/cmu_frame_rates.json  CMU 시도별 실제 촬영 fps (cgspeed BVH 보정용)
   io/fbx.py, io/blender_fbx_script.py  FBX 읽기(헤드리스 Blender, 캐시: data/cache/fbx/), BVH -> FBX 변환
   io/smpl.py        AMASS SMPL/SMPL-X (관절 FK, BodyMeshRig: 몸 메시 스키닝)
 tools/              retarget.py, compare_viewer.py, compare_report.py, qc_report.py, isaac_replay.py (--physics),
-                    physics_report.py, fetch_samples.py, make_samples.py, cmu_frame_rates.py
+                    physics_report.py, fetch_samples.py, make_samples.py, cmu_frame_rates.py,
+                    cmu_motion_index.py (-> docs/cmu_motion_labels.md: CMU 동작 라벨·대표 시도)
 configs/qc.yaml     QC 임계값, 목표 시간
 configs/physics.yaml  Isaac 물리 재생: PD 게인, 골반 보조 힘, 넘어짐·판정 기준
 requirements.md     환경 재현 요구사항 (버전, 드라이버, 네트워크), environment.lock.txt: conda 잠금 파일
@@ -468,7 +482,7 @@ data/  reports/     (git 제외) data/raw 공개 샘플, data/retargeted 로봇 
 
 최종 결과물은 내려받아 실행하는 프로그램입니다. 아직 패키징은 하지 않았지만, 아래 원칙으로 만들고 있습니다.
 
-- **화면은 비교 뷰어가 바탕입니다.** 로컬 웹 서버 + 브라우저 UI(viser)라서 PyInstaller 같은 도구로 묶을 수 있습니다.
+- **화면은 비교 뷰어가 바탕입니다.** 로컬 웹 서버 + 브라우저 UI(viser)라서 PyInstaller 같은 도구로 묶을 수 있습니다. 파일은 브라우저의 파일 선택 창("파일 열기")과 데이터 폴더 목록으로 고릅니다. 둘 다 경로 입력 없이 쓸 수 있고, 목록에 넣을 폴더는 `--library`로 바꿉니다(`khumanoid/compare.py`의 `library_files`).
 - **Isaac Sim은 묶지 않고 따로 설치한 것을 호출합니다.** 수십 GB이고, NVIDIA RTX GPU와 자체 EULA가 필요하기 때문입니다. 물리 계산은 별도 프로세스로 돌고(`khumanoid/physics_runner.py`), 그 위치는 설정으로 바꿀 수 있습니다. 묶인 실행파일 안에서는 자기 자신(`sys.executable`)을 Isaac 파이썬으로 쓰지 않습니다.
 - **EULA 동의는 사용자가 직접 합니다.** 지금은 `--isaac-accept-eula` 옵션이고, 프로그램에서는 설정 화면의 동의 절차로 바꿀 자리입니다.
 - **남은 일:**

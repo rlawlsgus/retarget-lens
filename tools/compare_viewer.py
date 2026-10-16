@@ -29,9 +29,11 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import re
 import sys
 import threading
 import time
+from dataclasses import replace
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, ROOT)
@@ -43,7 +45,8 @@ import yourdfpy  # noqa: E402
 from viser.extras import ViserUrdf  # noqa: E402
 
 from khumanoid import analysis  # noqa: E402
-from khumanoid.compare import Item, compute_metrics, load_item  # noqa: E402
+from khumanoid.compare import (LIBRARY_ROOTS, MOTION_EXT, Item, compute_metrics, library_files,  # noqa: E402
+                               load_item, save_upload)
 from khumanoid.diagnosis import CAUSE_KO  # noqa: E402
 from khumanoid.io import urdf_joint_limits  # noqa: E402
 from khumanoid.physics_runner import PHYSICS_CONFIG, PhysicsJob, PhysicsRunner  # noqa: E402
@@ -58,6 +61,12 @@ PALETTE = [(230, 90, 50), (50, 125, 215), (60, 165, 90), (150, 90, 190), (215, 1
 
 def log(msg: str) -> None:
     print(f"[compare_viewer] {msg}", flush=True)
+
+
+def _rel(path: str) -> str:
+    """Path relative to the project when inside it."""
+    rel = os.path.relpath(os.path.abspath(path), ROOT)
+    return path if rel.startswith("..") else rel
 
 
 def hexcolor(c) -> str:
@@ -126,13 +135,14 @@ class Viewer:
                     hint="켜면 각 로봇 동작을 관절각대로 그리지 않고, Isaac Sim PhysX(중력·바닥 접촉·관절 토크 한계)가 "
                          "시뮬레이션한 결과로 바꿔 그립니다. 결과가 없는 클립은 Isaac을 백그라운드로 돌려 만듭니다"
                          "(짧은 클립 약 1분, data/cache/physics에 저장)")
-                self.phys_btn.on_click(lambda _: self.set_physics(not self.physics_on))
+                self.phys_btn.on_click(lambda e: self.set_physics(
+                    not self.physics_on, f"button, client {getattr(e.client, 'client_id', '?')}"))
                 self.phys_assist = gui.add_dropdown(
                     "골반 보조 힘", tuple(ASSIST_OPTIONS), initial_value="켬 (기본)",
                     hint="균형 제어기 대신 골반을 원래 위치·자세로 당기는 가상 하네스입니다. 끄면 균형 피드백이 없어 "
                          "걷기도 대부분 1–2초 안에 넘어집니다")
                 self.phys_assist.on_update(lambda _: self._physics_changed())
-                gui.add_button("물리 계산 취소", hint="대기 중이거나 계산 중인 물리 실행을 멈춥니다").on_click(
+                gui.add_button("Isaac 작업 취소", hint="대기 중이거나 돌고 있는 물리 계산과 동영상 녹화를 멈춥니다").on_click(
                     lambda _: self.cancel_physics())
                 self.phys_status = gui.add_markdown("")
             self.play_btn = gui.add_button("재생")
@@ -163,11 +173,30 @@ class Viewer:
                 "균형 표시", True, hint="바닥에 지지다각형(초록, 발이 닿은 발바닥 점), 질량중심 투영(파랑), ZMP(빨강)")
             gui.add_button("카메라 맞추기").on_click(lambda _: self.fit_camera())
         with tabs.add_tab("모션"):
-            self.add_path = gui.add_text("파일 경로", "", hint="BVH / FBX / AMASS SMPL-X npz / 로봇 npz·csv·pkl "
-                                                              "(Isaac 물리 결과 *_sim.npz 포함)")
-            gui.add_button("추가").on_click(lambda _: self._add_from_gui())
+            with gui.add_folder("모션 고르기"):
+                self.lib_folder = gui.add_dropdown("폴더", ("-",), hint="data/raw(원본), data/retargeted(로봇), "
+                                                   "data/uploads(내 PC에서 연 파일), reports(물리 결과) 아래의 모션 파일")
+                self.lib_folder.on_update(lambda _: self._refresh_files())
+                self.lib_search = gui.add_text("이름 검색", "", hint="이름 일부(예: 143_11)를 넣으면 모든 폴더에서 찾습니다. "
+                                                                 "같은 촬영의 BVH·FBX·SMPL-X를 한 번에 찾을 때 편합니다")
+                self.lib_search.on_update(lambda _: self._refresh_files())
+                self.lib_file = gui.add_dropdown("파일", ("-",))
+                gui.add_button("선택한 파일 추가").on_click(lambda _: self._add_from_library())
+                gui.add_button("목록 새로고침", color="gray", hint="새로 생긴 파일을 다시 찾습니다").on_click(
+                    lambda _: self._refresh_library())
+                self.upload = gui.add_upload_button(
+                    "파일 열기 (내 PC)", mime_type=",".join(MOTION_EXT),
+                    hint="BVH / FBX / AMASS SMPL-X npz / 로봇 npz·csv·pkl. 고른 파일은 data/uploads에 복사해 엽니다")
+                self.upload.on_upload(lambda _: self._add_upload())
+            with gui.add_folder("경로 직접 입력", expand_by_default=False):
+                self.add_path = gui.add_text("파일 경로", "", hint="BVH / FBX / AMASS SMPL-X npz / 로봇 npz·csv·pkl "
+                                                                  "(Isaac 물리 결과 *_sim.npz 포함)")
+                gui.add_button("경로로 추가").on_click(lambda _: self._add_from_gui())
             self.status = gui.add_markdown("")
             self.motion_folder = gui.add_folder("목록")
+        self._library: dict[str, list[str]] = {}
+        self._lib_options: dict[str, str] = {}
+        self._refresh_library()
         with tabs.add_tab("분석"):
             self.ref = gui.add_dropdown("기준 모션", ("-",))
             self.ref.on_update(lambda _: self.refresh_analysis())
@@ -187,12 +216,57 @@ class Viewer:
             return
         if not os.path.isabs(p):
             p = os.path.join(ROOT, p)
-        self.status.content = f"불러오는 중: `{os.path.basename(p)}` (리타게팅이면 수십 초)"
+        self._add_path(p)
+
+    def _add_path(self, p: str) -> None:
+        self.status.content = f"불러오는 중: `{os.path.basename(p)}` (처음 리타게팅하는 사람 모션이면 수십 초)"
         try:
             self.add(p)
             self.status.content = f"추가됨: `{os.path.basename(p)}`"
         except Exception as e:
             self.status.content = f"**실패**: {type(e).__name__}: {e}"
+
+    # ---------------------------------------------------------------- motion picker
+    def _refresh_library(self) -> None:
+        """Rescan the library folders (keeps the current folder choice when it still exists)."""
+        self._library = library_files(self.args.library or LIBRARY_ROOTS)
+        opts = tuple(f"{d}  ({len(v)})" for d, v in self._library.items()) or ("-",)
+        cur = self.lib_folder.value
+        self.lib_folder.options = opts
+        if cur in opts:
+            self.lib_folder.value = cur
+        else:  # start where the original captures are
+            self.lib_folder.value = next((o for o in opts if o.startswith("data/raw/cmu_bvh")), opts[0])
+        self._refresh_files()
+
+    def _refresh_files(self) -> None:
+        q = self.lib_search.value.strip().lower()
+        if q:  # every folder, shown with its folder; names that start with the query first (05_02 before 105_02)
+            hits = [p for v in self._library.values() for p in v if q in os.path.basename(p).lower()]
+            hits = sorted(hits, key=lambda p: not os.path.basename(p).lower().startswith(q))[:300]
+            self._lib_options = {os.path.relpath(p, ROOT).replace(os.sep, "/"): p for p in hits}
+        else:
+            folder = self.lib_folder.value.rsplit("  (", 1)[0]
+            self._lib_options = {os.path.basename(p): p for p in self._library.get(folder, [])}
+        opts = tuple(self._lib_options) or (("찾은 파일 없음",) if q else ("-",))
+        self.lib_file.options = opts
+        self.lib_file.value = opts[0]
+
+    def _add_from_library(self) -> None:
+        p = self._lib_options.get(self.lib_file.value)
+        if p:
+            self._add_path(p)
+
+    def _add_upload(self) -> None:
+        f = self.upload.value
+        if f is None:
+            return
+        if not f.name.lower().endswith(MOTION_EXT):
+            self.status.content = f"**열 수 없는 형식**: `{f.name}` (BVH / FBX / npz / csv / pkl)"
+            return
+        path = save_upload(f.name, f.content)
+        self._add_path(path)
+        self._refresh_library()
 
     # ---------------------------------------------------------------- items
     def add(self, path: str) -> Item:
@@ -315,6 +389,15 @@ class Viewer:
         with f:
             s.gui.add_markdown(self._item_md(item))
             item.handles["phys_md"] = s.gui.add_markdown("")
+            s.gui.add_button(
+                "동영상 저장", hint="Isaac Sim에서 사람(원본이 있으면)과 로봇을 나란히 녹화해 MP4로 저장합니다. "
+                                 "물리 모드가 켜져 있으면 물리 시뮬레이션 결과를 녹화합니다").on_click(
+                lambda _, it=item: self.save_video(it))
+            item.handles["video_md"] = s.gui.add_markdown("")
+            dl = s.gui.add_button("동영상 내려받기", color="green", visible=False,
+                                  hint="저장된 동영상을 이 브라우저로 내려받습니다")
+            dl.on_click(lambda e, it=item: self._download_video(it, e.client))
+            item.handles["video_dl"] = dl
             vis = s.gui.add_checkbox("보이기", True)
             vis.on_update(lambda e, it=item: setattr(it, "visible", e.target.value))
             if item.human is not None:
@@ -341,7 +424,8 @@ class Viewer:
     def _is_physics_result(item: Item) -> bool:
         return item.kind.startswith("Isaac PhysX")
 
-    def set_physics(self, on: bool) -> None:
+    def set_physics(self, on: bool, why: str = "button") -> None:
+        log(f"physics mode {'on' if on else 'off'} ({why})")
         self.physics_on = bool(on)
         self.phys_btn.label = "물리 모드 끄기" if self.physics_on else "물리 모드 켜기"
         try:
@@ -396,9 +480,10 @@ class Viewer:
         self.refresh_analysis()
 
     def cancel_physics(self) -> None:
+        """Stop every queued or running Isaac job (physics runs and videos)."""
         for it in list(self.items):
-            for job in it.handles.get("phys_jobs", {}).values():
-                if job.active:
+            for job in [*it.handles.get("phys_jobs", {}).values(), it.handles.get("video_job")]:
+                if job is not None and job.active:
                     self.runner.cancel(job)
         self._update_phys_status(force=True)
 
@@ -441,12 +526,15 @@ class Viewer:
         self._last_status = now
         items = [it for it in list(self.items) if not self._is_physics_result(it)]
         running = sum(1 for it in items for j in it.handles.get("phys_jobs", {}).values() if j.active)
+        videos = sum(1 for it in list(self.items) if (j := it.handles.get("video_job")) is not None and j.active)
         if self.physics_on:
             head = f"**켜짐** · 골반 보조 힘 x{self._assist():g}"
         else:
             head = "**꺼짐** · 관절각대로 그리는 기구학 재생"
             if running:
                 head += f" · 백그라운드 물리 계산 {running}개 진행 중"
+        if videos:
+            head += f" · 동영상 녹화 {videos}개 대기·진행 중"
         lines = [head]
         if self.physics_on:
             lines += [f"<span style='color:{hexcolor(it.color)}'>■</span> {it.label}: {self._job_text(it)}" for it in items]
@@ -457,6 +545,55 @@ class Viewer:
             md = it.handles.get("phys_md")
             if md is not None:
                 md.content = f"물리: {self._job_text(it)}" if (self.physics_on or it.handles.get("phys")) else ""
+            if "video_md" in it.handles:
+                it.handles["video_md"].content = self._video_text(it)
+
+    # ---------------------------------------------------------------- video
+    def save_video(self, item: Item) -> None:
+        """Queue an Isaac recording of this motion (its physics result in physics mode)."""
+        physics = self.physics_on and not self._is_physics_result(item)
+        assist = self._assist()
+        mode = f"physics_x{assist:g}" if physics else "kinematic"
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.label).strip("_") or "motion"
+        path = os.path.join(self.args.video_dir, f"{stem}_{mode}.mp4")
+        human = item.source if item.human is not None else None
+        motion = replace(item.robot, name=stem)  # the video caption shows this name, not the cache file's
+        try:
+            job = self.runner.request_video(motion, path, human=human, physics=physics, assist=assist,
+                                            smpl_model_dir=self.args.smpl_model_dir,
+                                            on_done=lambda j, it=item: self._video_done(it, j))
+        except Exception as e:  # Isaac Sim not found
+            item.handles["video_md"].content = f"동영상: **실행할 수 없음** ({type(e).__name__}: {e})"
+            return
+        item.handles["video_job"] = job
+        item.handles["video_dl"].visible = job.state == "done"
+        self.status.content = (f"동영상 {'대기열에 추가' if job.active else '이미 있음'}: {item.label} "
+                               f"({'물리 x' + format(assist, 'g') if physics else '기구학'})")
+        self._update_phys_status(force=True)
+
+    def _video_done(self, item: Item, job: PhysicsJob) -> None:
+        if item.handles.get("video_job") is job:
+            item.handles["video_dl"].visible = job.state == "done"
+        self._update_phys_status(force=True)
+
+    def _video_text(self, item: Item) -> str:
+        job = item.handles.get("video_job")
+        if job is None:
+            return ""
+        if job.state == "done":
+            return f"동영상 저장됨: `{_rel(job.result)}`"
+        if job.state == "running":
+            return f"동영상: {job.stage} {100 * job.progress:.0f}% ({time.time() - job.started:.0f}초)"
+        if job.state == "queued":
+            return "동영상: 대기 중 (Isaac 작업은 한 번에 하나씩 돕니다)"
+        return f"동영상: {job.stage}" + (f": {job.message}" if job.message and job.message != job.stage else "")
+
+    def _download_video(self, item: Item, client) -> None:
+        job = item.handles.get("video_job")
+        if job is None or not job.result or not os.path.isfile(job.result) or client is None:
+            return
+        with open(job.result, "rb") as f:
+            client.send_file_download(os.path.basename(job.result), f.read())
 
     def _fall_note(self, phys: Item, local: float) -> str:
         """'넘어짐 2.07s · 발끝 걸림 1.47s부터' from the first cause's onset until shortly after the fall."""
@@ -481,7 +618,12 @@ class Viewer:
         if m.get("phys_ok"):
             lines.append(f"물리: **{m['phys_ok']}** · 보조 힘 {m['phys_harness_pct']:.0f}% 체중 · 넘어짐 {m['phys_falls']}"
                          f" · 토크 한계 초과 {m['phys_saturated_pct']:.1f}%")
-        lines.append(f"`{os.path.relpath(item.source, ROOT)}`")
+        if self._is_physics_result(item):
+            ref = item.info.get("reference_motion")
+            lines.append("이미 Isaac 물리 결과인 파일이라 물리 모드를 켜고 꺼도 그대로이고, 로봇 관절각만 있어 사람 스켈레톤이 "
+                         "없습니다. 사람과 나란히 보려면 원본 사람 모션을 추가하고 물리 모드를 켜세요."
+                         + (f" 원래 로봇 동작: `{_rel(ref)}`" if ref else ""))
+        lines.append(f"`{_rel(item.source)}`")
         return "  \n".join(lines)
 
     def _set_offset(self, item: Item, value: float) -> None:
@@ -598,7 +740,10 @@ class Viewer:
         h["urdf"].update_cfg(np.array([dof[i] if i is not None else 0.0 for i in jmap]))
         h["label"].position = p + np.array([0.0, 0.0, 0.85])
         text = item.label if inside else f"{item.label} (범위 밖)"
-        if self.physics_on and not self._is_physics_result(item):
+        if self._is_physics_result(item):
+            note = self._fall_note(item, local)
+            text += " · 물리 결과 파일" + (f" · {note}" if note else "")
+        elif self.physics_on:
             if src is item:  # not computed yet: still the joint angles
                 job = h.get("phys_jobs", {}).get(self._assist())
                 text += (" · 물리 대기" if job is not None and job.state == "queued" else
@@ -833,7 +978,12 @@ def main() -> int:
     ap.add_argument("--mesh-cell", type=float, default=0.004,
                     help="simplify robot meshes on this grid (m) before sending them to the browser; 0 = full detail")
     ap.add_argument("--body-mesh", action="store_true", help="draw SMPL-X inputs as body meshes from the start")
+    ap.add_argument("--library", action="append", default=None, metavar="DIR",
+                    help="folder to list in the motion picker (repeatable; default: data/raw, data/samples, "
+                         "data/retargeted, data/uploads, reports)")
     ap.add_argument("--physics", action="store_true", help="start in physics mode (same as the button)")
+    ap.add_argument("--video-dir", default=os.path.join(ROOT, "reports", "videos", "viewer"),
+                    help="where the \"동영상 저장\" button writes its MP4s")
     ap.add_argument("--physics-config", default=PHYSICS_CONFIG, help="PhysX settings for physics mode (yaml)")
     ap.add_argument("--isaac-accept-eula", action="store_true",
                     help="you accept the NVIDIA Omniverse EULA; physics mode runs Isaac Sim with OMNI_KIT_ACCEPT_EULA=YES")
@@ -845,10 +995,12 @@ def main() -> int:
     server = viser.ViserServer(host=args.host, port=args.port, label="K-Humanoid motion compare")
     viewer = Viewer(server, urdf, args)
     atexit.register(viewer.runner.shutdown)  # no Isaac process outlives the viewer
+    server.on_client_connect(lambda c: log(f"client {c.client_id} connected"))
+    server.on_client_disconnect(lambda c: log(f"client {c.client_id} disconnected"))
     if args.body_mesh:
         viewer.human_look.value = "몸 메시 (SMPL-X)"
     if args.physics:
-        viewer.set_physics(True)
+        viewer.set_physics(True, "--physics")
 
     server.initial_camera.position = (3.0, -3.0, 1.8)
     server.initial_camera.look_at = (0.0, 0.0, 0.75)
