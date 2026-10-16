@@ -22,6 +22,17 @@ Video (implies --headless; MP4 needs ffmpeg on PATH, otherwise a GIF is written)
 
     python tools\\isaac_replay.py --human clip.bvh --robot-motion clip_g1.npz --video reports\\videos\\clip.mp4
     python tools\\isaac_replay.py --human long.bvh --robot-motion long_g1.npz --video long.mp4 --start 30 --end 45
+
+Physics (--physics, headless): instead of teleporting, PhysX simulates the robot
+with gravity on a floor with friction; its joint drives (PD, configs/physics.yaml)
+track the clip and a virtual harness on the pelvis pulls toward the clip's root
+(--assist scales it, 0 = off: falls are reset to the clip and counted). Writes
+<check-out>/<clip>_sim.npz (the simulated motion, a project robot npz that
+tools/compare_viewer.py shows next to the original) and <clip>_sim.json (harness
+force, tracking error, torque saturation, falls, feet under physics):
+
+    python tools\\isaac_replay.py --robot-motion clip_g1.npz --physics --check-out reports\\physics
+    python tools\\isaac_replay.py --robot-motion clip_g1.npz --physics --assist 0 --video reports\\physics\\clip.mp4
 """
 
 from __future__ import annotations
@@ -67,11 +78,24 @@ def parse_args():
     ap.add_argument("--qc-config", default=os.path.join(ROOT, "configs", "qc.yaml"), help="QC thresholds (yaml)")
     ap.add_argument("--video", default=None, help="record the replay to this .mp4 (or .gif); implies --headless")
     ap.add_argument("--video-fps", type=float, default=30.0, help="frame rate of --video")
-    ap.add_argument("--start", type=float, default=0.0, help="check/video mode: first second to replay")
-    ap.add_argument("--end", type=float, default=None, help="check/video mode: last second to replay")
+    ap.add_argument("--start", type=float, default=0.0, help="check/video/physics mode: first second to replay")
+    ap.add_argument("--end", type=float, default=None, help="check/video/physics mode: last second to replay")
+    ap.add_argument("--physics", action="store_true",
+                    help="simulate the robot with PhysX (gravity, floor contact, PD tracking) instead of teleporting")
+    ap.add_argument("--physics-config", default=os.path.join(ROOT, "configs", "physics.yaml"))
+    ap.add_argument("--assist", type=float, default=1.0,
+                    help="physics: scale of the pelvis harness gains (0 = no harness)")
+    ap.add_argument("--no-reset", action="store_true", help="physics: stop at the first fall instead of resetting")
+    ap.add_argument("--progress", action="store_true", help="print progress lines (for the viewer's background runs)")
     args, _ = ap.parse_known_args()
     if not args.human and not args.robot_motion:
         ap.error("give --human and/or --robot-motion")
+    if args.physics:
+        if not args.robot_motion:
+            ap.error("--physics needs --robot-motion")
+        args.headless = True
+        if not args.check_out and not args.video:
+            args.check_out = os.path.join(ROOT, "reports", "physics")
     if args.video:
         args.headless = True
         if not args.check_out:  # keep the check JSON / snapshots next to the video, not in reports/sim_check
@@ -112,7 +136,7 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt  # noqa:
 
 from khumanoid.io import load_motion  # noqa: E402
 from khumanoid.motion import RobotMotion, SkeletonMotion  # noqa: E402
-from khumanoid.qc import QCConfig, _sustained, check_motion  # noqa: E402
+from khumanoid.qc import QCConfig, _sustained, add_balance_flags, check_motion  # noqa: E402
 from khumanoid.rotations import matrix_to_quat, quat_from_two_vectors, quat_to_matrix  # noqa: E402
 
 COLORS = {
@@ -127,6 +151,13 @@ def log(msg: str) -> None:
     print(f"[isaac_replay] {msg}", flush=True)
 
 
+def progress(stage: str, done: int, total: int) -> None:
+    """--progress: machine-readable "[isaac_replay] progress <stage> <done>/<total>" lines,
+    about 50 per stage (read by khumanoid/physics_runner.py)."""
+    if args.progress and (done % max(1, total // 50) == 0 or done == total - 1):
+        log(f"progress {stage} {done + 1}/{total}")
+
+
 # --------------------------------------------------------------------------- scene
 def make_material(stage, path: str, rgb) -> UsdShade.Material:
     mat = UsdShade.Material.Define(stage, path)
@@ -138,9 +169,11 @@ def make_material(stage, path: str, rgb) -> UsdShade.Material:
     return mat
 
 
-def build_scene(stage) -> None:
-    """Lights, a visual-only floor (no collider: replay must show penetration, not
-    resolve it) with a 1 m grid, and a zero-gravity physics scene."""
+def build_scene(stage, physics: dict | None = None) -> None:
+    """Lights, a floor with a 1 m grid and the physics scene. Kinematic replay: the
+    floor is visual only (replay must show penetration, not resolve it) and gravity
+    is off. Physics (``physics`` = configs/physics.yaml "sim"): a static floor
+    collider with friction and gravity on."""
     UsdGeom.Xform.Define(stage, "/World")
     UsdLux.DomeLight.Define(stage, "/World/DomeLight").CreateIntensityAttr(500.0)
     sun = UsdLux.DistantLight.Define(stage, "/World/Sun")
@@ -167,7 +200,25 @@ def build_scene(stage) -> None:
 
     scene = UsdPhysics.Scene.Define(stage, "/World/PhysicsScene")
     scene.CreateGravityDirectionAttr(Gf.Vec3f(0, 0, -1))
-    scene.CreateGravityMagnitudeAttr(0.0)  # kinematic replay
+    if physics is None:
+        scene.CreateGravityMagnitudeAttr(0.0)  # kinematic replay
+        return
+    scene.CreateGravityMagnitudeAttr(9.81)
+    # static box collider under the visual floor (top face at z = 0)
+    box = UsdGeom.Cube.Define(stage, "/World/FloorCollider")
+    box.CreateSizeAttr(1.0)
+    xf = UsdGeom.Xformable(box)
+    xf.AddTranslateOp().Set(Gf.Vec3d(0, 0, -0.05))
+    xf.AddScaleOp().Set(Gf.Vec3f(60.0, 60.0, 0.1))
+    box.CreatePurposeAttr(UsdGeom.Tokens.guide)  # not rendered
+    UsdPhysics.CollisionAPI.Apply(box.GetPrim())
+    mat = UsdShade.Material.Define(stage, "/World/Looks/FloorPhysics")
+    pm = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
+    pm.CreateStaticFrictionAttr(float(physics.get("static_friction", 1.0)))
+    pm.CreateDynamicFrictionAttr(float(physics.get("dynamic_friction", 0.8)))
+    pm.CreateRestitutionAttr(0.0)
+    UsdShade.MaterialBindingAPI.Apply(box.GetPrim()).Bind(
+        mat, UsdShade.Tokens.weakerThanDescendants, "physics")
 
 
 def look_at_quat(eye, target) -> np.ndarray:
@@ -270,8 +321,9 @@ class RobotReplay:
     """Teleports an articulation through a RobotMotion and measures its feet."""
 
     PATH = "/World/Robot"
+    FLOOR = "/World/FloorCollider"  # see build_scene
 
-    def __init__(self, stage, motion: RobotMotion, usd_path: str, offset):
+    def __init__(self, stage, motion: RobotMotion, usd_path: str, offset, contacts: bool = False):
         self.m = motion
         self.offset = np.asarray(offset, dtype=float)
         stage_utils.add_reference_to_stage(usd_path=usd_path, path=self.PATH)
@@ -293,16 +345,45 @@ class RobotReplay:
         self.foot_names = [names[i] for i in feet]
         self.foot_paths = [paths[i] for i in feet]
         self.foot_corners = [self._local_corners(stage, p) for p in self.foot_paths]
+        if self.foot_corners:
+            c = self.foot_corners[0]
+            log(f"foot box (link frame, m): x {c[:, 0].min():.3f}..{c[:, 0].max():.3f}, "
+                f"z {c[:, 2].min():.3f}..{c[:, 2].max():.3f}")
         # bottom face of each foot box (link frame z-up when the foot is flat, as on the G1)
         self.foot_bottoms = [c[np.isclose(c[:, 2], c[:, 2].min())] for c in self.foot_corners]
-        self.feet = RigidPrim(self.foot_paths) if self.foot_paths else None
+        self.feet = None
+        self.contacts = False
+        if self.foot_paths and contacts:
+            try:  # contact view against the floor collider (set up before the simulation starts)
+                self.feet = RigidPrim(self.foot_paths, contact_filter_paths=[self.FLOOR])
+                self.feet.set_enabled_contact_tracking(True)
+                self.contacts = True
+            except Exception as e:
+                log(f"foot contact forces unavailable: {e}")
+        if self.foot_paths and self.feet is None:
+            self.feet = RigidPrim(self.foot_paths)
+        root = [p for n, p in zip(names, paths) if n == "pelvis"] or [paths[0]]
+        self.root_link = RigidPrim(root[0])
+        self.link_names = list(names)
+        self.links = RigidPrim(list(paths))  # every link: world poses for the whole-body CoM
         log(f"robot: {usd_path}\n               feet: {self.foot_names}")
 
     @staticmethod
     def _local_corners(stage, path: str) -> np.ndarray:
-        """8 corners of the link's geometry bound in the link frame (sole estimate)."""
-        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render])
-        rng = cache.ComputeUntransformedBound(stage.GetPrimAtPath(path)).ComputeAlignedRange()
+        """8 corners of the link's collision geometry bound in the link frame (sole
+        estimate). Falls back to the visual geometry when the link has no collider;
+        on the Isaac G1 the visual foot box reaches 1.7 cm below the collision shapes."""
+        prim = stage.GetPrimAtPath(path)
+        purposes = [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.guide, UsdGeom.Tokens.proxy]
+        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), purposes)
+        colliders = [p for p in Usd.PrimRange(prim, Usd.TraverseInstanceProxies())
+                     if p.HasAPI(UsdPhysics.CollisionAPI) and p.IsA(UsdGeom.Boundable)]
+        rng = Gf.Range3d()
+        for c in colliders:
+            rng.UnionWith(cache.ComputeRelativeBound(c, prim).ComputeAlignedRange())
+        if rng.IsEmpty():
+            cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), purposes[:2])
+            rng = cache.ComputeUntransformedBound(prim).ComputeAlignedRange()
         if rng.IsEmpty():
             return np.zeros((1, 3))
         lo, hi = np.array(rng.GetMin()), np.array(rng.GetMax())
@@ -327,6 +408,20 @@ class RobotReplay:
             log(f"  robot DoFs not in motion (held at 0): {unused}")
         lo, hi = (a.numpy()[0] for a in self.art.get_dof_limits())
         self.limits = {n: (float(lo[i]), float(hi[i]), float("inf")) for n, i in index.items()}
+        # link masses and CoMs (link frame) from the robot asset, for the whole-body CoM
+        self.link_masses = np.asarray(self.art.get_link_masses().numpy()[0], float)
+        self.link_coms = np.asarray(self.art.get_link_coms()[0].numpy()[0], float)
+        log(f"robot mass {self.link_masses.sum():.2f} kg over {len(self.link_masses)} links (from the asset)")
+
+    def link_poses(self) -> tuple[np.ndarray, np.ndarray]:
+        """World positions (L, 3, offset removed) and orientations (L, 4 wxyz) of every link."""
+        pos, quat = (np.asarray(a.numpy(), float) for a in self.links.get_world_poses())
+        return pos - self.offset, quat
+
+    def sole_points(self) -> np.ndarray:
+        """(feet, C, 3) bottom-face corners of the foot collision boxes, world, offset removed."""
+        pos, quat = (np.asarray(a.numpy(), float) for a in self.feet.get_world_poses())
+        return np.stack([c @ quat_to_matrix(q).T + p - self.offset for c, p, q in zip(self.foot_bottoms, pos, quat)])
 
     def apply(self, f: int) -> None:
         q = self.q.copy()
@@ -374,8 +469,20 @@ def load_qc_config(path: str) -> QCConfig:
         return QCConfig.from_dict((yaml.safe_load(f) or {}).get("thresholds"))
 
 
+def load_physics_config(path: str) -> dict:
+    import yaml
+
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    for key in ("sim", "assist", "fall", "report", "diagnosis"):
+        cfg.setdefault(key, {})
+    cfg.setdefault("pd", [{"pattern": ".*", "stiffness": 100.0, "damping": 5.0}])
+    return cfg
+
+
 def main() -> int:
     qc_cfg = load_qc_config(args.qc_config)
+    phys_cfg = load_physics_config(args.physics_config) if args.physics else None
     human = robot_motion = None
     human_qc = robot_qc = None
     if args.human:
@@ -396,7 +503,7 @@ def main() -> int:
     stage_utils.set_stage_units(meters_per_unit=1.0)
     stage = omni.usd.get_context().get_stage()
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-    build_scene(stage)
+    build_scene(stage, phys_cfg["sim"] if phys_cfg else None)
 
     skel = None
     if human is not None:
@@ -404,14 +511,28 @@ def main() -> int:
     robot = None
     if robot_motion is not None:
         offset = args.robot_offset if human is not None else [0.0, 0.0, 0.0]
-        robot = RobotReplay(stage, robot_motion, resolve_robot_usd(args.robot_usd), offset)
+        robot = RobotReplay(stage, robot_motion, resolve_robot_usd(args.robot_usd), offset, contacts=args.physics)
+
+    substeps = 1
+    if args.physics:
+        from isaacsim.core.simulation_manager import SimulationManager
+
+        substeps = max(1, int(round(float(phys_cfg["sim"].get("physics_hz", 240)) / robot_motion.fps)))
+        # physics advances only through SimulationManager.step (app updates just render)
+        carb.settings.get_settings().set_bool("/app/player/playSimulations", False)
+        SimulationManager.set_physics_dt(1.0 / (robot_motion.fps * substeps))
 
     app_utils.play()
     simulation_app.update()
+    if args.physics:  # with playSimulations off, playing the timeline does not start physics
+        SimulationManager.initialize_physics()
+        simulation_app.update()
     if robot is not None:
         robot.start()
         robot_qc = check_motion(robot_motion, qc_cfg, robot.limits)
         log(f"robot QC (limits from the robot asset): {robot_qc.status} ({'; '.join(robot_qc.notes) or 'ok'})")
+    if args.physics:
+        return run_physics(robot, human, skel, human_qc, robot_qc, qc_cfg, phys_cfg, substeps)
 
     clock = Clock(human, robot_motion)
     bad = np.zeros(clock.num_frames, dtype=bool)
@@ -580,22 +701,89 @@ def encode_video(frame_dir: str, n: int, fps: float, path: str) -> str | None:
     return path
 
 
+class SnapCamera:
+    """RTX camera looking at a point from the front-right, for snapshots / video."""
+
+    def __init__(self):
+        from isaacsim.sensors.experimental.rtx import CameraSensor, RtxCamera
+
+        self.cam = RtxCamera("/World/SnapCam")
+        self.sensor = CameraSensor(self.cam, resolution=(540, 960), annotators=["rgb"])
+        # ~60 deg horizontal FOV like the GUI viewport camera (USD attrs: focal length and
+        # aperture share units, only their ratio matters)
+        usd_cam = UsdGeom.Camera(omni.usd.get_context().get_stage().GetPrimAtPath("/World/SnapCam"))
+        usd_cam.GetFocalLengthAttr().Set(18.0)
+        usd_cam.GetHorizontalApertureAttr().Set(20.955)
+        usd_cam.GetVerticalApertureAttr().Set(20.955 * 540 / 960)
+
+    def capture(self, c: np.ndarray, min_updates: int):
+        """Aim at c and grab an RGB image (the annotator lags the stage by a few
+        updates; the very first capture also waits for the renderer)."""
+        eye = c + [3.5, -3.5, 1.4]
+        self.cam.set_world_poses(positions=[eye.tolist()], orientations=[look_at_quat(eye, c + [0, 0, -0.1]).tolist()])
+        for i in range(120):
+            simulation_app.update()
+            data, _ = self.sensor.get_data("rgb")
+            if i >= min_updates - 1 and data is not None and data.size:
+                return data.numpy()[..., :3]
+        return None
+
+
+def foot_summary(rf: np.ndarray, z: np.ndarray, flat: np.ndarray, xy: np.ndarray, fps: float,
+                 foot_names: list[str], qc_cfg: QCConfig) -> dict:
+    """Robot feet measured in the simulator, one sample per robot frame rf: lowest
+    sole point z, highest bottom-face corner flat, foot xy (per foot)."""
+    lowest = z.min(1)
+    dt = np.maximum(np.diff(rf), 1) / fps
+    hspeed = np.linalg.norm(np.diff(xy, axis=0), axis=-1) / dt[:, None]
+    # same idea as the human QC: a foot planted flat (whole sole within 2.5 cm of the
+    # floor; the lowest point alone also catches toe scuff in swing) that keeps
+    # sliding faster than skate_speed for skate_min_duration
+    slide = (flat[1:] < 0.025) & (hspeed > qc_cfg.skate_speed)
+    step = int(np.median(np.diff(rf))) if len(rf) > 1 else 1
+    n_min = max(1, int(round(qc_cfg.skate_min_duration * fps / max(step, 1))))
+    skating = np.stack([_sustained(slide[:, i], n_min) for i in range(slide.shape[1])], 1) if len(slide) else slide
+    planted = flat[1:] < 0.025
+    return {
+        "feet": foot_names,
+        "robot_frames": int(len(rf)),
+        "sole_min_z_m": round(float(z.min()), 4),
+        "penetration_ratio(<-2cm)": round(float((lowest < -0.02).mean()), 4),
+        "both_feet_airborne_ratio(>5cm)": round(float((lowest > 0.05).mean()), 4),
+        f"foot_skating_ratio(flat sole<2.5cm, >{qc_cfg.skate_speed:g}m/s for >={qc_cfg.skate_min_duration:g}s)":
+            round(float(skating.any(1).mean()), 4) if len(skating) else 0.0,
+        "planted_foot_mean_speed_mps": round(float(hspeed[planted].mean()), 3) if planted.any() else None,
+    }
+
+
+def balance_of(robot, link_pos: np.ndarray, link_quat: np.ndarray, soles: np.ndarray, fps: float,
+               qc_cfg: QCConfig, floor=None, breaks: list[int] | None = None):
+    """(BalanceTrack, static_unbalanced flag, JSON summary) from recorded link poses (T, L, ...)
+    and sole points (T, feet, C, 3). Masses / link CoMs are the robot asset's. The floor is
+    tracked through the clip (retargets drift) unless given (physics: the real floor, 0).
+    ``breaks``: frames where a physics replay restarted the robot (ZMP per piece)."""
+    from khumanoid import stability
+    from khumanoid.analysis import BALANCE_MIN_DURATION, floor_track, slowest_sole_speed
+
+    com = stability.com_from_links(link_pos, link_quat, robot.link_coms, robot.link_masses)
+    if floor is None:
+        floor = floor_track(soles[..., 2].min(-1), slowest_sole_speed(soles, fps), fps)
+    track = stability.balance_track(com, soles, fps, floor, qc_cfg.support_contact_height, breaks=breaks)
+    static = stability.static_unbalanced(track, qc_cfg.balance_tolerance, qc_cfg.static_max_speed,
+                                         qc_cfg.static_min_duration)
+    summary = stability.summarize(track, qc_cfg.balance_tolerance, BALANCE_MIN_DURATION, static=static)
+    summary["mass_kg"] = round(float(robot.link_masses.sum()), 2)
+    summary["model"] = "CoM from the robot asset's link masses; ZMP cart-table (angular momentum ignored)"
+    return track, static, summary
+
+
 def run_check(clock: Clock, show, focus, robot, human_qc, robot_qc, bad: np.ndarray, qc_cfg: QCConfig) -> int:
     from PIL import Image
-    from isaacsim.sensors.experimental.rtx import CameraSensor, RtxCamera
 
     out = os.path.abspath(args.check_out)
     os.makedirs(out, exist_ok=True)
     name = (human_qc or robot_qc).name
-
-    cam = RtxCamera("/World/SnapCam")
-    sensor = CameraSensor(cam, resolution=(540, 960), annotators=["rgb"])
-    # ~60 deg horizontal FOV like the GUI viewport camera (USD attrs: focal length and
-    # aperture share units, only their ratio matters)
-    usd_cam = UsdGeom.Camera(omni.usd.get_context().get_stage().GetPrimAtPath("/World/SnapCam"))
-    usd_cam.GetFocalLengthAttr().Set(18.0)
-    usd_cam.GetHorizontalApertureAttr().Set(20.955)
-    usd_cam.GetVerticalApertureAttr().Set(20.955 * 540 / 960)
+    snap = SnapCamera()
     # replay range (--start / --end, seconds)
     f0 = min(max(int(round(args.start * clock.fps)), 0), clock.num_frames - 1)
     f1 = clock.num_frames if args.end is None else min(clock.num_frames, int(round(args.end * clock.fps)) + 1)
@@ -615,19 +803,9 @@ def run_check(clock: Clock, show, focus, robot, human_qc, robot_qc, bad: np.ndar
     n_video = 0
 
     def capture(f: int, min_updates: int):
-        """Aim the camera at frame f and grab an RGB image (the annotator lags the stage
-        by a few updates; the very first capture also waits for the renderer)."""
-        c = focus(f)
-        eye = c + [3.5, -3.5, 1.4]
-        cam.set_world_poses(positions=[eye.tolist()], orientations=[look_at_quat(eye, c + [0, 0, -0.1]).tolist()])
-        for i in range(120):
-            simulation_app.update()
-            data, _ = sensor.get_data("rgb")
-            if i >= min_updates - 1 and data is not None and data.size:
-                return data.numpy()[..., :3]
-        return None
+        return snap.capture(focus(f), min_updates)
 
-    soles, flats, feet_xy, robot_frames = [], [], [], []
+    soles, flats, feet_xy, robot_frames, link_pos, link_quat, sole_pts = [], [], [], [], [], [], []
     t0 = time.perf_counter()
     frames = sorted(set(range(f0, f1, max(args.stride, 1))) | snap_frames | video_frames)
     for k, f in enumerate(frames):
@@ -639,6 +817,10 @@ def run_check(clock: Clock, show, focus, robot, human_qc, robot_qc, bad: np.ndar
             flats.append(flat)
             feet_xy.append(p[:, :2])
             robot_frames.append(clock.frame_of(robot.m, f))
+            lp, lq = robot.link_poses()
+            link_pos.append(lp)
+            link_quat.append(lq)
+            sole_pts.append(robot.sole_points())
         img = None
         if f in snap_frames:
             img = capture(f, 9)
@@ -664,41 +846,483 @@ def run_check(clock: Clock, show, focus, robot, human_qc, robot_qc, bad: np.ndar
         video_tmp.cleanup()
     if human_qc is not None:
         summary["human_qc"] = human_qc.row()
-    if robot_qc is not None:
-        summary["robot_qc"] = robot_qc.row()
     if soles:
         # one sample per robot frame: the clock runs at the faster clip's rate, so a
         # 30 fps robot next to a 120 fps human repeats each pose 4 times
         rf = np.array(robot_frames)
         keep = np.concatenate([[True], np.diff(rf) != 0])
         rf, z, flat, xy = rf[keep], np.array(soles)[keep], np.array(flats)[keep], np.array(feet_xy)[keep]
-        fps = robot.m.fps
-        lowest = z.min(1)
-        dt = np.maximum(np.diff(rf), 1) / fps
-        hspeed = np.linalg.norm(np.diff(xy, axis=0), axis=-1) / dt[:, None]
-        # same idea as the human QC: a foot planted flat (whole sole within 2.5 cm of the
-        # floor; the lowest point alone also catches toe scuff in swing) that keeps
-        # sliding faster than skate_speed for skate_min_duration
-        slide = (flat[1:] < 0.025) & (hspeed > qc_cfg.skate_speed)
+        summary["robot_sim"] = foot_summary(rf, z, flat, xy, robot.m.fps, robot.foot_names, qc_cfg)
+        # balance: whole-body CoM (asset masses) and cart-table ZMP against the feet's support
         step = int(np.median(np.diff(rf))) if len(rf) > 1 else 1
-        n_min = max(1, int(round(qc_cfg.skate_min_duration * fps / max(step, 1))))
-        skating = np.stack([_sustained(slide[:, i], n_min) for i in range(slide.shape[1])], 1) if len(slide) else slide
-        planted = flat[1:] < 0.025
-        summary["robot_sim"] = {
-            "feet": robot.foot_names,
-            "robot_frames": int(len(rf)),
-            "sole_min_z_m": round(float(z.min()), 4),
-            "penetration_ratio(<-2cm)": round(float((lowest < -0.02).mean()), 4),
-            "both_feet_airborne_ratio(>5cm)": round(float((lowest > 0.05).mean()), 4),
-            f"foot_skating_ratio(flat sole<2.5cm, >{qc_cfg.skate_speed:g}m/s for >={qc_cfg.skate_min_duration:g}s)":
-                round(float(skating.any(1).mean()), 4) if len(skating) else 0.0,
-            "planted_foot_mean_speed_mps": round(float(hspeed[planted].mean()), 3) if planted.any() else None,
-        }
+        _, static, bal = balance_of(robot, np.array(link_pos)[keep], np.array(link_quat)[keep],
+                                    np.array(sole_pts)[keep], robot.m.fps / max(step, 1), qc_cfg)
+        bal["robot_frames"] = int(len(rf))
+        summary["robot_balance"] = bal
+        if robot_qc is not None:
+            flag = np.zeros(robot_qc.num_frames, dtype=bool)
+            flag[rf] = static
+            add_balance_flags(robot_qc, flag, qc_cfg)
+    if robot_qc is not None:
+        summary["robot_qc"] = robot_qc.row()
     path = os.path.join(out, f"{name}_sim_check.json")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(summary, fh, indent=2, ensure_ascii=False, default=str)
     log(f"wrote {path}")
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+# --------------------------------------------------------------------------- physics
+def _log_rot(D: np.ndarray) -> np.ndarray:
+    """Rotation vectors (..., 3) of rotation matrices (..., 3, 3) (angles below pi)."""
+    ang = np.arccos(np.clip((np.trace(D, axis1=-2, axis2=-1) - 1) / 2, -1.0, 1.0))
+    v = np.stack([D[..., 2, 1] - D[..., 1, 2], D[..., 0, 2] - D[..., 2, 0], D[..., 1, 0] - D[..., 0, 1]], -1)
+    s = np.sin(ang)
+    small = s < 1e-6
+    return v * np.where(small, 0.5, ang / (2 * np.where(small, 1.0, s)))[..., None]
+
+
+def _nlerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
+    b = -b if np.dot(a, b) < 0 else b
+    q = (1 - t) * a + t * b
+    return q / np.linalg.norm(q)
+
+
+def _stats(x: np.ndarray, digits: int = 3) -> dict:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if not len(x):
+        return {"mean": None, "p95": None, "max": None}
+    return {"mean": round(float(x.mean()), digits), "p95": round(float(np.percentile(x, 95)), digits),
+            "max": round(float(x.max()), digits)}
+
+
+def fall_diagnosis(d: dict, fps: float, fall_frames: list[int], robot, ref_sp: np.ndarray, SP: np.ndarray,
+                   LP: np.ndarray, FF: np.ndarray, weight: float, tau_ratio: np.ndarray, joint_names: list[str],
+                   sim_track, harness: np.ndarray, assist: float, ref_track=None) -> list[dict]:
+    """First cause of every fall (khumanoid/diagnosis.py). ref_sp / SP: (T, feet, C, 3) sole points
+    of the clip (reference pass) and of the simulation; LP (T, L, 3) simulated link positions;
+    FF (T, feet) foot contact forces (NaN if unavailable); tau_ratio (T, joints) drive demand / limit.
+    ref_track: the clip's BalanceTrack, so support_exit evidence shows whether the clip itself
+    had the CoM outside its feet at that moment (a data issue) or only the simulation did."""
+    from khumanoid.analysis import floor_track, slowest_sole_speed
+    from khumanoid.diagnosis import diagnose_fall
+
+    if not fall_frames:
+        return []
+    T = len(SP)
+    feet = robot.foot_names
+    ref_low = ref_sp[..., 2].min(-1)
+    ref_speed = slowest_sole_speed(ref_sp, fps)
+    ref_clear = ref_low - floor_track(ref_low, ref_speed, fps)[:, None]
+    sim_low = SP[..., 2].min(-1)
+    sim_speed = slowest_sole_speed(SP, fps)
+    ff = np.nan_to_num(FF, nan=0.0)
+    contact_h = float(d.get("contact_height_m", 0.005))
+    on_floor = (sim_low < contact_h) | (ff > float(d.get("contact_force_bw", 0.05)) * weight)
+    # the clip's foot swings (fast and off the floor: a touchdown at 0.6 m/s is not a swing)
+    toe = on_floor & (ref_speed > float(d.get("swing_speed_mps", 0.5))) & (ref_clear > contact_h)
+    slip_v = float(d.get("slip_speed_mps", 0.3))
+    slip = on_floor & (sim_speed > slip_v) & (ref_speed < slip_v)
+    idx = {n: i for i, n in enumerate(robot.link_names)}
+    pairs = {"feet": [idx[f] for f in feet[:2]] if len(feet) >= 2 else [],
+             "knees": [i for n, i in idx.items() if "knee" in n.lower()][:2]}
+    dist = {k: np.linalg.norm(LP[:, v[0]] - LP[:, v[1]], axis=1) if len(v) == 2 else np.full(T, np.inf)
+            for k, v in pairs.items()}
+    selfc = np.minimum(dist["feet"], dist["knees"]) < float(d.get("self_distance_m", 0.09))
+    tmax, targ = tau_ratio.max(1), tau_ratio.argmax(1)
+    torque = tmax > float(d.get("torque_ratio", 1.5))
+    cm = np.nan_to_num(sim_track.com_margin, nan=0.0)
+    zm = np.nan_to_num(sim_track.zmp_margin, nan=0.0)
+    exit_ = cm < -float(d.get("com_outside_m", 0.03))
+    if assist <= 0:  # with the harness on, the ZMP includes its pull and leaves the feet all the time
+        exit_ |= zm < -float(d.get("zmp_outside_m", 0.05))
+    exit_ &= sim_track.supported
+    spike = harness > float(d.get("harness_bw", 0.5)) if assist > 0 else np.zeros(T, bool)
+
+    def r(x, k=2):
+        return None if x is None or not np.isfinite(x) else round(float(x), k)
+
+    def toe_ev(i, a, b):
+        ks = np.flatnonzero(toe[i])
+        return {"feet": [feet[k] for k in ks],
+                "clip_foot_speed_mps": [r(ref_speed[i, k]) for k in ks],
+                "clip_clearance_cm": [r(100 * ref_clear[i, k], 1) for k in ks],
+                "sim_sole_height_cm": [r(100 * sim_low[i, k], 1) for k in ks],
+                "contact_force_n": [r(ff[i, k], 0) for k in ks]}
+
+    def slip_ev(i, a, b):
+        ks = np.flatnonzero(slip[i])
+        return {"feet": [feet[k] for k in ks], "sim_foot_speed_mps": [r(sim_speed[i, k]) for k in ks],
+                "peak_speed_in_window_mps": r(sim_speed[a:b + 1].max())}
+
+    def self_ev(i, a, b):
+        return {"feet_distance_m": r(dist["feet"][i], 3), "knees_distance_m": r(dist["knees"][i], 3),
+                "min_in_window_m": r(min(dist["feet"][a:b + 1].min(), dist["knees"][a:b + 1].min()), 3)}
+
+    def torque_ev(i, a, b):
+        w = a + int(np.argmax(tmax[a:b + 1]))
+        return {"joint": joint_names[targ[i]], "demand_per_limit": r(tmax[i]),
+                "peak_joint": joint_names[targ[w]], "peak_demand_per_limit": r(tmax[w]), "peak_s": r(w / fps, 3)}
+
+    def exit_ev(i, a, b):
+        ev = {"com_margin_cm": r(100 * sim_track.com_margin[i], 1), "zmp_margin_cm": r(100 * sim_track.zmp_margin[i], 1),
+              "feet_on_floor": int(sim_track.phase[i]),
+              "min_com_margin_in_window_cm": r(100 * np.nanmin(sim_track.com_margin[a:b + 1]), 1)
+              if np.isfinite(sim_track.com_margin[a:b + 1]).any() else None}
+        if ref_track is not None and i < len(ref_track.com_margin):
+            ev["clip_com_margin_cm"] = r(100 * ref_track.com_margin[i], 1)  # < 0: the clip's own CoM was outside too
+        return ev
+
+    def harness_ev(i, a, b):
+        return {"harness_per_body_weight": r(harness[i]), "peak_in_window": r(harness[a:b + 1].max())}
+
+    conditions = {"toe_catch": toe.any(1), "foot_slip": slip.any(1), "self_collision": selfc,
+                  "torque_saturation": torque, "support_exit": exit_}
+    evidence = {"toe_catch": toe_ev, "foot_slip": slip_ev, "self_collision": self_ev,
+                "torque_saturation": torque_ev, "support_exit": exit_ev}
+    if assist > 0:
+        conditions["harness_spike"] = spike
+        evidence["harness_spike"] = harness_ev
+    window = max(1, int(round(float(d.get("window_s", 0.75)) * fps)))
+    settle = 3  # frames after a (re)start, while the robot settles on the floor
+    out, prev = [], 0
+    for fr in fall_frames:
+        if fr >= T:
+            break
+        start = min(max(prev + settle, fr - window), fr)
+        out.append(diagnose_fall(conditions, evidence, fr, start, fps, int(d.get("min_frames", 2)),
+                                 earliest=min(prev + settle, fr)))
+        prev = fr
+    return out
+
+
+def run_physics(robot, human, skel, human_qc, robot_qc, qc_cfg: QCConfig, cfg: dict, substeps: int) -> int:
+    """PhysX tracking of the robot motion (see the module docstring); writes <clip>_sim.npz / .json."""
+    import re
+
+    from PIL import Image
+    from isaacsim.core.simulation_manager import SimulationManager
+
+    from dataclasses import replace
+
+    m = robot.m
+    f0 = min(max(int(round(args.start * m.fps)), 0), m.num_frames - 1)
+    f1 = m.num_frames if args.end is None else min(m.num_frames, int(round(args.end * m.fps)) + 1)
+    f1 = max(f1, f0 + 1)
+    if (f0, f1) != (0, m.num_frames):  # --start / --end: simulate that segment only (times below are segment times)
+        m = robot.m = replace(m, root_pos=m.root_pos[f0:f1], root_quat=m.root_quat[f0:f1], dof_pos=m.dof_pos[f0:f1])
+        log(f"physics segment: frames {f0}..{f1 - 1} ({f0 / m.fps:.2f}-{(f1 - 1) / m.fps:.2f} s of the clip)")
+    seg_start = f0 / m.fps
+    fps, n = m.fps, m.num_frames
+    out = os.path.abspath(args.check_out)
+    os.makedirs(out, exist_ok=True)
+    art, off = robot.art, robot.offset
+    dof_names = art.dof_names
+    D = len(dof_names)
+
+    # reference in the asset's DoF order, plus velocities
+    q_ref = np.zeros((n, D))
+    q_ref[:, robot.dst] = m.dof_pos[:, robot.src]
+    qd_ref = np.gradient(q_ref, 1.0 / fps, axis=0) if n > 1 else np.zeros_like(q_ref)
+    p_ref = m.root_pos + off
+    quat_ref = m.root_quat.copy()
+    for i in range(1, n):
+        if np.dot(quat_ref[i], quat_ref[i - 1]) < 0:
+            quat_ref[i] *= -1
+    R_ref = quat_to_matrix(quat_ref)
+    v_ref = np.gradient(p_ref, 1.0 / fps, axis=0) if n > 1 else np.zeros_like(p_ref)
+    w_ref = np.zeros((n, 3))
+    if n > 1:
+        w_ref[:-1] = _log_rot(R_ref[1:] @ np.swapaxes(R_ref[:-1], -1, -2)) * fps
+        w_ref[-1] = w_ref[-2]
+
+    # joint drives
+    kp, kd = np.zeros(D), np.zeros(D)
+    for i, dn in enumerate(dof_names):
+        for g in cfg["pd"]:
+            if re.fullmatch(g["pattern"], dn):
+                kp[i], kd[i] = float(g["stiffness"]), float(g["damping"])
+                break
+    art.set_dof_gains(stiffnesses=kp[None], dampings=kd[None])
+    sim = cfg["sim"]
+    try:
+        art.set_solver_iteration_counts(position_counts=[int(sim.get("solver_position_iterations", 8))],
+                                        velocity_counts=[int(sim.get("solver_velocity_iterations", 2))])
+    except Exception as e:
+        log(f"solver iteration counts not set: {e}")
+    max_eff = np.asarray(art.get_dof_max_efforts().numpy()[0], float)
+    mass = float(np.asarray(art.get_link_masses().numpy()[0]).sum())
+    weight = mass * 9.81
+
+    # pelvis harness
+    scale = max(float(args.assist), 0.0)
+    wn = 2 * np.pi * float(cfg["assist"].get("pos_hz", 2.0))
+    kp_lin, kd_lin = scale * mass * wn ** 2, scale * 2 * mass * wn
+    kp_rot = scale * float(cfg["assist"].get("rot_stiffness", 300.0))
+    kd_rot = scale * float(cfg["assist"].get("rot_damping", 30.0))
+    axes = np.array([1.0, 1.0, 1.0 if cfg["assist"].get("vertical", False) else 0.0])  # harness force axes
+    fall = cfg["fall"]
+    log(f"physics: {fps * substeps:g} Hz ({substeps} steps per frame), mass {mass:.1f} kg, harness x{scale:g}, "
+        f"{len(q_ref)} frames")
+
+    def root_state():
+        p, q = (np.asarray(a.numpy()[0], float) for a in art.get_world_poses())
+        v, w = (np.asarray(a.numpy()[0], float) for a in art.get_velocities())
+        return p, q, v, w
+
+    def place(f: int, dz: float) -> None:
+        art.set_world_poses(positions=(p_ref[f] + [0.0, 0.0, dz])[None], orientations=quat_ref[f][None])
+        art.set_dof_positions(q_ref[f][None])
+        art.set_dof_position_targets(q_ref[f][None])
+        art.set_dof_velocities(qd_ref[f][None])
+        art.set_dof_velocity_targets(qd_ref[f][None])
+        art.set_velocities(v_ref[f][None], w_ref[f][None])
+
+    def reset(f: int) -> float:
+        """(Re)start from the clip's frame f, lifted so that no sole is below the floor."""
+        place(f, 0.05)
+        SimulationManager.step(steps=1)
+        z, _, _ = robot.sole_heights()
+        lift = max(0.0, 0.002 - (float(z.min()) - 0.05))
+        place(f, lift)
+        return lift
+
+    def reference_pass() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Link poses and sole points of the clip's own frames: the robot is put in each
+        frame's pose 0.5 m up (no contact) and stepped once so PhysX moves its links."""
+        lp, lq, sp = [], [], []
+        up = np.array([0.0, 0.0, 0.5])
+        zero = np.zeros((1, D))
+        for f in range(n):
+            progress("reference", f, n)
+            art.set_world_poses(positions=(p_ref[f] + up)[None], orientations=quat_ref[f][None])
+            art.set_dof_positions(q_ref[f][None])
+            art.set_dof_position_targets(q_ref[f][None])
+            art.set_dof_velocities(zero)
+            art.set_dof_velocity_targets(zero)
+            art.set_velocities(np.zeros((1, 3)), np.zeros((1, 3)))
+            SimulationManager.step(steps=1)
+            a, b = robot.link_poses()
+            lp.append(a - up)
+            lq.append(b)
+            sp.append(robot.sole_points() - up)
+        return np.array(lp), np.array(lq), np.array(sp)
+
+    # recording
+    rec = {k: [] for k in ("p", "q", "dof", "f_mean", "f_max", "t_mean", "tau", "support", "z", "flat", "xy",
+                           "lp", "lq", "sp", "ff")}
+
+    def record(f: int, forces: list, torques: list) -> tuple:
+        p, q, _, _ = root_state()
+        dof = np.asarray(art.get_dof_positions().numpy()[0], float)
+        dofv = np.asarray(art.get_dof_velocities().numpy()[0], float)
+        rec["p"].append(p)
+        rec["q"].append(q)
+        rec["dof"].append(dof)
+        rec["f_mean"].append(float(np.mean(forces)) if forces else 0.0)
+        rec["f_max"].append(float(np.max(forces)) if forces else 0.0)
+        rec["t_mean"].append(float(np.mean(torques)) if torques else 0.0)
+        rec["tau"].append(kp * (q_ref[f] - dof) + kd * (qd_ref[f] - dofv))  # drive demand before clipping
+        support = np.nan
+        forces_z = np.full(len(robot.foot_names), np.nan)
+        if robot.contacts:
+            try:
+                impulse_to_force = SimulationManager.get_physics_dt()  # the view returns impulses by default
+                forces_z = np.abs(np.asarray(robot.feet.get_net_contact_forces(dt=impulse_to_force).numpy())[:, 2])
+                support = float(forces_z.sum()) / weight
+            except Exception as e:
+                log(f"foot contact forces unavailable: {type(e).__name__}: {e}")
+                robot.contacts = False
+        rec["support"].append(abs(support))
+        rec["ff"].append(forces_z)
+        z, flat, pos = robot.sole_heights()
+        rec["z"].append(z)
+        rec["flat"].append(flat)
+        rec["xy"].append(pos[:, :2])
+        lp, lq = robot.link_poses()
+        rec["lp"].append(lp)
+        rec["lq"].append(lq)
+        rec["sp"].append(robot.sole_points())
+        return p, q
+
+    snap = SnapCamera() if (args.video or args.snapshots > 0) else None
+    every = max(1, int(round(fps / args.video_fps))) if args.video else 0
+    snap_frames = set(np.linspace(0, n - 1, max(args.snapshots, 0)).astype(int).tolist())
+    video_tmp = tempfile.TemporaryDirectory(prefix="kh_video_") if args.video else None
+    n_video, snapshots = 0, []
+
+    def focus(f: int, p: np.ndarray) -> np.ndarray:
+        pts = [p]
+        if skel is not None:
+            pts.append(skel.root_position(min(int((f / fps + seg_start) * human.fps), human.num_frames - 1)))
+        return np.mean(pts, axis=0)
+
+    def show(f: int, p: np.ndarray, fallen: bool) -> None:
+        nonlocal n_video
+        if snap is None or not (f in snap_frames or (every and f % every == 0) or fallen):
+            return
+        if skel is not None:
+            skel.update(min(int((f / fps + seg_start) * human.fps), human.num_frames - 1))
+        img = snap.capture(focus(f, p), 4 if snapshots or n_video else 9)
+        if img is None:
+            return
+        if f in snap_frames or fallen:
+            path = os.path.join(out, f"{m.name}_sim_f{f:06d}.png")
+            Image.fromarray(img).save(path)
+            snapshots.append(path)
+        if every and f % every == 0:
+            label = f"PhysX, harness x{scale:g}" + ("  FALL" if fallen else "")
+            video_frame(img, f, f / fps, f"{m.name}  [{label}]", fallen).save(
+                os.path.join(video_tmp.name, f"f{n_video:05d}.png"))
+            n_video += 1
+
+    t0 = time.perf_counter()
+    ref_lp, ref_lq, ref_sp = reference_pass()
+    log(f"reference pass: {n} frames in {time.perf_counter() - t0:.1f}s")
+    t0 = time.perf_counter()
+    lifts = [reset(0)]
+    # retargets often leave the feet a little in the floor: the robot starts that much
+    # higher, and the harness keeps that height (not the clip's) as its target
+    p_ref[:, 2] += lifts[0]
+    falls: list[float] = []
+    fall_frames: list[int] = []
+    p, q = record(0, [], [])
+    show(0, p, False)
+    for f in range(n - 1):
+        progress("simulate", f, n - 1)
+        forces, torques = [], []
+        vt = (q_ref[f + 1] - q_ref[f]) * fps
+        for s in range(substeps):
+            a = s / substeps
+            art.set_dof_position_targets((q_ref[f] + a * (q_ref[f + 1] - q_ref[f]))[None])
+            art.set_dof_velocity_targets(vt[None])
+            if scale > 0:
+                p, q, v, w = root_state()
+                pt = p_ref[f] + a * (p_ref[f + 1] - p_ref[f])
+                Rt = quat_to_matrix(_nlerp(quat_ref[f], quat_ref[f + 1], a))
+                F = axes * (kp_lin * (pt - p) + kd_lin * (v_ref[f] - v))
+                T = kp_rot * _log_rot(Rt @ quat_to_matrix(q).T) + kd_rot * (w_ref[f] - w)
+                robot.root_link.apply_forces_and_torques_at_pos(F[None], T[None])
+                forces.append(float(np.linalg.norm(F)))
+                torques.append(float(np.linalg.norm(T)))
+            SimulationManager.step(steps=1)
+        p, q = record(f + 1, forces, torques)
+        tilt = np.degrees(np.linalg.norm(_log_rot(quat_to_matrix(q) @ R_ref[f + 1].T)))
+        fallen = (np.linalg.norm(p - p_ref[f + 1]) > float(fall.get("root_error_m", 0.5))
+                  or tilt > float(fall.get("tilt_error_deg", 60.0))
+                  or p[2] - off[2] < float(fall.get("min_pelvis_height_m", 0.3))
+                  or p_ref[f + 1, 2] - p[2] > float(fall.get("drop_m", 0.25)))
+        show(f + 1, p, fallen)
+        if fallen:
+            falls.append(round((f + 1) / fps, 3))
+            fall_frames.append(f + 1)
+            log(f"fall at {(f + 1) / fps:.2f}s")
+            if args.no_reset:
+                break
+            lifts.append(reset(f + 1))
+        if f % 300 == 0:
+            log(f"frame {f}/{n - 1}")
+    log(f"simulated {len(rec['p'])} frames in {time.perf_counter() - t0:.1f}s")
+
+    # results
+    T = len(rec["p"])
+    P, Q, DOF = np.array(rec["p"]), np.array(rec["q"]), np.array(rec["dof"])
+    sim_dof = m.dof_pos[:T].copy()
+    sim_dof[:, robot.src] = DOF[:, robot.dst]
+    sim_motion = RobotMotion(name=f"{m.name}_sim", joint_names=list(m.joint_names), root_pos=P - off,
+                             root_quat=Q, dof_pos=sim_dof, fps=fps, source=os.path.abspath(args.robot_motion))
+    base = os.path.join(out, f"{m.name}_sim")
+    sim_motion.save_npz(base + ".npz")
+
+    err = np.degrees(np.abs(DOF[:, robot.dst] - q_ref[:T, robot.dst]))
+    rmse = np.sqrt((err ** 2).mean(0))
+    names = [dof_names[i] for i in robot.dst]
+    worst = np.argsort(-rmse)[:5]
+    root_err = np.linalg.norm((P - p_ref[:T])[:, :2], axis=1)
+    height_err = P[:, 2] - p_ref[:T, 2]  # < 0: the clip floats above where the robot can stand
+    rot_err = np.degrees(np.linalg.norm(_log_rot(quat_to_matrix(Q) @ np.swapaxes(R_ref[:T], -1, -2)), axis=-1))
+    harness = np.array(rec["f_mean"]) / weight
+    flag = float(cfg["report"].get("assist_flag_ratio", 0.2))
+    # only the clip's joints: DoFs it does not drive (G1 fingers, held at 0) have tiny effort limits
+    tau_ratio = np.abs(np.array(rec["tau"]))[:, robot.dst] / np.maximum(max_eff[robot.dst], 1e-6)
+    saturated = (tau_ratio > 1.0).any(1)
+    peak = tau_ratio.max(0)
+    top_tau = [robot.dst[i] for i in np.argsort(-peak)[:5]]
+    peak = dict(zip(robot.dst, peak))
+    flagged = float((harness > flag).mean()) if scale > 0 else 0.0
+    verdict = []
+    if falls:
+        verdict.append(f"{len(falls)} fall(s)")
+    if flagged > float(cfg["report"].get("max_flagged_ratio", 0.05)):
+        verdict.append(f"harness > {flag:.0%} body weight in {flagged:.1%} of frames")
+    if saturated.mean() > float(cfg["report"].get("max_saturated_ratio", 0.05)):
+        verdict.append(f"torque limits exceeded in {saturated.mean():.1%} of frames")
+    support = np.array(rec["support"], float)
+    # balance of the clip (reference pass, floor tracked) and of the simulated robot (floor at z = 0)
+    ref_track, _, ref_bal = balance_of(robot, ref_lp, ref_lq, ref_sp, fps, qc_cfg)
+    LP, SP = np.array(rec["lp"]), np.array(rec["sp"])
+    sim_track, _, sim_bal = balance_of(robot, LP, np.array(rec["lq"]), SP, fps, qc_cfg, floor=np.zeros(T),
+                                       breaks=[fr + 1 for fr in fall_frames])  # the robot was reset after each fall
+    diagnoses = fall_diagnosis(cfg["diagnosis"], fps, fall_frames, robot, ref_sp[:T], SP, LP, np.array(rec["ff"]),
+                               weight, tau_ratio, names, sim_track, harness, scale, ref_track)
+    physics = {
+        "engine": "PhysX via Isaac Sim (isaacsim.core.simulation_manager)",
+        "physics_hz": round(fps * substeps, 3),
+        "harness_scale": scale,
+        "robot_mass_kg": round(mass, 2),
+        "consistent": not verdict,
+        "issues": verdict,
+        "falls": len(falls),
+        "fall_times_s": falls[:50],
+        "first_fall_cause": diagnoses[0]["primary_cause"] if diagnoses else None,
+        "fall_diagnosis": diagnoses[:20],
+        "balance": sim_bal,
+        "start_lift_m": [round(x, 4) for x in lifts[:20]],
+        "simulated_frames": T,
+        "harness_force_per_body_weight": _stats(harness),
+        "harness_force_max_per_body_weight": _stats(np.array(rec["f_max"]) / weight),
+        "harness_torque_nm": _stats(rec["t_mean"], 1),
+        f"harness_flagged_ratio(>{flag:.0%} body weight)": round(flagged, 4),
+        "feet_support_per_body_weight": _stats(support) if np.isfinite(support).any() else None,
+        "tracking": {
+            "joint_rmse_deg_median": round(float(np.median(rmse)), 2),
+            "joint_rmse_deg_max": round(float(rmse.max()), 2),
+            "worst_joints_deg": {names[i]: round(float(rmse[i]), 1) for i in worst},
+            "root_position_error_m": _stats(root_err),  # horizontal
+            "root_height_error_m": {"mean": round(float(height_err.mean()), 3),
+                                    "min": round(float(height_err.min()), 3), "max": round(float(height_err.max()), 3)},
+            "root_rotation_error_deg": _stats(rot_err, 1),
+        },
+        "torque": {
+            "saturated_frame_ratio": round(float(saturated.mean()), 4),
+            "peak_demand_per_limit": {dof_names[i]: round(float(peak[i]), 2) for i in top_tau},
+        },
+        "gains": cfg["pd"],
+        "assist": cfg["assist"],
+    }
+    rf = np.arange(T)
+    summary = {"clip": m.name, "reference_motion": os.path.abspath(args.robot_motion),
+               "simulated_motion": base + ".npz", "fps": fps, "duration_s": round(n / fps, 3),
+               "replayed_s": [round(seg_start, 3), round(seg_start + (n - 1) / fps, 3)],  # fall / onset times count from replayed_s[0]
+               "physics": physics,
+               "robot_sim": foot_summary(rf, np.array(rec["z"]), np.array(rec["flat"]), np.array(rec["xy"]), fps,
+                                         robot.foot_names, qc_cfg),
+               "snapshots": snapshots}
+    summary["reference_balance"] = ref_bal
+    if robot_qc is not None:
+        summary["reference_robot_qc"] = robot_qc.row()
+    if human_qc is not None:
+        summary["human_qc"] = human_qc.row()
+    if video_tmp is not None:
+        summary["video"] = encode_video(video_tmp.name, n_video, fps / every, os.path.abspath(args.video))
+        video_tmp.cleanup()
+    with open(base + ".json", "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, indent=2, ensure_ascii=False, default=str)
+    log(f"wrote {base}.npz / .json  ->  {'consistent' if not verdict else '; '.join(verdict)}")
+    print(json.dumps({k: summary[k] for k in ("clip", "physics", "robot_sim")}, indent=2, ensure_ascii=False,
+                     default=str), flush=True)
     return 0
 
 

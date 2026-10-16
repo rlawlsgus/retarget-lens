@@ -1,6 +1,7 @@
 """AMASS-style SMPL / SMPL+H / SMPL-X parameter files -> joint positions.
 
-Pure numpy skeleton FK (no torch, no mesh skinning). Joint locations need the
+Pure numpy skeleton FK (no torch); :func:`body_mesh_rig` adds linear-blend
+skinning data for drawing the body surface. Joint locations need the
 body-model file (e.g. SMPLX_NEUTRAL.npz), which is licence-gated: register at
 https://smpl-x.is.tue.mpg.de (SMPL-X) or https://mano.is.tue.mpg.de (SMPL+H)
 and point ``model_dir`` / $SMPL_MODEL_DIR at the folder holding
@@ -147,3 +148,38 @@ def load_amass_npz(
         meta=meta,
         rotations=g_rot if with_rotations else None,
     )
+
+
+class BodyMeshRig:
+    """Body surface of an AMASS clip by linear blend skinning (no pose correctives).
+
+    ``vertices(f)`` -> (V, 3) world vertices of frame f (Z-up, meters), the same
+    world as :func:`load_amass_npz`. ``faces`` (F, 3).
+    """
+
+    def __init__(self, path: str, model_dir: str | None = None, gender: str | None = None):
+        self.motion = load_amass_npz(path, model_dir=model_dir, gender=gender, with_rotations=True)
+        d = np.load(path, allow_pickle=True)
+        betas = d["betas"].astype(np.float64).reshape(-1) if "betas" in d else np.zeros(10)
+        model_dir = model_dir or os.environ.get("SMPL_MODEL_DIR")
+        m = np.load(_find_model_file(model_dir, self.motion.meta["model_type"], self.motion.meta["gender"]),
+                    allow_pickle=True)
+        v = m["v_template"].astype(np.float64)
+        shapedirs = m["shapedirs"].astype(np.float64)
+        n = min(len(betas), shapedirs.shape[-1])
+        self.rest = v + shapedirs[..., :n] @ betas[:n]
+        self.faces = np.asarray(m["f"], dtype=np.int32)
+        J = len(self.motion.joint_names)
+        self.weights = np.asarray(m["weights"], dtype=np.float64)[:, :J]
+        self.rest_joints, _ = _rest_joints(_find_model_file(model_dir, self.motion.meta["model_type"],
+                                                            self.motion.meta["gender"]), betas)
+        self.rest_joints = self.rest_joints[:J]
+        self.fps = self.motion.fps
+        self.num_frames = self.motion.num_frames
+
+    def vertices(self, f: int) -> np.ndarray:
+        G = self.motion.rotations[f]  # (J, 3, 3) world joint rotations
+        p = self.motion.positions[f]  # (J, 3) world joint positions
+        A = np.concatenate([G, (p - np.einsum("jab,jb->ja", G, self.rest_joints))[..., None]], -1)  # (J, 3, 4)
+        B = (self.weights @ A.reshape(len(A), 12)).reshape(-1, 3, 4)
+        return np.einsum("vab,vb->va", B[..., :3], self.rest) + B[..., 3]

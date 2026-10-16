@@ -15,6 +15,7 @@
 | conda | Miniconda 또는 Miniforge, **conda-forge 채널만** | conda 26.7.1 (Miniconda, `%LOCALAPPDATA%\miniconda3`) |
 | Python | 3.12 (Isaac Sim 6.1 내장 Python과 같은 마이너 버전) | env 3.12.15 / Isaac 내장 3.12.13 |
 | GMR | YanjieZe/GMR 커밋 `bb1bbe40774794fceb2a7c579a3464a28e68c844` (MIT), 프로젝트 폴더 밖 `..\GMR` | 같음 |
+| Blender | FBX 입력에만 필요. **4.5 LTS** 포터블 zip, `C:\blender`(또는 `BLENDER` 환경변수) | 4.5.14 LTS (`C:\blender\blender-4.5.14-windows-x64`) |
 | ffmpeg | 선택. `isaac_replay.py --video`의 MP4 출력용(없으면 GIF), PATH에 있어야 함 | 2024-09-22 gyan.dev full build, `C:\ffmpeg\bin` |
 | 웹 브라우저 | 비교 뷰어용 (WebGL). 기본 주소 `http://127.0.0.1:8080`, 이 PC에서만 접속 | Chromium 계열에서 확인 |
 | 인터넷 | 설치와 Isaac 로봇 에셋(G1 USD) 로딩에 필요 (6절) | – |
@@ -27,6 +28,7 @@
 | Isaac Sim 설치 폴더 `C:\isaacsim` | 18.3 GB (셰이더 캐시는 사용자 폴더에 따로 쌓임) |
 | conda env `k-humanoid` | 2.2 GB |
 | GMR 부분 체크아웃 `..\GMR` | 53 MB |
+| Blender 4.5.14 `C:\blender` (FBX용, zip 380 MB는 지워도 됨) | 약 1.2 GB |
 | 공개 샘플·리타겟 결과 `data/` | 30 MB (받는 중에는 LAFAN1 zip 137 MB가 잠깐 필요) |
 
 ## 2. 설치 순서
@@ -44,7 +46,15 @@ conda activate k-humanoid
 
 # 3) 공개 샘플 (선택)
 python tools\fetch_samples.py
+
+# 4) Blender 4.5 LTS (선택, FBX 입력용): zip을 C:\blender에 풀기만 하면 됨
+#    https://download.blender.org/release/Blender4.5/blender-4.5.14-windows-x64.zip
+#    380 MB, sha256 b9533d2397ac1984db4466fb23a7a4649391cca93f6e84209f9bcc60d071c8b9
+Expand-Archive blender-4.5.14-windows-x64.zip -DestinationPath C:\blender
 ```
+
+- Blender는 FBX를 읽을 때만 씁니다(`khumanoid/io/fbx.py`가 헤드리스로 실행). 다른 위치에 풀었으면 `BLENDER=<blender.exe>`를 설정합니다. 4.5 LTS 밖의 버전은 확인하지 않았습니다.
+- PyPI `ufbx` 0.0.5는 시험 후 쓰지 않기로 했습니다(메타데이터가 비어 있고, 노드 접근에서 접근 위반·잘못된 부모 값). env에서 제거했습니다.
 
 - Isaac Sim zip은 `https://downloads.isaacsim.nvidia.com/isaac-sim-standalone-6.1.0-windows-x86_64.zip`이고 MD5는 `a07968e980072c9ca27b2166443e2d89`입니다. 스크립트가 받기·확인·압축 해제·`post_install.bat`을 처리합니다.
 - `post_install.bat`은 GUI 예제 링크만 만듭니다. 관리자 권한이 없어 실패해도 시뮬레이터는 정상입니다.
@@ -108,6 +118,7 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 | 로봇 에셋 | Unitree G1을 Isaac 에셋 서버에서 실행할 때마다 읽음: `https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.1/Isaac/Robots_Multiphysics/Unitree/G1/g1.usda`. 오프라인이면 `--robot-usd`로 로컬 USD 지정 |
 | 렌더링 | 헤드리스 스냅샷·동영상은 RTX 카메라 센서 사용(960×540) |
 | 동영상 | `--video`가 PNG 프레임을 만든 뒤 ffmpeg(libx264)로 MP4로 묶음. ffmpeg가 없으면 GIF |
+| 물리 재생 | `--physics`: PhysX CPU, 240 Hz(모션 30 fps당 8스텝). 앱 업데이트가 물리를 진행하지 않게(`/app/player/playSimulations` 끔) 하고 `SimulationManager.step`으로만 진행. 설정은 `configs/physics.yaml`. 11초 클립 약 1분(동영상 포함 약 2분) |
 
 ## 6. 네트워크와 외부 소스
 
@@ -118,7 +129,8 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 | `pypi.org`, `files.pythonhosted.org` | mink, smplx | env 생성 |
 | `api.github.com`, `raw.githubusercontent.com` | GMR 소스(고정 커밋), CMU BVH | `install_gmr.ps1`, `fetch_samples.py` |
 | `media.githubusercontent.com` | LAFAN1 zip (Git LFS) | `fetch_samples.py lafan1` |
-| `huggingface.co` | Unitree LAFAN1 G1 csv | `fetch_samples.py unitree` |
+| `huggingface.co` | Unitree LAFAN1 G1 csv, CMU FBX(`gbionics/cmu-fbx`) | `fetch_samples.py unitree`, `fetch_samples.py cmu_fbx` |
+| `download.blender.org` | Blender 4.5 LTS zip | FBX를 쓸 때 설치 |
 | `omniverse-content-production.s3-us-west-2.amazonaws.com` | Isaac 로봇 에셋(G1) | Isaac 재생할 때마다 |
 
 - **`repo.anaconda.com`(Anaconda defaults 채널)은 이 네트워크에서 막혀 있습니다**(HTTP 429, 클라이언트 등록 필요). `setup_env.ps1`은 프로세스에 `CONDA_CHANNELS=conda-forge`를 설정하고, environment.yml도 `nodefaults`입니다. `.condarc`는 건드리지 않습니다.
@@ -139,11 +151,13 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 
 ```powershell
 conda activate k-humanoid
-python -m pytest tests                     # 20 passed (GMR이 없으면 GMR이 필요한 4개, AMASS·SMPL-X 파일이 없으면 1개 skip)
+python -m pytest tests                     # 28 passed (GMR, AMASS·SMPL-X 파일, Blender·FBX 샘플, 리타겟 결과가 없으면 해당 테스트만 skip)
 python -c "import general_motion_retargeting, mujoco, torch; print(mujoco.__version__, torch.__version__)"   # 3.11.0 2.10.0
 python tools\retarget.py data\raw\cmu_bvh\02_01.bvh --smooth 6 --out-dir data\retargeted\check
 #   -> 86 frames @ 30 fps, residual feet 약 0.66 cm
 $env:OMNI_KIT_ACCEPT_EULA = "YES"
 python tools\isaac_replay.py --human data\raw\cmu_bvh\02_01.bvh --robot-motion data\retargeted\check\02_01_g1.npz --headless --check-out reports\check
 #   -> reports\check\02_01_sim_check.json: human_qc / robot_qc 모두 PASS
+python tools\isaac_replay.py --robot-motion data\retargeted\check\02_01_g1.npz --physics --check-out reports\check
+#   -> reports\check\02_01_g1_sim.json / _sim.npz: 넘어짐 0, 관절 추종 RMSE 중앙값 약 0.4°
 ```

@@ -1,6 +1,6 @@
 """Download a few small public mocap clips into data/raw/ for end-to-end checks.
 
-    python tools/fetch_samples.py                 # all three sets
+    python tools/fetch_samples.py                 # all sets
     python tools/fetch_samples.py cmu unitree     # pick sets
 
 Every file is pinned to a repository revision and checked against the hash the
@@ -10,6 +10,9 @@ SOURCE.md with the origin, revision and licence, because the licences differ:
   cmu      CMU Graphics Lab mocap, cgspeed 2010 BVH conversion (2.3 MB).
            Free for research and commercial use, redistribution allowed;
            do not sell the data itself. -> usable for the public dataset.
+  cmu_fbx  The same six CMU clips as FBX (Hugging Face gbionics/cmu-fbx, 0.8 MB):
+           RancidMilk's Blender conversion of the cgspeed Daz-friendly BVHs.
+           CMU terms -> usable for the public dataset.
   unitree  Unitree's G1 retarget of LAFAN1 (csv, 30 fps, 8 MB).
            CC BY-NC-ND 4.0 -> internal validation only, never redistribute.
   lafan1   Ubisoft LAFAN1 BVH for the same four clips (137 MB zip; only the
@@ -55,6 +58,20 @@ SETS = {
         "notes": "cgspeed 변환본은 모든 파일의 0번 프레임에 T-pose를 끼워 넣었다(원본 캡처 아님). "
                  "파일에는 모두 120 fps로 적혀 있지만 143번 등 일부 피험자는 60 Hz 촬영이다(BVH 로더가 "
                  "khumanoid/io/cmu_frame_rates.json으로 보정). Y-up, 단위 inch/0.45. 손가락·엄지 관절은 데이터 없음.",
+    },
+    "cmu_fbx": {
+        "folder": "cmu_fbx",
+        "host": "hf",
+        "repo": "gbionics/cmu-fbx",
+        "rev": None,
+        "files": {**{f"animations/{c}.fbx": f"{c}.fbx" for c in ("02_01", "02_03", "16_17", "143_11", "143_13", "143_28")},
+                  "README.md": "README.md", "metadata.csv": "metadata.csv"},
+        "license": "CMU Graphics Lab Motion Capture Database terms (데이터셋 카드: license other / cmu-mocap)",
+        "usage": "공개 데이터셋 사용 가능(CMU 약관). 데이터 자체 판매 금지, 재배포 시 같은 조건과 mocap.cs.cmu.edu 사사 표기.",
+        "notes": "RancidMilk가 cgspeed의 Daz판 BVH를 Blender + Auto-Rig Pro로 게임 캐릭터(Quaternius CC0) 골격에 옮겨 "
+                 "FBX로 내보낸 것(뼈대만, 손가락 없음). 관절 이름 hip/abdomen/lThigh…(Daz), 30 fps로 다시 뽑음. "
+                 "0번 프레임은 T-pose. cgspeed의 120 Hz 가정을 물려받아 60 Hz 피험자(143)는 2배속 -> load_fbx가 보정. "
+                 "수치는 cm인데 장면 단위가 m라 100배 큼 -> load_fbx가 자동 보정.",
     },
     "unitree": {
         "folder": "unitree_lafan1_g1",
@@ -135,13 +152,16 @@ def fetch_github(spec: dict, out: str) -> tuple[str, list[dict]]:
 def fetch_hf(spec: dict, out: str) -> tuple[str, list[dict]]:
     info = http_get(f"https://huggingface.co/api/datasets/{spec['repo']}", True)
     rev = info["sha"]
-    rows, listings = [], {}
+    # hashes of just these paths (folder listings are paginated on large datasets)
+    req = urllib.request.Request(
+        f"https://huggingface.co/api/datasets/{spec['repo']}/paths-info/{rev}",
+        data=json.dumps({"paths": list(spec["files"])}).encode(), method="POST",
+        headers={"User-Agent": "k-humanoid-fetch/1.0", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        entries = {e["path"]: e for e in json.loads(r.read())}
+    rows = []
     for src, name in spec["files"].items():
-        folder = os.path.dirname(src)
-        if folder not in listings:
-            url = f"https://huggingface.co/api/datasets/{spec['repo']}/tree/{rev}" + (f"/{folder}" if folder else "")
-            listings[folder] = http_get(url, True)
-        entry = next(e for e in listings[folder] if e["path"] == src)
+        entry = entries[src]
         algo, expected = ("sha256", entry["lfs"]["oid"]) if entry.get("lfs") else ("git-sha1", entry["oid"])
         dst = os.path.join(out, name)
         if not os.path.isfile(dst):

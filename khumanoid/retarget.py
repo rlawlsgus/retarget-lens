@@ -13,6 +13,9 @@ Source formats:
               derived per clip: GMR's LAFAN1 task list and weights for the
               robot, with rotation offsets, per-body scales and ground height
               computed from the T-pose and the robot model.
+  ``fbx``     FBX skeleton animation (read with Blender, khumanoid.io.fbx) with
+              the same derived config: the armature's rest pose, or frame 0 when
+              that is the inserted T-pose of a cgspeed CMU conversion.
   ``smplx``   AMASS SMPL / SMPL-X npz with the same derived config as ``tpose``
               (the body model's zero pose is a T-pose), so BVH and SMPL-X
               retargets of one clip are comparable. Needs the licence-gated
@@ -52,15 +55,17 @@ TPOSE_BODIES = (
     "LeftArm", "LeftForeArm", "LeftHand", "RightArm", "RightForeArm", "RightHand",
 )
 
-# Joint names of common BVH exporters (MotionBuilder / CMU cgspeed, Xsens MVN,
-# OptiTrack Motive) and of SMPL / SMPL-X for each body. Right side is derived from the left.
+# Joint names of common BVH / FBX exporters (MotionBuilder / CMU cgspeed / Mixamo,
+# Xsens MVN, OptiTrack Motive, Daz / Poser) and of SMPL / SMPL-X for each body.
+# Right side is derived from the left. A namespace ("mixamorig:") or a prefix that
+# every joint shares ("Skeleton1_") is ignored.
 _LEFT_ALIASES = {
-    "UpLeg": ("LeftUpLeg", "LeftUpperLeg", "LeftThigh", "LThigh", "left_hip"),
-    "Leg": ("LeftLeg", "LeftLowerLeg", "LeftShin", "LShin", "left_knee"),
-    "Foot": ("LeftFoot", "LFoot", "left_ankle"),
-    "Arm": ("LeftArm", "LeftUpperArm", "LUArm", "left_shoulder"),
-    "ForeArm": ("LeftForeArm", "LeftLowerArm", "LFArm", "left_elbow"),
-    "Hand": ("LeftHand", "LHand", "left_wrist"),
+    "UpLeg": ("LeftUpLeg", "LeftUpperLeg", "LeftThigh", "LThigh", "lThigh", "left_hip"),
+    "Leg": ("LeftLeg", "LeftLowerLeg", "LeftShin", "LShin", "lShin", "left_knee"),
+    "Foot": ("LeftFoot", "LFoot", "lFoot", "left_ankle"),
+    "Arm": ("LeftArm", "LeftUpperArm", "LUArm", "lShldr", "left_shoulder"),
+    "ForeArm": ("LeftForeArm", "LeftLowerArm", "LFArm", "lForeArm", "left_elbow"),
+    "Hand": ("LeftHand", "LHand", "lHand", "left_wrist"),
 }
 
 
@@ -69,7 +74,18 @@ def _right_alias(name: str) -> str:
         return "Right" + name[4:]
     if name.startswith("left_"):
         return "right_" + name[5:]
+    if name.startswith("l"):
+        return "r" + name[1:]  # Daz: lThigh -> rThigh
     return "R" + name[1:]  # OptiTrack: LThigh -> RThigh
+
+
+def _strip_common_prefix(names: list[str]) -> list[str]:
+    """Drop a namespace ("mixamorig:Hips") or a prefix every joint shares ("Skeleton1_Hips")."""
+    for sep in (":", "_"):
+        heads = {n.split(sep, 1)[0] for n in names}
+        if len(heads) == 1 and all(sep in n for n in names):
+            return [n.split(sep, 1)[1] for n in names]
+    return list(names)
 _HIPS_ALIASES = ("Hips", "Hip", "Pelvis", "hip", "pelvis")
 
 # T-pose of the robot, matched to the human's reference frame one joint at a
@@ -225,8 +241,10 @@ def detect_format(path: str) -> str:
         if "pose_body" in keys:
             return "smplx"
         raise ValueError(f"{path}: not an AMASS SMPL-X npz (no 'pose_body'; keys {sorted(keys)[:8]})")
+    if ext == ".fbx":
+        return "fbx"
     if ext != ".bvh":
-        raise ValueError(f"unsupported input {path!r} (expected .bvh or AMASS SMPL-X .npz)")
+        raise ValueError(f"unsupported input {path!r} (expected .bvh, .fbx or AMASS SMPL-X .npz)")
     names = set(bvh_joint_names(path))
     if {"LeftToe", "Spine2", "LeftUpLeg"} <= names and "LeftToeBase" not in names:
         return "lafan1"
@@ -235,6 +253,7 @@ def detect_format(path: str) -> str:
 
 def _resolve_bvh_bodies(names: list[str], parents: np.ndarray) -> dict[str, int]:
     """Our joint index for each body the T-pose config needs (+ the two feet)."""
+    names = _strip_common_prefix(names)
     lookup = {n: i for i, n in enumerate(names)}
     idx = {}
     hips = next((lookup[a] for a in _HIPS_ALIASES if a in lookup), None)
@@ -314,6 +333,35 @@ def load_bvh_tpose(path: str, up_axis: str = "y", ref: str | int = "auto", fps: 
         "unit_scale": m.meta["unit_scale"],
     }
     return _tpose_clip(m.joint_names, idx, P[dropped:], R[dropped:], m.fps, fps, ref_P, ref_R, "tpose", height, info)
+
+
+def load_fbx_tpose(path: str, ref: str | int = "auto", fps: float | None = 30.0, take: str | None = None) -> HumanClip:
+    """FBX -> GMR human frames for the T-pose config, plus the reference pose.
+
+    ref: "auto" (frame 0 when it is the rest pose and the motion starts after it,
+    as in cgspeed CMU conversions; it is then dropped; otherwise the armature's
+    rest pose), "rest", or a frame index of the clip that shows a T-pose.
+    """
+    from .io.fbx import load_fbx
+
+    m = load_fbx(path, with_rotations=True, drop_tpose=False, take=take)
+    idx = _resolve_bvh_bodies(m.joint_names, m.parents)
+    P, R = m.positions, m.rotations
+    tpose0 = m.meta["tpose_frame0"]
+    dropped = 0
+    if ref == "auto":
+        ref = 0 if tpose0 else "rest"
+        dropped = 1 if tpose0 else 0
+    ref_P, ref_R = m.meta["rest_pose"] if ref == "rest" else (P[int(ref)], R[int(ref)])
+    info = {
+        "reference": "rest pose" if ref == "rest" else f"frame {ref}",
+        "dropped_leading_frames": dropped,
+        "source_fps_note": m.meta.get("fps_note") or None,
+        "unit_scale": m.meta["unit_scale"],
+        "fbx_take": m.meta["take"],
+        "fbx_reader": m.meta["reader"],
+    }
+    return _tpose_clip(m.joint_names, idx, P[dropped:], R[dropped:], m.fps, fps, ref_P, ref_R, "fbx", None, info)
 
 
 def _tpose_clip(names, idx, P, R, fps_in, fps, ref_P, ref_R, fmt, height, info) -> HumanClip:
@@ -762,21 +810,190 @@ def smooth_motion(m: RobotMotion, cutoff_hz: float, order: int = 4, limits=None)
     )
 
 
+# Swing legs for ensure_swing_clearance: (foot body, leg joints hip -> ankle).
+_G1_LEGS = [(f"{s}_ankle_roll_link",
+             [f"{s}_{j}_joint" for j in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")])
+            for s in ("left", "right")]
+SWING_LEGS = {"unitree_g1": _G1_LEGS, "unitree_g1_with_hands": _G1_LEGS}
+
+
+def _rot_err(R_target: np.ndarray, R: np.ndarray) -> np.ndarray:
+    """World-frame rotation vector taking R to R_target (small-angle form)."""
+    D = R_target @ R.T
+    return 0.5 * np.array([D[2, 1] - D[1, 2], D[0, 2] - D[2, 0], D[1, 0] - D[0, 1]])
+
+
+def ensure_swing_clearance(m: RobotMotion, robot: str = "unitree_g1", clearance: float = 0.02, slow: float = 0.3,
+                           fast: float = 1.0, rot_weight: float = 0.2,
+                           max_change_deg: float = 20.0) -> tuple[RobotMotion, dict]:
+    """Lift moving feet that skim the floor; returns the motion and a summary.
+
+    The floor under the robot is tracked through the clip (``analysis.floor_track``: the
+    lower of the feet standing still, i.e. whose slowest sole contact point moves slower
+    than ``slow`` m/s horizontally, interpolated between those frames). A clip whose
+    floor drifts (CMU 02_01 rises ~4 cm) keeps a local reference this way. A moving foot must
+    keep every sole point above that floor by a margin that grows with its speed: 0 at
+    ``slow``, ``clearance`` from ``fast`` m/s on. A foot sliding fast close to the floor
+    catches it in physics; one slowing down into touch-down may come close.
+
+    Shortfalls are taken up by the moving foot's leg (feet standing still are never
+    changed). Weighted damped least squares on its six joints lifts the sole points
+    that are too low, keeps the foot's horizontal position, and keeps its orientation
+    only softly (``rot_weight``). No joint moves more than ``max_change_deg``: a foot
+    that reaches below the floor on a nearly straight leg (late touch-down in the clip)
+    would need the knee bent by tens of degrees, so it is lifted only partly and the
+    rest is reported. The joint changes are smoothed over time.
+
+    Why: retargets of one walk differ here. On CMU 02_01 the SMPL-X retarget swings with
+    less knee flexion (heel 0.8 cm above the floor before touch-down) and the FBX retarget
+    toes off pointing 71 deg down (toe 0.6 cm). Kinematic replay shows nothing wrong, but
+    in PhysX both catch the floor, stumble, and the SMPL-X one falls.
+    """
+    import mujoco as mj
+    from scipy.ndimage import gaussian_filter1d, maximum_filter1d
+
+    from .analysis import floor_track, slowest_sole_speed
+
+    legs = SWING_LEGS.get(robot)
+    T = m.num_frames
+    if not legs or clearance <= 0 or T < 4:
+        return m, {}
+    model = robot_model(robot)
+    data = mj.MjData(model)
+    names = robot_joint_names(model)
+    col = {n: i for i, n in enumerate(m.joint_names)}
+    jid = {n: mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in names}
+    lo, hi = robot_joint_ranges(model)
+    rng = {n: (lo[i], hi[i]) for i, n in enumerate(names)}
+    feet = []
+    for body, joints in legs:
+        b = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body)
+        soles = [g for g in range(model.ngeom) if model.geom_bodyid[g] == b
+                 and (model.geom_contype[g] or model.geom_conaffinity[g])]
+        if b < 0 or not soles or any(j not in col for j in joints):
+            return m, {}
+        feet.append((b, soles, joints))
+    G = max(len(f[1]) for f in feet)
+
+    def set_pose(dof_row: np.ndarray, t: int) -> None:
+        q = model.qpos0.copy()
+        q[:3], q[3:7] = m.root_pos[t], m.root_quat[t]
+        for n in names:
+            if n in col:
+                q[model.jnt_qposadr[jid[n]]] = dof_row[col[n]]
+        data.qpos[:] = q
+
+    def sole_points(dof: np.ndarray) -> np.ndarray:
+        P = np.full((T, len(feet), G, 3), np.inf)
+        for t in range(T):
+            set_pose(dof[t], t)
+            mj.mj_kinematics(model, data)
+            for k, (_, soles, _) in enumerate(feet):
+                P[t, k, :len(soles)] = [data.geom_xpos[g] - [0.0, 0.0, model.geom_size[g][0]] for g in soles]
+        return P
+
+    P = sole_points(m.dof_pos)
+    low = P[..., 2].min(-1)  # (T, feet)
+    speed = slowest_sole_speed(P, m.fps)
+    still = speed < slow
+    floor = floor_track(low, speed, m.fps, still=slow)
+    margin = clearance * np.clip((speed - slow) / (fast - slow), 0.0, 1.0)
+    margin = np.stack([gaussian_filter1d(maximum_filter1d(margin[:, k], size=3), 1.0) for k in range(len(feet))], 1)
+    margin[still] = 0.0
+    need = floor[:, None] + margin  # required height of every sole point (T, feet)
+    short = np.where(still, 0.0, np.maximum(need - low, 0.0))
+
+    dof = m.dof_pos.copy()
+    lam = 1e-4
+    cap = np.radians(max_change_deg)
+    for t in np.flatnonzero((short > 1e-3).any(1)):
+        for k, (body, soles, joints) in enumerate(feet):
+            if short[t, k] <= 1e-3:
+                continue
+            set_pose(dof[t], t)
+            mj.mj_kinematics(model, data)
+            xy0 = data.xpos[body][:2].copy()
+            R0 = data.xmat[body].reshape(3, 3).copy()
+            dofs = [model.jnt_dofadr[jid[j]] for j in joints]
+            for _ in range(8):
+                set_pose(dof[t], t)
+                mj.mj_kinematics(model, data)
+                mj.mj_comPos(model, data)
+                rows, errs, w = [], [], []
+                jacp, jacr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+                for g in soles:
+                    z = data.geom_xpos[g][2] - model.geom_size[g][0]
+                    if z < need[t, k] - 1e-4:
+                        mj.mj_jac(model, data, jacp, jacr, data.geom_xpos[g], body)
+                        rows.append(jacp[2, dofs].copy())
+                        errs.append(need[t, k] - z)
+                        w.append(1.0)
+                if not rows:
+                    break
+                mj.mj_jacBody(model, data, jacp, jacr, body)
+                rows += list(jacp[:2, dofs]) + list(jacr[:, dofs])
+                errs += list(xy0 - data.xpos[body][:2]) + list(_rot_err(R0, data.xmat[body].reshape(3, 3)))
+                w += [1.0, 1.0] + [rot_weight] * 3
+                J, e, W = np.array(rows), np.array(errs), np.array(w)
+                dq = np.linalg.solve(J.T @ (W[:, None] * J) + lam * np.eye(len(dofs)), J.T @ (W * e))
+                dq = np.clip(dq, -0.05, 0.05)  # small steps: the active sole points change as the foot moves
+                for j, d in zip(joints, dq):
+                    q0 = m.dof_pos[t, col[j]]
+                    dof[t, col[j]] = np.clip(np.clip(dof[t, col[j]] + d, q0 - cap, q0 + cap), *rng[j])
+
+    leg_joints = [j for _, _, joints in feet for j in joints]
+    leg_cols = [col[j] for j in leg_joints]
+    delta = gaussian_filter1d(dof[:, leg_cols] - m.dof_pos[:, leg_cols], 1.0, axis=0)
+    n_leg = len(feet[0][2])
+    for k in range(len(feet)):  # the smoothing must not reach a foot standing still
+        delta[still[:, k], k * n_leg:(k + 1) * n_leg] = 0.0
+    dof[:, leg_cols] = np.clip(m.dof_pos[:, leg_cols] + delta, [rng[j][0] for j in leg_joints],
+                               [rng[j][1] for j in leg_joints])
+    after = sole_points(dof)[..., 2].min(-1)
+    moving = speed >= fast
+    changed = (np.abs(dof[:, leg_cols] - m.dof_pos[:, leg_cols]) > np.radians(0.1)).any(1)
+    change = np.degrees(np.abs(dof[:, leg_cols] - m.dof_pos[:, leg_cols]))
+
+    def fast_min(z: np.ndarray) -> float | None:
+        return round(100 * float((z - floor[:, None])[moving].min()), 2) if moving.any() else None
+
+    info = {
+        "clearance_cm": round(100 * clearance, 2),
+        "speed_for_full_clearance_mps": fast,
+        "frames_changed": int(changed.sum()),
+        "shortfall_cm": {"mean": round(100 * float(short[short > 1e-3].mean()), 2) if (short > 1e-3).any() else 0.0,
+                         "max": round(100 * float(short.max()), 2)},
+        "remaining_shortfall_cm_max": round(100 * float(np.where(still, 0.0, np.maximum(need - after, 0.0)).max()), 2),
+        "leg_joint_change_deg": {"rmse": round(float(np.sqrt((change ** 2).mean())), 2),
+                                 "max": round(float(change.max()), 2)},
+        "fast_foot_min_clearance_cm": {"before": fast_min(low), "after": fast_min(after)},
+        "floor_drift_cm": round(100 * float(floor.max() - floor.min()), 2),
+    }
+    out = RobotMotion(name=m.name, joint_names=list(m.joint_names), root_pos=m.root_pos.copy(),
+                      root_quat=m.root_quat.copy(), dof_pos=dof, fps=m.fps, source=m.source,
+                      meta={**m.meta, "swing_clearance": info})
+    return out, info
+
+
 def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: float | None = 30.0,
                   up_axis: str = "y", ref: str | int = "auto", smpl_model_dir: str | None = None,
-                  velocity_limit: bool = False, smooth_hz: float = 0.0, log=print) -> tuple[RobotMotion, dict]:
+                  velocity_limit: bool = False, smooth_hz: float = 0.0, swing_clearance: float = 0.0,
+                  log=print) -> tuple[RobotMotion, dict]:
     """Retarget one human motion file. Returns the robot motion and a provenance dict.
 
     smooth_hz > 0 low-passes the result (:func:`smooth_motion`); 6 Hz is the tested
-    setting. velocity_limit is GMR's own option; it caps each IK iteration, not the
-    per-frame change, and left the output unchanged on LAFAN1.
+    setting. swing_clearance > 0 (meters) then lifts swing feet that skim the floor
+    (:func:`ensure_swing_clearance`). velocity_limit is GMR's own option; it caps
+    each IK iteration, not the per-frame change, and left the output unchanged on LAFAN1.
     """
     log = log or (lambda *_: None)
     fmt = detect_format(path) if fmt == "auto" else fmt
     config, ground, cfg_info = None, 0.0, {}
-    if fmt in ("tpose", "smplx"):
+    if fmt in ("tpose", "fbx", "smplx"):
         if fmt == "tpose":
             clip = load_bvh_tpose(path, up_axis=up_axis, ref=ref, fps=fps)
+        elif fmt == "fbx":
+            clip = load_fbx_tpose(path, ref=ref, fps=fps)
         else:
             clip = load_smplx_tpose(path, smpl_model_dir, fps=fps)
         config, ground, cfg_info = derive_tpose_config(robot, clip)
@@ -804,6 +1021,13 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
         motion = smooth_motion(motion, smooth_hz, limits=robot_joint_ranges(model))
         smoothing = {**motion.meta["smoothing"], "ik_position_residual_before": resid}
         resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1), track)
+    clearance = None
+    if swing_clearance:
+        motion, clearance = ensure_swing_clearance(motion, robot, clearance=swing_clearance)
+        if clearance:
+            clearance["ik_position_residual_before"] = resid
+            resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1),
+                                       track)
     info = {
         "source": os.path.abspath(path),
         "source_format": fmt,
@@ -816,6 +1040,7 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
         **cfg_info,
         "ik_position_residual": resid,
         "smoothing": smoothing,
+        "swing_clearance": clearance,
         "ik_seconds": round(elapsed, 1),
         "root_quat": "wxyz",
     }

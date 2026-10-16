@@ -64,3 +64,64 @@ def test_foot_metrics_with_gmr_model():
                         np.zeros((30, 29)), 30.0)  # G1 zero pose with the pelvis at its standing height
     fm = analysis.foot_metrics(stand, fk)
     assert abs(fm["sole_min_cm"]) < 1.0 and fm["planted_slip_pct"] == 0.0 and fm["penetration_pct"] == 0.0
+    assert fm["swing_low_pct"] == 0.0  # standing still: no swing frames
+    # a foot dragged forward along the floor (pelvis slides at 1 m/s, nothing lifts) = every swing frame low
+    drag = RobotMotion("drag", m.joint_names, np.column_stack([np.arange(30) / 30.0, np.zeros(30), np.full(30, 0.793)]),
+                       np.tile([1.0, 0, 0, 0], (30, 1)), np.zeros((30, 29)), 30.0)
+    assert analysis.foot_metrics(drag, fk)["swing_low_pct"] == 100.0
+
+
+def test_swing_clearance_lifts_only_skimming_swing_feet():
+    pytest.importorskip("general_motion_retargeting")
+    from khumanoid.retarget import ensure_swing_clearance
+
+    fk = analysis.FootKinematics("unitree_g1")
+    joints = g1_motion(seconds=1.0, fps=30.0).joint_names
+    T = 45
+    stand = RobotMotion("stand", joints, np.tile([0.0, 0.0, 0.793], (T, 1)), np.tile([1.0, 0, 0, 0], (T, 1)),
+                        np.zeros((T, 29)), 30.0)
+    same, info = ensure_swing_clearance(stand, clearance=0.02)
+    assert info["frames_changed"] == 0 and np.array_equal(same.dof_pos, stand.dof_pos)
+
+    # knees a little bent, both feet dragged along the floor at 1 m/s between 0.25 s stands
+    dof = np.zeros((T, 29))
+    for side in ("left", "right"):
+        dof[:, joints.index(f"{side}_hip_pitch_joint")] = -0.3
+        dof[:, joints.index(f"{side}_knee_joint")] = 0.6
+        dof[:, joints.index(f"{side}_ankle_pitch_joint")] = -0.3
+    x = np.concatenate([np.zeros(8), np.linspace(0, 1.0, 31)[1:], np.ones(7)])
+    root = np.column_stack([x, np.zeros(T), np.full(T, 0.793)])
+    probe = RobotMotion("probe", joints, root, np.tile([1.0, 0, 0, 0], (T, 1)), dof, 30.0)
+    root[:, 2] -= fk.run(probe)["sole"].min()  # soles on the floor
+    drag = RobotMotion("drag", joints, root, np.tile([1.0, 0, 0, 0], (T, 1)), dof, 30.0)
+    out, info = ensure_swing_clearance(drag, clearance=0.02)
+    assert info["fast_foot_min_clearance_cm"]["before"] < 0.1 and info["fast_foot_min_clearance_cm"]["after"] >= 1.8
+    assert info["leg_joint_change_deg"]["max"] <= 20.0 + 1e-6
+    sole0, sole1 = fk.run(drag)["sole"], fk.run(out)["sole"]
+    assert np.all(sole1[12:34] - sole0[12:34] > 0.018)  # while sliding fast: lifted to ~2 cm
+    assert np.allclose(sole1[:6], sole0[:6]) and np.allclose(sole1[-5:], sole0[-5:])  # standing still: untouched
+    assert np.array_equal(out.root_pos, drag.root_pos)
+    legs = [i for i, n in enumerate(joints) if any(k in n for k in ("hip", "knee", "ankle"))]
+    others = [i for i in range(29) if i not in legs]
+    assert np.array_equal(out.dof_pos[:, others], drag.dof_pos[:, others])  # arms / waist untouched
+
+
+FBX_02_01 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "retargeted", "cmu_fbx_smooth6",
+                         "02_01_g1.npz")
+
+
+@pytest.mark.skipif(not os.path.isfile(FBX_02_01), reason="needs the FBX retarget of CMU 02_01 (README)")
+def test_swing_clearance_on_fbx_walk():
+    """The HF FBX retarget of 02_01 drags its toes at toe-off (mid-swing minimum below the floor level)."""
+    pytest.importorskip("general_motion_retargeting")
+    from khumanoid.io import load_motion
+    from khumanoid.retarget import ensure_swing_clearance
+
+    m = load_motion(FBX_02_01)
+    out, info = ensure_swing_clearance(m, clearance=0.02)
+    assert info["fast_foot_min_clearance_cm"]["before"] < 0.0 < 1.0 <= info["fast_foot_min_clearance_cm"]["after"]
+    fk = analysis.FootKinematics("unitree_g1")
+    before, after = analysis.foot_metrics(m, fk), analysis.foot_metrics(out, fk)
+    assert after["swing_low_pct"] < before["swing_low_pct"] / 1.5
+    assert after["penetration_pct"] <= before["penetration_pct"] and after["planted_slip_pct"] <= before["planted_slip_pct"]
+    assert info["leg_joint_change_deg"]["rmse"] < 3.0 and info["leg_joint_change_deg"]["max"] <= 20.0 + 1e-6

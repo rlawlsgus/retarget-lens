@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import stability
 from .motion import RobotMotion
 from .rotations import quat_normalize
 
@@ -21,6 +22,9 @@ LEG_KEYS = ("hip", "knee", "ankle")
 PLANTED_HEIGHT = 0.025  # m: every sole contact point below this = foot planted flat
 SLIDE_SPEED = 0.3  # m/s
 SLIDE_MIN_DURATION = 0.1  # s
+SWING_SPEED = 0.5  # m/s: a foot whose slowest sole point moves this fast is in swing
+SWING_CLEARANCE = 0.01  # m: a swing foot this close to the floor (floor_track) catches it in physics
+BALANCE_MIN_DURATION = 0.1  # s: a point outside the support this long counts as "sustained"
 
 
 def common_joints(*motions: RobotMotion) -> list[str]:
@@ -131,27 +135,71 @@ class FootKinematics:
                        and (self.model.geom_contype[g] or self.model.geom_conaffinity[g])] for b in self.feet]
 
     def run(self, m: RobotMotion) -> dict:
-        """{"sole": (T,2) lowest contact point, "flat": (T,2) highest contact point, "foot": (T,2,3)}."""
+        """{"sole": (T,2) lowest contact point, "flat": (T,2) highest contact point, "foot": (T,2,3),
+        "points": (T,2,G,3) bottom of every sole contact sphere, "com": (T,3) whole-body CoM}."""
         mj, model, data = self.mj, self.model, self.data
         col = {n: i for i, n in enumerate(m.joint_names)}
         idx = [col.get(n) for n in self.joint_names]
         T = m.num_frames
+        G = max(1, max(len(g) for g in self.soles))
         sole, flat, foot = np.zeros((T, 2)), np.zeros((T, 2)), np.zeros((T, 2, 3))
+        points, com = np.zeros((T, 2, G, 3)), np.zeros((T, 3))
         q = model.qpos0.copy()
         for t in range(T):
             q[:3], q[3:7] = m.root_pos[t], m.root_quat[t]
             q[7:] = [m.dof_pos[t, i] if i is not None else 0.0 for i in idx]
             data.qpos[:] = q
             mj.mj_kinematics(model, data)
+            mj.mj_comPos(model, data)
+            com[t] = data.subtree_com[0]  # the world body's subtree = the whole robot
             for k, (b, geoms) in enumerate(zip(self.feet, self.soles)):
                 foot[t, k] = data.xpos[b]
-                bottoms = [data.geom_xpos[g][2] - model.geom_size[g][0] for g in geoms] or [data.xpos[b][2]]
-                sole[t, k], flat[t, k] = min(bottoms), max(bottoms)
-        return {"sole": sole, "flat": flat, "foot": foot}
+                pts = [data.geom_xpos[g] - [0.0, 0.0, model.geom_size[g][0]] for g in geoms] or [data.xpos[b]]
+                points[t, k] = pts + [pts[-1]] * (G - len(pts))
+                sole[t, k], flat[t, k] = min(p[2] for p in pts), max(p[2] for p in pts)
+        return {"sole": sole, "flat": flat, "foot": foot, "points": points, "com": com}
+
+
+def slowest_sole_speed(points: np.ndarray, fps: float) -> np.ndarray:
+    """(T, feet) horizontal speed of each foot's slowest sole contact point (m/s): ~0 for
+    a foot on the floor, also while it rolls over the heel or toe."""
+    s = np.linalg.norm(np.diff(points[..., :2], axis=0), axis=-1).min(-1) * fps
+    return np.concatenate([s[:1], s])
+
+
+def floor_track(sole: np.ndarray, speed: np.ndarray, fps: float, still: float = SLIDE_SPEED) -> np.ndarray:
+    """(T,) floor height under the robot through a clip: the lower of the feet standing
+    still (slowest sole point below ``still`` m/s), interpolated between such frames and
+    median-filtered over ~0.3 s. Retargets drift (CMU 02_01's floor rises ~4 cm), so a
+    single clip-wide floor level misjudges how close a moving foot comes to it."""
+    from scipy.ndimage import median_filter
+
+    T = len(sole)
+    standing = speed < still
+    ts = np.flatnonzero(standing.any(1))
+    if not len(ts):
+        return np.full(T, float(np.percentile(sole, 5)))
+    floor = np.interp(np.arange(T), ts, [sole[t, standing[t]].min() for t in ts])
+    return median_filter(floor, size=max(3, int(0.3 * fps) | 1), mode="nearest")
+
+
+def balance(m: RobotMotion, fk: FootKinematics, cfg=None, r: dict | None = None):
+    """(BalanceTrack, summary dict, static_unbalanced flag) of a robot motion, from MuJoCo FK of
+    the robot model (CoM, sole points) with the floor tracked through the clip. ``cfg`` is a
+    khumanoid.qc.QCConfig (support / balance thresholds); ``r`` a precomputed fk.run(m)."""
+    from .qc import QCConfig
+
+    cfg = cfg or QCConfig()
+    r = r if r is not None else fk.run(m)
+    floor = floor_track(r["sole"], slowest_sole_speed(r["points"], m.fps), m.fps)
+    track = stability.balance_track(r["com"], r["points"], m.fps, floor, cfg.support_contact_height)
+    static = stability.static_unbalanced(track, cfg.balance_tolerance, cfg.static_max_speed, cfg.static_min_duration)
+    return track, stability.summarize(track, cfg.balance_tolerance, BALANCE_MIN_DURATION, static=static), static
 
 
 def foot_metrics(m: RobotMotion, fk: FootKinematics) -> dict:
-    """Planted-foot slip (% frames), mean planted-foot speed, penetration (% frames < -2 cm)."""
+    """Planted-foot slip (% frames), mean planted-foot speed, penetration (% frames < -2 cm),
+    moving feet within 1 cm of the floor (% of moving-foot frames)."""
     r = fk.run(m)
     if m.num_frames < 2:
         return {}
@@ -160,11 +208,32 @@ def foot_metrics(m: RobotMotion, fk: FootKinematics) -> dict:
     n = max(1, int(round(SLIDE_MIN_DURATION * m.fps)))
     slide = np.stack([_sustained(planted[:, k] & (hs[:, k] > SLIDE_SPEED), n) for k in range(2)], 1).any(1)
     lowest = r["sole"].min(1)
+    # moving feet skimming the floor: in physics they catch it and the robot stumbles (the
+    # SMPL-X / FBX retargets of CMU 02_01 that fall in Isaac do this 2-3x as often as the BVH one).
+    # Moving = even the foot's slowest sole point slides (a heel rising over the toe is not);
+    # height above the floor tracked through the clip (floor_track).
+    speed = slowest_sole_speed(r["points"], m.fps)
+    swing = speed > SWING_SPEED
+    floor = floor_track(r["sole"], speed, m.fps)
+    rel = r["sole"] - floor[:, None]
+    low_swing = float(100 * (swing & (rel < SWING_CLEARANCE)).sum() / max(swing.sum(), 1))
+    # balance: CoM projection and cart-table ZMP against the feet's support polygon
+    bal, bs, static = balance(m, fk, r=r)
+    sustained = next(k for k in bs["zmp"] if k.startswith("outside_ratio(>"))
     return {
         "planted_slip_pct": float(100 * slide.mean()),
         "planted_speed": float(hs[planted].mean()) if planted.any() else float("nan"),
         "penetration_pct": float(100 * (lowest < -0.02).mean()),
         "sole_min_cm": float(100 * lowest.min()),
+        "swing_low_pct": low_swing,
+        "com_out_pct": 100 * bs["com"]["outside_ratio"],
+        "zmp_out_pct": 100 * bs["zmp"]["outside_ratio"],
+        "zmp_out_sustained_pct": 100 * bs["zmp"][sustained],
+        "zmp_margin_p5_cm": None if bs["zmp"]["margin_m"]["p5"] is None else 100 * bs["zmp"]["margin_m"]["p5"],
+        "static_unbalanced_pct": 100 * bs["static_unbalanced_ratio"],
+        "no_support_pct": 100 * bs["support_phase_ratio"]["none"],
         "_flat": r["flat"],
         "_sole": r["sole"],
+        "_balance": bal,
+        "_static_unbalanced": static,
     }

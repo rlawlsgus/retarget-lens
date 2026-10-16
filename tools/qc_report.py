@@ -22,7 +22,7 @@ import pandas as pd  # noqa: E402
 import yaml  # noqa: E402
 
 from khumanoid.io import MOTION_EXTENSIONS, load_motion, urdf_joint_limits  # noqa: E402
-from khumanoid.qc import QCConfig, check_motion  # noqa: E402
+from khumanoid.qc import QCConfig, add_balance_flags, check_motion  # noqa: E402
 
 
 def iter_files(paths: list[str]):
@@ -45,6 +45,10 @@ def main() -> int:
     ap.add_argument("--urdf", default=None, help="robot URDF for joint-limit checks on robot motions")
     ap.add_argument("--up-axis", default=None, help="up axis for BVH/C3D (default: per-format)")
     ap.add_argument("--smpl-model-dir", default=None, help="SMPL/SMPL-X model folder for AMASS npz")
+    ap.add_argument("--balance", action="store_true",
+                    help="robot motions: CoM / ZMP against the feet's support polygon and the soft flag "
+                         "static_unbalanced (needs GMR's robot model; --robot)")
+    ap.add_argument("--robot", default="unitree_g1", help="GMR robot model for --balance")
     args = ap.parse_args()
 
     cfg_all = {}
@@ -54,12 +58,24 @@ def main() -> int:
     cfg = QCConfig.from_dict(cfg_all.get("thresholds"))
     target_h = args.target_hours if args.target_hours is not None else float(cfg_all.get("target_hours", 5.0))
     limits = urdf_joint_limits(args.urdf) if args.urdf else None
+    fk = None
+    if args.balance:
+        from khumanoid.analysis import FootKinematics
+
+        fk = FootKinematics(args.robot)
 
     rows = []
     for path in iter_files(args.paths):
         try:
             m = load_motion(path, up_axis=args.up_axis, model_dir=args.smpl_model_dir)
             r = check_motion(m, cfg, limits)
+            if fk is not None and r.kind == "robot":
+                from khumanoid.analysis import balance
+
+                _, bs, static = balance(m, fk, cfg)
+                add_balance_flags(r, static, cfg, {
+                    "com_outside_ratio": bs["com"]["outside_ratio"], "zmp_outside_ratio": bs["zmp"]["outside_ratio"],
+                    "zmp_margin_p5_m": bs["zmp"]["margin_m"]["p5"], "no_support_ratio": bs["support_phase_ratio"]["none"]})
             row = r.row()
         except Exception as e:  # keep going: one broken file must not stop the ledger
             row = {"name": os.path.basename(path), "source": os.path.abspath(path), "status": "ERROR",

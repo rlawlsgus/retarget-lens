@@ -35,14 +35,15 @@ def fmt(v, f="{:.1f}") -> str:
 
 def report_group(paths: list[str], args, fk, limits) -> list[str]:
     items = [load_item(p, robot=args.robot, smooth=args.smooth, fps=args.fps, csv_fps=args.csv_fps,
-                       smpl_model_dir=args.smpl_model_dir, log=None) for p in paths]
+                       smpl_model_dir=args.smpl_model_dir, swing_clearance=args.swing_clearance / 100.0, log=None)
+             for p in paths]
     for it in items:
         compute_metrics(it, fk, limits)
     ref = items[0]
     lines = [f"### {ref.label} (기준)", "",
              "| 모션 | 종류 | 길이 s | 시간 오프셋 s | 다리 RMSE° | 전체 RMSE° | 차이 큰 관절 (°) | 가속도 | 저크 | "
-             "최대속도 | 발 미끄러짐 % | 관통 % | 발 최저점 cm | IK 발/손 cm | QC |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "최대속도 | 발 미끄러짐 % | 관통 % | 발 최저점 cm | 스윙 근접 % | IK 발/손 cm | QC |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for it in items:
         m = it.metrics
         off = legs = whole = worst = "-"
@@ -60,7 +61,7 @@ def report_group(paths: list[str], args, fk, limits) -> list[str]:
         lines.append(f"| {it.label} | {it.kind} | {fmt(m['duration'], '{:.2f}')} | {off} | {legs} | {whole} | {worst} | "
                      f"{fmt(m.get('acc_mean'))} | {fmt(m.get('jerk_mean'), '{:.0f}')} | {fmt(m.get('vel_max'))} | "
                      f"{fmt(m.get('planted_slip_pct'), '{:.2f}')} | {fmt(m.get('penetration_pct'), '{:.2f}')} | "
-                     f"{fmt(m.get('sole_min_cm'))} | {ik} | {m.get('qc')} |")
+                     f"{fmt(m.get('sole_min_cm'))} | {fmt(m.get('swing_low_pct'), '{:.0f}')} | {ik} | {m.get('qc')} |")
     return lines + [""]
 
 
@@ -73,6 +74,8 @@ def main() -> int:
     ap.add_argument("--urdf", default=os.path.join(os.path.dirname(ROOT), "GMR", "assets", "unitree_g1",
                                                    "g1_custom_collision_29dof.urdf"))
     ap.add_argument("--smooth", type=float, default=6.0, help="smoothing for retargeted inputs (Hz, 0 = off)")
+    ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
+                    help="lift swing feet of retargeted inputs to at least CM off the floor (0 = off)")
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--csv-fps", type=float, default=30.0)
     ap.add_argument("--smpl-model-dir", default=os.environ.get("SMPL_MODEL_DIR", os.path.join(ROOT, "models")))
@@ -88,10 +91,14 @@ def main() -> int:
     except Exception as e:
         print(f"foot metrics disabled ({type(e).__name__}: {e})")
     limits = urdf_joint_limits(args.urdf) if os.path.isfile(args.urdf) else None
-    lines = [f"# 모션 비교 ({dt.datetime.now():%Y-%m-%d %H:%M}, 로봇 {args.robot}, 사람 입력 평활화 {args.smooth:g} Hz)", "",
+    clearance = f", 스윙 발 높이 >= {args.swing_clearance:g} cm" if args.swing_clearance else ""
+    lines = [f"# 모션 비교 ({dt.datetime.now():%Y-%m-%d %H:%M}, 로봇 {args.robot}, 사람 입력 평활화 {args.smooth:g} Hz"
+             f"{clearance})", "",
              "시간 오프셋: 기준에 맞추는 표시 오프셋(다리 관절각 차이 최소). RMSE: 그 오프셋에서 관절별 RMSE의 중앙값. "
              "가속도 rad/s², 저크 rad/s³, 최대속도 rad/s. 발 미끄러짐: 발바닥 전체가 붙은 채 0.3 m/s 이상으로 0.1 s 이상 "
-             "움직인 프레임 비율. 관통: 발 최저점 -2 cm 아래 프레임 비율.", ""]
+             "움직인 프레임 비율. 관통: 발 최저점 -2 cm 아래 프레임 비율. 스윙 근접: 가장 느린 발바닥 점까지 0.5 m/s "
+             "넘게 움직이는 발이 그때의 바닥(디딤발 높이를 따라감) 1 cm 안을 지나는 비율(Isaac 물리 재생에서 발끝이 걸려 "
+             "비틀거리는 원인, `--swing-clearance`로 보정).", ""]
     for g in groups:
         lines += report_group(g, args, fk, limits)
         print("\n".join(lines[-(len(g) + 4):]), flush=True)

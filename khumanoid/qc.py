@@ -2,7 +2,8 @@
 
 A frame is *hard*-flagged when the data at that frame is unusable (NaN, pops,
 floor penetration, sustained floating, robot joint-limit violations, fall).
-Foot skating is a *soft* flag: reported, and only affects the clip status.
+Foot skating and robot static imbalance (add_balance_flags) are *soft* flags:
+reported, and only affect the clip status.
 
     valid_seconds = (#frames without a hard flag) / fps     (0 for FAIL clips)
 """
@@ -39,6 +40,12 @@ class QCConfig:
     default_max_joint_velocity: float = 25.0  # rad/s when the URDF gives none
     max_root_tilt_deg: float = 75.0
     min_root_height: float = 0.25  # m
+    # robot balance (needs the robot model: khumanoid.stability; soft flag, see add_balance_flags)
+    support_contact_height: float = 0.02  # m: sole points this close to the floor support the robot
+    balance_tolerance: float = 0.02  # m outside the support polygon before it counts
+    static_max_speed: float = 0.1  # m/s: CoM slower than this = standing still
+    static_min_duration: float = 0.2  # s
+    max_static_unbalanced_ratio: float = 0.05  # more -> clip WARN
     # clip verdict
     min_duration: float = 1.0  # s
     pass_hard_ratio: float = 0.02
@@ -260,6 +267,35 @@ def check_robot(
     for k, v in res.flags.items():
         res.metrics[f"{k}_ratio"] = round(float(v.mean()), 4)
     _verdict(res, cfg, res.hard_mask(), 0.0, False)
+    return res
+
+
+def add_balance_flags(res: QCResult, static_unbalanced: np.ndarray, cfg: QCConfig | None = None,
+                      metrics: dict | None = None) -> QCResult:
+    """Add the soft flag ``static_unbalanced`` (khumanoid.stability.static_unbalanced: standing
+    still with the CoM outside the feet's support polygon) to a robot QC result.
+
+    Soft, not hard: it does not reduce valid time, only turns PASS into WARN above
+    ``max_static_unbalanced_ratio``. The support polygon only knows the feet, so a
+    clip that rests a hand on a table or kneels is flagged as well. On clean CMU /
+    LAFAN1 / Unitree retargets it is 0-1 %; CMU subject 143 (feet pitched toe-up by
+    the retarget, standing on the heels) 22-39 %; LAFAN1 fall-and-get-up 12 %.
+    ZMP leaving the support is reported (metrics) but not flagged: with the
+    cart-table model even Unitree's official retargets of LAFAN1 dance / run show it
+    in 58-67 % of frames, so it does not separate good data from bad.
+    """
+    cfg = cfg or QCConfig()
+    flag = np.asarray(static_unbalanced, dtype=bool)
+    if flag.shape != (res.num_frames,):
+        raise ValueError(f"balance flag has {flag.shape}, clip has {res.num_frames} frames")
+    res.flags["static_unbalanced"] = flag
+    ratio = float(flag.mean()) if flag.size else 0.0
+    res.metrics["static_unbalanced_ratio"] = round(ratio, 4)
+    res.metrics.update(metrics or {})
+    if ratio > cfg.max_static_unbalanced_ratio:
+        res.notes.append(f"standing with the CoM outside the feet in {100 * ratio:.0f}% of frames")
+        if res.status == "PASS":
+            res.status = "WARN"
     return res
 
 

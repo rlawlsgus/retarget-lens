@@ -25,6 +25,20 @@ thresholds:
   default_max_joint_velocity: 25.0  # rad/s if the URDF has no velocity limit
   max_root_tilt_deg: 75.0
   min_root_height: 0.25      # m
+  # --- robot balance (khumanoid/stability.py; needs the robot model: Isaac check, viewer,
+  #     qc_report.py --balance). Soft flag static_unbalanced: standing still (CoM < 0.1 m/s)
+  #     with the CoM projection > 2 cm outside the feet's support polygon for >= 0.2 s.
+  #     2026-10-16 survey: clean CMU / LAFAN1 / Unitree G1 retargets 0-1 %, CMU subject 143
+  #     (retarget feet pitched toe-up 4-16 deg: standing on the heels) 22-39 %, LAFAN1
+  #     fall-and-get-up 12 % (hands on the floor are not in the polygon). Soft = no valid-time
+  #     loss: the polygon only knows the feet, and balance is the controller's job.
+  #     ZMP outside the support is reported, not flagged: with the cart-table model even
+  #     Unitree's own LAFAN1 dance / run retargets show it in 58-67 % of frames.
+  support_contact_height: 0.02     # m, sole points this close to the floor support the robot
+  balance_tolerance: 0.02          # m outside the polygon before it counts
+  static_max_speed: 0.1            # m/s CoM speed = standing still
+  static_min_duration: 0.2         # s
+  max_static_unbalanced_ratio: 0.05  # more -> clip WARN
   # --- clip verdict ---
   min_duration: 1.0          # s
   pass_hard_ratio: 0.02      # <= 2 % hard-flagged frames -> PASS
