@@ -15,7 +15,7 @@ import os
 import numpy as np
 
 from ..motion import SkeletonMotion
-from ..rotations import axis_angle_to_matrix
+from ..rotations import Y_UP_TO_Z_UP, axis_angle_to_matrix
 
 BODY_JOINTS = [
     "pelvis", "left_hip", "right_hip", "spine1", "left_knee", "right_knee", "spine2",
@@ -82,8 +82,16 @@ def load_amass_npz(
     model_dir: str | None = None,
     gender: str | None = None,
     body_only: bool = False,
+    with_rotations: bool = False,
 ) -> SkeletonMotion:
-    """Load an AMASS-style npz (poses / trans / betas / framerate)."""
+    """Load an AMASS-style npz (poses / trans / betas / framerate).
+
+    with_rotations also fills ``SkeletonMotion.rotations`` (world joint frames; the
+    joints' own axes are the body model's Y-up axes) and ``meta["rest_pose"]``:
+    the zero pose (a T-pose for SMPL/SMPL-X) of this subject's shape, stood up in
+    the Z-up world, as (positions (J, 3), frames (J, 3, 3)) — the retargeting
+    reference pose.
+    """
     d = np.load(path, allow_pickle=True)
     if "poses" not in d:
         raise ValueError(f"{path}: no 'poses' array (not an AMASS-style SMPL file)")
@@ -122,8 +130,12 @@ def load_amass_npz(
     names = JOINT_NAMES.get(model_type, [])[:n_j]
     names += [f"joint_{i}" for i in range(len(names), n_j)]
     if body_only:
-        g_pos, parents, names = g_pos[:, :22], parents[:22], names[:22]
+        g_pos, g_rot, rest, parents, names = g_pos[:, :22], g_rot[:, :22], rest[:22], parents[:22], names[:22]
 
+    meta = {"format": "amass_npz", "model_type": model_type, "gender": gender}
+    if with_rotations:
+        n = len(names)
+        meta["rest_pose"] = ((rest - rest[0]) @ Y_UP_TO_Z_UP.T, np.broadcast_to(Y_UP_TO_Z_UP, (n, 3, 3)).copy())
     return SkeletonMotion(
         name=os.path.splitext(os.path.basename(path))[0],
         joint_names=names,
@@ -132,5 +144,6 @@ def load_amass_npz(
         fps=fps,
         source=os.path.abspath(path),
         kind="skeleton",
-        meta={"format": "amass_npz", "model_type": model_type, "gender": gender},
+        meta=meta,
+        rotations=g_rot if with_rotations else None,
     )

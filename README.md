@@ -120,11 +120,12 @@ conda 없이 실행하려면 `python` 대신 `C:\isaacsim\python.bat`을 쓰면 
 |---|---|
 | `tpose`: T-pose 기준 BVH (CMU cgspeed 변환본, Vicon/OptiTrack/Xsens/Rokoko 내보내기) | GMR에 이 스켈레톤용 설정이 없어 클립마다 만듭니다(아래). CMU는 변환기가 넣은 0번 T-pose 프레임을 기준으로 쓰고 출력에서는 뺍니다. 그 밖의 파일은 rest pose가 기준입니다(`--ref <frame>`으로 변경) |
 | `lafan1` / `nokov` | GMR 자체 BVH 로더와 IK 설정을 그대로 씁니다 |
-| `smplx`: AMASS SMPL-X npz | GMR 자체 경로. SMPL-X 바디모델(라이선스 등록 필요)이 있어야 하며, 이 PC에는 모델이 없어 **미검증**입니다 |
+| `smplx`: AMASS SMPL / SMPL-X npz | `tpose`와 같은 방법으로 설정을 만듭니다. 바디모델의 zero pose가 T-pose라 그대로 적용되고, 같은 클립의 BVH 결과와 바로 비교할 수 있습니다. SMPL-X 바디모델(`models/smplx/`)이 필요합니다 |
+| `smplx-gmr` | 같은 파일을 GMR 자체 SMPL-X 로더·설정으로 처리합니다. 로봇 발끝 링크를 SMPL-X 발가락 관절에 맞춰서, AMASS CMU에서는 발이 3–5 cm 기울어 바닥을 뚫습니다(아래 비교) |
 
 T-pose 설정을 만드는 방법:
 - IK 과제 목록과 가중치는 GMR의 LAFAN1→G1 설정을 그대로 씁니다. 골반·몸통·상완은 방향, 발은 위치를 중시합니다.
-- 회전 오프셋: 사람 T-pose의 관절 방향과, 같은 자세로 맞춘 로봇의 링크 방향을 대응시킵니다. 로봇 자세는 어깨 roll, 팔꿈치, 고관절 roll, 무릎을 하나씩 사람 팔다리 방향에 맞춰 정합니다.
+- 회전 오프셋: 사람 T-pose의 관절 방향과, 같은 자세로 맞춘 로봇의 링크 방향을 대응시킵니다. 로봇 자세는 먼저 어깨 roll, 팔꿈치, 고관절 roll, 무릎을 하나씩 맞춘 뒤, 팔다리마다 굽힘 관절(고관절 pitch·roll·무릎, 어깨 pitch·roll·팔꿈치)을 함께 최적화합니다. 마지막으로 발목으로 발을 수평으로 맞춥니다. 비틀림(yaw) 관절은 쓰지 않습니다. 기준 골격의 작은 꺾임을 맞추느라 75°까지 비틀어져, 모든 프레임이 틀어졌기 때문입니다.
 - 위치 오프셋: G1 링크 원점이 관절 중심에 있지 않은 곳(hip_yaw_link는 허벅지 중간, shoulder_yaw_link는 상완 중간)을 보정합니다.
 - 스케일(피험자별 자동): 다리·루트는 골반-발목 거리 비, 몸통·팔은 골반-손목 거리 비입니다.
 - 바닥: 하위 5% 프레임에서 발이 로봇 발목 높이(발바닥 위 3.6 cm)에 오도록 전체를 내립니다.
@@ -169,19 +170,36 @@ LAFAN1 4클립(13.3분)에서 설정별로 비교한 결과입니다(클립 평�
 `tools/compare_viewer.py`는 여러 모션을 같은 G1에 올려 브라우저에서 나란히 재생하고 수치로 비교합니다(viser 기반). 지표 계산은 `khumanoid/analysis.py`에 있습니다.
 
 ```powershell
-# BVH와 같은 동작의 AMASS SMPL-X를 각각 리타게팅해 비교 (SMPL-X 바디모델 필요)
-python tools\compare_viewer.py data\raw\cmu_bvh\143_11.bvh data\raw\amass_cmu_smplx\143_11_stageii.npz
+# BVH와 같은 촬영의 AMASS SMPL-X를 각각 리타게팅해 비교 (SMPL-X 바디모델 필요)
+python tools\compare_viewer.py data\raw\cmu_bvh\143_11.bvh data\raw\amass_cmu_smplx\CMU\143\143_11_stageii.npz
+# 같은 비교를 여러 클립에 대해 표로 (-g 그룹마다 첫 파일이 기준)
+python tools\compare_report.py -g data\raw\cmu_bvh\02_01.bvh data\raw\amass_cmu_smplx\CMU\02\02_01_stageii.npz -g ... --out reports\compare.md
 # 같은 LAFAN1 클립: 우리 GMR(평활화) vs Unitree 공식 리타겟 vs GMR 원본
 python tools\compare_viewer.py data\raw\lafan1_bvh\dance1_subject1.bvh data\raw\unitree_lafan1_g1\dance1_subject1.csv data\retargeted\lafan1\dance1_subject1_g1.npz
 # -> 브라우저에서 http://127.0.0.1:8080
 ```
 
-- **입력:** 사람 모션(BVH, AMASS SMPL-X npz)은 리타게팅해서 불러옵니다(기본 `--smooth 6`, 결과는 `data/retargeted/cache/`에 캐시). 로봇 모션(npz, Unitree csv, GMR pkl)은 그대로 불러옵니다. 실행 중에 "모션" 탭에서 파일을 추가하거나 제거할 수 있습니다.
+- **입력:** 사람 모션(BVH, AMASS SMPL-X npz)은 리타게팅해서 불러옵니다(기본 `--smooth 6`, 결과는 `data/cache/retarget/`에 캐시). 로봇 모션(npz, Unitree csv, GMR pkl)은 그대로 불러옵니다. 실행 중에 "모션" 탭에서 파일을 추가하거나 제거할 수 있습니다.
 - **3D:** 모션마다 다른 색의 G1을 나란히 또는 겹쳐서 보여 줍니다. 기본으로 각자의 시작 골반을 원점에, 진행 방향을 +x로 맞춥니다(소스마다 월드 좌표가 달라서). 리타게팅한 모션은 원본 사람 스켈레톤을 로봇 크기로 줄여 옆에 그립니다(겹치기, 로봇 반투명 선택 가능).
 - **재생:** 재생과 일시정지, 시간 슬라이더, ±1 프레임, 속도, 반복을 지원합니다. 모션별 시간 오프셋을 직접 넣거나, 기준 모션에 자동 정렬합니다(다리 관절각 차이가 가장 작은 오프셋).
 - **분석:** 관절각·골반 높이·골반 속도 그래프(현재 시점 앞뒤 구간), 모션별 지표 표(관절 가속도·저크·최대 속도, 발바닥 미끄러짐, 바닥 관통, 발 최저점, 기준 대비 다리·전체 RMSE, QC), 기준 대비 관절별 RMSE 막대그래프를 보여 줍니다.
 - 로봇 메시는 브라우저로 보내기 전에 4 mm 격자로 단순화합니다(삼각형 38.8만 → 10만, 로봇 3대 로딩이 약 25초에서 5초로 줄어듦). `--mesh-cell 0`이면 원본 그대로 보냅니다.
 - 기본으로 이 PC에서만 접속됩니다(`--host 127.0.0.1`). 다른 PC에서 보려면 `--host 0.0.0.0`을 쓰는데, 같은 네트워크의 누구나 열 수 있습니다.
+
+### BVH vs SMPL-X 비교 (같은 촬영, 2026-10-15)
+
+CMU 5클립(02_01, 02_03, 143_11, 143_13, 143_28)을 cgspeed BVH와 AMASS SMPL-X로 각각 G1에 리타게팅해 비교했습니다(`--smooth 6`, 결과 `reports/compare_bvh_vs_smplx.md`, BVH 기준).
+
+| 항목 | SMPL-X (`smplx`, BVH와 같은 유도 설정) | SMPL-X (`smplx-gmr`, GMR 자체 설정) |
+|---|---|---|
+| 자동 시간 정렬 오프셋 | 0 또는 +1프레임 | 0 또는 +1프레임 |
+| BVH 대비 다리 관절 RMSE (중앙값) | 4.5–10.2° | 6.0–10.7° |
+| BVH 대비 전체 관절 RMSE | 4.7–9.0° | 6.0–11.3° |
+| 바닥 관통 프레임 (BVH 0–6%) | 0–9% | 18–99% (발이 3–5 cm 기울어 바닥을 뚫음) |
+| 손 IK 위치 오차 (평균) | 4.9–8.8 cm | 8.2–11.3 cm |
+
+- 두 소스는 프레임까지 같은 촬영입니다. 남는 차이는 주로 어깨·손목 비틀림과, 143번 피험자의 무릎(17–20°)입니다. CMU 원본 골격(ASF)과 AMASS의 SMPL-X 피팅이 같은 동작의 관절각을 다르게 추정한 결과입니다.
+- SMPL-X 기준 자세를 맞추는 방식 세 가지를 같은 지표로 비교해 골랐습니다(관절 하나씩 / 팔다리 일괄 + 발 수평 / 발 수평만). 팔다리 일괄 + 발 수평이 SMPL-X 발 IK 오차 1.9 → 1.3 cm, BVH와의 전체 차이 7.9 → 7.4°로 가장 좋았습니다.
 
 ## 공개 샘플 데이터와 라이선스
 
@@ -189,7 +207,8 @@ python tools\compare_viewer.py data\raw\lafan1_bvh\dance1_subject1.bvh data\raw\
 
 | 폴더 | 내용 | 라이선스 | 사용 범위 |
 |---|---|---|---|
-| `data/raw/cmu_bvh` | CMU mocap(cgspeed 2010 BVH 변환본) 6클립, 120 fps, 총 24 s: 02_01 걷기, 02_03 조깅, 16_17 걷다 좌회전, 143_11 상자 들기, 143_13 빨래바구니 들기, 143_28 빗자루질 | CMU 약관(상업 사용·재배포 허용, 데이터 판매 금지) | **공개 데이터셋 사용 가능**. 사사 문구는 SOURCE.md |
+| `data/raw/cmu_bvh` | CMU mocap(cgspeed 2010 BVH 변환본) 6클립, 총 40 s: 02_01 걷기, 02_03 조깅, 16_17 걷다 좌회전(이상 120 Hz), 143_11 상자 들기, 143_13 빨래바구니 들기, 143_28 빗자루질(이상 60 Hz) | CMU 약관(상업 사용·재배포 허용, 데이터 판매 금지) | **공개 데이터셋 사용 가능**. 사사 문구는 SOURCE.md |
+| `data/raw/amass_cmu_smplx` | AMASS CMU SMPL-X N 전체(2,080 파일, 8.6 GB, 사용자가 직접 받음). 비교에는 위 BVH와 같은 5클립을 씀(16_17은 AMASS에 없음) | AMASS 비상업 연구 라이선스 | **내부 검증 전용** |
 | `data/raw/unitree_lafan1_g1` | Unitree의 LAFAN1→G1 리타겟 csv 4클립(30 fps, 13.3분) | CC BY-NC-ND 4.0 | **내부 검증 전용**. 재배포·파생물 공유 금지 |
 | `data/raw/lafan1_bvh` | 같은 4클립의 LAFAN1 원본 BVH(137 MB zip에서 4개만 남김) | CC BY-NC-ND 4.0 | **내부 검증 전용** |
 
@@ -235,6 +254,7 @@ xyzw를 쓰는 포맷(Unitree csv, GMR)은 로더에서 변환합니다. 쿼터�
 - **floating**: 발 대신 몸 전체의 가장 낮은 관절로 판단합니다. 넘어졌다 일어나기 클립에서 누워서 발을 든 구간이 "떠 있음"(1.7%)으로 잡혔습니다.
 - **joint_limit_margin** 0 → 0.01 rad: IK 해가 관절 한계에 붙어 있을 때 1e-4 rad 미만의 반올림 오차로 걸렸습니다.
 - **CMU 0번 프레임**: cgspeed 변환본은 0번 프레임이 변환기가 넣은 T-pose입니다. 그대로 두면 T-pose에서 첫 프레임으로 넘어가는 점프가 100 m/s spike로 잡혀서, 로더가 자동으로 뺍니다(`load_bvh(drop_tpose=...)`).
+- **CMU 60 Hz 피험자**: cgspeed 변환본은 모든 파일에 120 fps를 적었지만, 20명(143번 등, 495개 시도)은 60 Hz로 촬영됐습니다. 그대로 쓰면 2배속이 됩니다(143_11: 실제 10.95초가 5.47초로). AMASS가 보존한 C3D 헤더 값으로 시도별 표(`khumanoid/io/cmu_frame_rates.json`, `tools/cmu_frame_rates.py`로 생성)를 만들었습니다. BVH 로더가 cgspeed 파일이면 이 표로 fps를 고치고, `meta["fps_note"]`에 이유를 남깁니다. 이 수정 전에 만든 143번 리타겟·영상·유효시간은 2배 빨랐습니다(모두 다시 만듦).
 - `isaac_replay.py`가 `configs/qc.yaml`을 읽지 않고 코드 기본값만 쓰던 것을 고쳤습니다.
 
 그대로 둔 것: spike 15 m/s(깨끗한 데이터 최대 6–12 m/s로 여유 충분), penetration 3 cm(걸린 프레임 0–0.3%), 클립 판정 비율.
@@ -253,7 +273,10 @@ Isaac Sim 헤드리스 검사(CMU 143_11, 16_17, 02_01을 G1과 나란히 재생
 khumanoid/          모션 로더, 공통 데이터 구조, QC (numpy만 사용 → Isaac Sim Python에서도 동작)
   retarget.py       GMR 연동 (GMR·mujoco는 함수 안에서만 import)
   analysis.py       모션 비교 지표 (시간 정렬, 관절 RMSE, 매끄러움, 발바닥 지표)
-tools/              retarget.py, compare_viewer.py, qc_report.py, isaac_replay.py, fetch_samples.py, make_samples.py
+  compare.py        여러 포맷을 같은 로봇으로 불러오기 (리타게팅 캐시: data/cache/retarget/)
+  io/cmu_frame_rates.json  CMU 시도별 실제 촬영 fps (cgspeed BVH 보정용)
+tools/              retarget.py, compare_viewer.py, compare_report.py, qc_report.py, isaac_replay.py,
+                    fetch_samples.py, make_samples.py, cmu_frame_rates.py
 configs/qc.yaml     QC 임계값, 목표 시간
 requirements.md     환경 재현 요구사항 (버전, 드라이버, 네트워크), environment.lock.txt: conda 잠금 파일
 scripts/            install_isaacsim.ps1, setup_env.ps1, install_gmr.ps1
@@ -266,7 +289,7 @@ data/  reports/     (git 제외) data/raw 공개 샘플, data/retargeted 로봇 
 
 - 사람은 스틱 피겨로만 표시합니다. SMPL-X 메시 표시는 아직 없습니다(UsdSkel 필요).
 - 로봇 발바닥 높이는 발 링크 바운딩박스로 근사합니다. Isaac G1 USD의 발 박스는 GMR MJCF 충돌구보다 약 1.7 cm 낮아서, 리타게팅이 맞아도 최저점이 -2 cm 근처로 나옵니다.
-- SMPL-X 리타게팅은 바디모델이 없어 미검증입니다. smpl-x.is.tue.mpg.de에 등록해 받은 `SMPLX_NEUTRAL.npz` 등을 `models/smplx/`에 두고 `--smpl-model-dir models`로 확인하세요.
+- SMPL-X 경로는 AMASS SMPL-X N(중립 모델)으로만 확인했습니다. 성별 모델 파일(SMPL-X G)과 SMPL+H 파일은 리타게팅을 해 보지 않았습니다.
 - GMR 결과는 바닥을 제약하지 않습니다. LAFAN1 춤·넘어졌다 일어나기에서 발이 바닥 아래 7–9 cm까지 내려가고 -2 cm 아래 프레임이 0.7–7.9%입니다(Unitree 0.03–1.6%). 평활화로는 바뀌지 않으므로, 바닥 동작을 쓰려면 IK에 바닥 제약을 넣거나 발 높이를 뒤처리해야 합니다.
 - T-pose 설정의 로봇 자세 맞춤과 관절 중심 보정은 G1에만 정의되어 있습니다(`khumanoid/retarget.py`의 `TPOSE_CHAINS`, `JOINT_CENTERS`). LG 휴머노이드가 오면 MJCF를 GMR `params.py`에 등록하고, LAFAN1 형식 IK 설정과 이 두 표를 추가합니다.
 - 손가락과 물체 접촉은 리타게팅하지 않습니다.

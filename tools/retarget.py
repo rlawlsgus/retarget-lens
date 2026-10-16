@@ -12,8 +12,10 @@ Input formats (--format auto picks one):
            Rokoko exports (rest pose; or --ref <frame>). The GMR config is
            derived from that T-pose; see khumanoid/retarget.py.
   lafan1   LAFAN1-skeleton BVH, GMR's own loader and config. (nokov: --format nokov)
-  smplx    AMASS SMPL-X npz; needs the SMPL-X body model (--smpl-model-dir or
-           $SMPL_MODEL_DIR -> folder with smplx/SMPLX_NEUTRAL.npz).
+  smplx    AMASS SMPL-X npz, config derived from the body model's zero (T-)pose
+           exactly like tpose BVH; needs the SMPL-X body model (--smpl-model-dir
+           or $SMPL_MODEL_DIR -> folder with smplx/SMPLX_NEUTRAL.npz).
+  smplx-gmr  the same files through GMR's own SMPL-X loader and config.
 
 Writes per clip:
   <clip>_<robot>.npz   RobotMotion.save_npz: fps, joint_names, root_pos,
@@ -68,7 +70,7 @@ def main() -> int:
     ap.add_argument("inputs", nargs="+", help="BVH / AMASS SMPL-X npz files or folders (searched recursively)")
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "data", "retargeted"))
     ap.add_argument("--robot", default="unitree_g1", help="GMR robot name (default unitree_g1, 29 DoF)")
-    ap.add_argument("--format", default="auto", choices=["auto", "tpose", "lafan1", "nokov", "smplx"])
+    ap.add_argument("--format", default="auto", choices=["auto", "tpose", "lafan1", "nokov", "smplx", "smplx-gmr"])
     ap.add_argument("--fps", type=float, default=30.0, help="output frame rate (0 = keep the source rate)")
     ap.add_argument("--ref", default="auto", help="T-pose reference for --format tpose: auto | rest | <frame>")
     ap.add_argument("--up-axis", default="y", help="BVH up axis (default y)")

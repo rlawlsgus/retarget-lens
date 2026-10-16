@@ -6,7 +6,7 @@
 
 Inputs (any mix, also addable from the GUI):
   human motion  .bvh, AMASS SMPL-X .npz  -> retargeted to the robot with tools/retarget.py's
-                pipeline (cached in data/retargeted/cache/), shown with the source
+                pipeline (cached in data/cache/retarget/), shown with the source
                 skeleton overlaid at robot scale
   robot motion  project .npz, Unitree .csv, GMR .pkl -> shown as is
 
@@ -20,13 +20,10 @@ The robot model is GMR's G1 URDF (meshes from ..\\GMR\\assets\\unitree_g1).
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, ROOT)
@@ -38,19 +35,12 @@ import yourdfpy  # noqa: E402
 from viser.extras import ViserUrdf  # noqa: E402
 
 from khumanoid import analysis  # noqa: E402
-from khumanoid.io import load_motion, urdf_joint_limits  # noqa: E402
-from khumanoid.io.bvh import load_bvh  # noqa: E402
-from khumanoid.io.smpl import load_amass_npz  # noqa: E402
-from khumanoid.motion import RobotMotion, SkeletonMotion  # noqa: E402
-from khumanoid.qc import QCConfig, check_robot  # noqa: E402
-from khumanoid.retarget import ROBOT_TAGS, detect_format, retarget_file  # noqa: E402
+from khumanoid.compare import Item, compute_metrics, load_item  # noqa: E402
+from khumanoid.io import urdf_joint_limits  # noqa: E402
 from khumanoid.rotations import quat_mul, quat_to_matrix  # noqa: E402
 
 PALETTE = [(230, 90, 50), (50, 125, 215), (60, 165, 90), (150, 90, 190), (215, 165, 40), (110, 110, 110),
            (0, 160, 170), (200, 70, 140)]
-HUMAN_EXT = (".bvh",)
-ROBOT_EXT = (".csv", ".pkl")
-CACHE = os.path.join(ROOT, "data", "retargeted", "cache")
 
 
 def log(msg: str) -> None:
@@ -70,94 +60,7 @@ def heading(q_wxyz: np.ndarray) -> float:
     return float(np.arctan2(x[1], x[0]))
 
 
-# --------------------------------------------------------------------------- loading
-@dataclass
-class Item:
-    label: str
-    source: str
-    kind: str  # e.g. "BVH (tpose) -> G1", "Unitree csv"
-    robot: RobotMotion
-    human: SkeletonMotion | None = None
-    info: dict = field(default_factory=dict)
-    color: tuple = (110, 110, 110)
-    offset: float = 0.0
-    visible: bool = True
-    show_human: bool = True
-    metrics: dict = field(default_factory=dict)
-    # display state, filled by the viewer
-    handles: dict = field(default_factory=dict)
-
-
-def _cache_path(path: str, robot: str, smooth: float, fps: float) -> str:
-    st = os.stat(path)
-    key = json.dumps([os.path.abspath(path), st.st_size, int(st.st_mtime), robot, smooth, fps])
-    h = hashlib.sha1(key.encode()).hexdigest()[:10]
-    stem = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(CACHE, f"{stem}_{h}_{ROBOT_TAGS.get(robot, robot)}.npz")
-
-
-def load_item(path: str, args) -> Item:
-    """Robot motion as is, or human motion retargeted (cached) + its skeleton."""
-    path = os.path.abspath(path)
-    ext = os.path.splitext(path)[1].lower()
-    name = os.path.splitext(os.path.basename(path))[0]
-    folder = os.path.basename(os.path.dirname(path))
-    human_fmt = None
-    if ext in HUMAN_EXT:
-        human_fmt = detect_format(path)
-    elif ext == ".npz":
-        with np.load(path, allow_pickle=False) as d:
-            keys = set(d.files)
-        if "pose_body" in keys:
-            human_fmt = "smplx"
-        elif "dof_pos" not in keys:
-            raise ValueError(f"{path}: neither a robot npz (dof_pos) nor AMASS SMPL-X (pose_body)")
-    elif ext not in ROBOT_EXT:
-        raise ValueError(f"unsupported file type: {path}")
-
-    if human_fmt is None:
-        robot = load_motion(path, fps=args.csv_fps)
-        kind = {"robot_npz": "robot npz", "unitree_csv": "Unitree csv", "gmr_pkl": "GMR pkl"}.get(
-            robot.meta.get("format"), "robot")
-        info_path = os.path.splitext(path)[0] + ".json"
-        info = json.load(open(info_path, encoding="utf-8")) if os.path.isfile(info_path) else {}
-        return Item(label=f"{folder}/{name}", source=path, kind=kind, robot=robot, info=info)
-
-    cached = _cache_path(path, args.robot, args.smooth, args.fps)
-    if os.path.isfile(cached) and os.path.isfile(cached[:-4] + ".json"):
-        robot = load_motion(cached)
-        info = json.load(open(cached[:-4] + ".json", encoding="utf-8"))
-        log(f"{name}: retarget from cache {os.path.relpath(cached, ROOT)}")
-    else:
-        log(f"{name}: retargeting ({human_fmt}) ...")
-        robot, info = retarget_file(path, robot=args.robot, fmt=human_fmt, fps=args.fps, smooth_hz=args.smooth,
-                                    smpl_model_dir=args.smpl_model_dir, log=None)
-        os.makedirs(CACHE, exist_ok=True)
-        robot.save_npz(cached)
-        with open(cached[:-4] + ".json", "w", encoding="utf-8") as f:
-            json.dump(info, f, indent=1, ensure_ascii=False, default=float)
-        robot = load_motion(cached)
-    if human_fmt == "smplx":
-        human = load_amass_npz(path, model_dir=args.smpl_model_dir, body_only=True)
-    else:
-        human = load_bvh(path)
-    smooth = f", smooth {args.smooth:g} Hz" if args.smooth else ""
-    label_fmt = {"tpose": "BVH", "lafan1": "BVH LAFAN1", "nokov": "BVH Nokov", "smplx": "SMPL-X"}[human_fmt]
-    return Item(label=f"{folder}/{name}", source=path, kind=f"{label_fmt} -> GMR{smooth}", robot=robot,
-                human=human, info=info)
-
-
-def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> None:
-    m = item.robot
-    out = {"duration": m.duration, "fps": m.fps, "frames": m.num_frames, **analysis.smoothness(m)}
-    if fk is not None:
-        out.update({k: v for k, v in analysis.foot_metrics(m, fk).items() if not k.startswith("_")})
-    r = check_robot(m, QCConfig(), limits)
-    out["qc"] = r.status
-    out["qc_notes"] = "; ".join(r.notes)
-    item.metrics = out
-
-
+# --------------------------------------------------------------------------- display helpers
 def human_scale(item: Item) -> float:
     """Uniform scale that puts the source skeleton on the robot (GMR scales positions)."""
     h, r = item.human, item.robot
@@ -252,7 +155,9 @@ class Viewer:
 
     # ---------------------------------------------------------------- items
     def add(self, path: str) -> Item:
-        item = load_item(path, self.args)
+        a = self.args
+        item = load_item(path, robot=a.robot, smooth=a.smooth, fps=a.fps, csv_fps=a.csv_fps,
+                         smpl_model_dir=a.smpl_model_dir, log=log)
         compute_metrics(item, self.fk, self.limits)
         with self.lock:
             used = {it.color for it in self.items}

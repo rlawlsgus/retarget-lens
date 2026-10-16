@@ -134,6 +134,56 @@ def test_cgspeed_tpose_frame_is_dropped(tmp_path):
     assert load_bvh(str(q)).num_frames == 2
 
 
+def test_cmu_60hz_trials_get_their_true_rate(tmp_path):
+    from khumanoid.io.bvh import cmu_capture_fps
+
+    assert cmu_capture_fps("143_11") == (60.0, "AMASS / C3D header")
+    assert cmu_capture_fps("02_01") == (None, "")  # 120 Hz subject
+    assert cmu_capture_fps("walk1_subject1") == (None, "")
+    tpose = [0, 17, 0] + [0] * 12
+    moving = [0, 17, 0] + [5, -80, 3, 10, 2, 1, -9, 4, 2, 7, 1, 3]
+    p = tmp_path / "143_11.bvh"  # cgspeed signature + a 60 Hz CMU trial name
+    p.write_text(_cmu_like_bvh([tpose, moving, moving]))
+    m = load_bvh(str(p))
+    assert m.fps == 60.0 and m.meta["file_fps"] == pytest.approx(120.0, rel=1e-3) and "60" in m.meta["fps_note"]
+    assert load_bvh(str(p), fps=100.0).fps == 100.0
+    q = tmp_path / "143_11_copy.bvh"  # same content, not a CMU trial name: the file's rate stands
+    q.write_text(_cmu_like_bvh([tpose, moving, moving]))
+    assert load_bvh(str(q)).fps == pytest.approx(120.0, rel=1e-3)
+
+
+def test_smpl_joint_names_map_to_tpose_bodies():
+    from khumanoid.io.smpl import BODY_JOINTS
+    from khumanoid.retarget import _resolve_bvh_bodies
+
+    parents = np.array([-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19])  # SMPL body tree
+    idx = _resolve_bvh_bodies(BODY_JOINTS, parents)
+    name = {k: BODY_JOINTS[v] for k, v in idx.items()}
+    assert name["Hips"] == "pelvis" and name["Spine2"] == "spine3"  # chest = parent of the collar
+    assert name["LeftUpLeg"] == "left_hip" and name["RightLeg"] == "right_knee" and name["LeftFoot"] == "left_ankle"
+    assert name["RightArm"] == "right_shoulder" and name["LeftForeArm"] == "left_elbow" and name["RightHand"] == "right_wrist"
+
+
+AMASS_02_01 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "amass_cmu_smplx", "CMU",
+                           "02", "02_01_stageii.npz")
+SMPLX_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")
+
+
+@pytest.mark.skipif(not (os.path.isfile(AMASS_02_01) and os.path.isfile(os.path.join(SMPLX_MODELS, "smplx",
+                                                                                     "SMPLX_NEUTRAL.npz"))),
+                    reason="needs licence-gated AMASS CMU 02_01 and the SMPL-X body model (see requirements.md)")
+def test_retarget_amass_smplx_matches_bvh_time_base():
+    """SMPL-X through the derived T-pose config: G1 npz at exactly 30 fps, same length as the BVH of the clip."""
+    pytest.importorskip("general_motion_retargeting")
+    from khumanoid.retarget import retarget_file
+
+    m, info = retarget_file(AMASS_02_01, fps=30.0, smooth_hz=6.0, smpl_model_dir=SMPLX_MODELS, log=None)
+    assert info["source_format"] == "smplx" and m.fps == 30.0 and m.num_frames == 86  # 343 frames @ 120 Hz
+    assert m.joint_names == G1_29DOF_JOINTS and np.all(np.isfinite(m.dof_pos))
+    assert info["ik_position_residual"]["feet"]["mean_cm"] < 5.0
+    assert 0.6 < np.median(m.root_pos[:, 2]) < 0.85
+
+
 def test_detect_format(tmp_path):
     p = tmp_path / "walk.bvh"
     p.write_text(walking_bvh_text(seconds=0.5, fps=30))

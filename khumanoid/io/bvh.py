@@ -6,7 +6,9 @@ Rokoko, MotionBuilder, and is the format of CMU Mocap / LAFAN1.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 
 import numpy as np
 
@@ -139,6 +141,35 @@ def _cgspeed_tpose(joints: list[_Joint], data: np.ndarray) -> bool:
     return bool(np.mean(data[0, rot] == 0) > 0.8 and np.mean(data[1, rot] == 0) < 0.8)
 
 
+_CMU_RATES: dict | None = None
+
+
+def cmu_capture_fps(stem: str) -> tuple[float | None, str]:
+    """True capture rate of a CMU trial named like "143_11", and where it comes from.
+
+    The cgspeed BVH conversion writes 120 fps into every file, but 20 subjects were
+    (partly) captured at 60 Hz. cmu_frame_rates.json (tools/cmu_frame_rates.py, from
+    AMASS's C3D-header rates) lists them. None = a 120 Hz subject or not a CMU name.
+    """
+    global _CMU_RATES
+    m = re.fullmatch(r"(\d+)_(\d+)", stem)
+    if not m:
+        return None, ""
+    if _CMU_RATES is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmu_frame_rates.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                _CMU_RATES = json.load(f)
+        except OSError:
+            _CMU_RATES = {}
+    subject = _CMU_RATES.get("subjects", {}).get(str(int(m.group(1))))
+    if subject is None:
+        return None, ""
+    if stem in subject["trials"]:
+        return float(subject["trials"][stem]), "AMASS / C3D header"
+    return float(subject["majority_fps"]), f"most trials of CMU subject {int(m.group(1))} (this one is not in AMASS)"
+
+
 def _auto_scale(positions_raw: np.ndarray) -> float:
     """Pick the unit scale that makes the performer's height closest to 1.7 m."""
     frame0 = positions_raw[0]
@@ -166,6 +197,7 @@ def load_bvh(
     ground: bool = False,
     with_rotations: bool = False,
     drop_tpose: bool | str = "auto",
+    fps: float | str = "auto",
 ) -> SkeletonMotion:
     """Load a BVH file as world-space joint positions (Z-up, meters).
 
@@ -181,10 +213,21 @@ def load_bvh(
         drop_tpose: drop frame 0 when it is the T-pose the CMU cgspeed converter
             inserted ("auto"), always (True) or never (False). Left in, the jump
             from it to the first captured frame is a 100 m/s QC spike.
+        fps: frame rate. "auto" = the file's frame time, except cgspeed CMU files
+            of 60 Hz trials (see :func:`cmu_capture_fps`), which say 120.
     """
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         joints, frame_time, data = _parse(f.read())
     tpose0 = _cgspeed_tpose(joints, data)
+    file_fps = 1.0 / frame_time if frame_time > 0 else 0.0
+    fps_out, fps_note = file_fps, ""
+    if fps != "auto" and fps is not None:
+        fps_out, fps_note = float(fps), "given by the caller"
+    elif tpose0:
+        true_fps, why = cmu_capture_fps(os.path.splitext(os.path.basename(path))[0])
+        if true_fps and abs(true_fps - file_fps) > 1.0:
+            fps_out = true_fps
+            fps_note = f"cgspeed CMU file says {file_fps:.0f} fps; captured at {true_fps:g} fps ({why})"
     dropped = 1 if (drop_tpose is True or (drop_tpose == "auto" and tpose0)) and len(data) > 1 else 0
     data = data[dropped:]
     raw, raw_rot = _forward_kinematics(joints, data)
@@ -204,11 +247,12 @@ def load_bvh(
         joint_names=names,
         parents=parents,
         positions=pos,
-        fps=1.0 / frame_time if frame_time > 0 else 0.0,
+        fps=fps_out,
         source=os.path.abspath(path),
         kind="skeleton",
         meta={"format": "bvh", "unit_scale": s, "up_axis": up_axis, "ground_offset_m": ground_offset,
-              "cgspeed_tpose_frame0": tpose0, "dropped_frames": dropped},
+              "cgspeed_tpose_frame0": tpose0, "dropped_frames": dropped, "file_fps": file_fps,
+              "fps_note": fps_note},
         rotations=rot_to_z_up(raw_rot[:, keep], up_axis) if with_rotations else None,
     )
 

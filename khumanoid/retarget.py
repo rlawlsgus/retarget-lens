@@ -13,8 +13,13 @@ Source formats:
               derived per clip: GMR's LAFAN1 task list and weights for the
               robot, with rotation offsets, per-body scales and ground height
               computed from the T-pose and the robot model.
-  ``smplx``   AMASS SMPL-X npz through GMR (needs the ``smplx`` package and the
-              licence-gated SMPL-X model files).
+  ``smplx``   AMASS SMPL / SMPL-X npz with the same derived config as ``tpose``
+              (the body model's zero pose is a T-pose), so BVH and SMPL-X
+              retargets of one clip are comparable. Needs the licence-gated
+              body model files.
+  ``smplx-gmr``  AMASS SMPL-X through GMR's own loader and smplx_to_<robot> config
+              (it matches the robot toe link to the SMPL-X toe joint; on AMASS CMU
+              the feet end up pitched 3-5 cm into the floor).
 
 GMR's robot configuration is MuJoCo qpos: root xyz, root quaternion **wxyz**,
 then joints in MJCF order. Only GMR's pkl files store the root as xyzw.
@@ -48,15 +53,23 @@ TPOSE_BODIES = (
 )
 
 # Joint names of common BVH exporters (MotionBuilder / CMU cgspeed, Xsens MVN,
-# OptiTrack Motive) for each body. Right side is derived from the left.
+# OptiTrack Motive) and of SMPL / SMPL-X for each body. Right side is derived from the left.
 _LEFT_ALIASES = {
-    "UpLeg": ("LeftUpLeg", "LeftUpperLeg", "LeftThigh", "LThigh"),
-    "Leg": ("LeftLeg", "LeftLowerLeg", "LeftShin", "LShin"),
-    "Foot": ("LeftFoot", "LFoot"),
-    "Arm": ("LeftArm", "LeftUpperArm", "LUArm"),
-    "ForeArm": ("LeftForeArm", "LeftLowerArm", "LFArm"),
-    "Hand": ("LeftHand", "LHand"),
+    "UpLeg": ("LeftUpLeg", "LeftUpperLeg", "LeftThigh", "LThigh", "left_hip"),
+    "Leg": ("LeftLeg", "LeftLowerLeg", "LeftShin", "LShin", "left_knee"),
+    "Foot": ("LeftFoot", "LFoot", "left_ankle"),
+    "Arm": ("LeftArm", "LeftUpperArm", "LUArm", "left_shoulder"),
+    "ForeArm": ("LeftForeArm", "LeftLowerArm", "LFArm", "left_elbow"),
+    "Hand": ("LeftHand", "LHand", "left_wrist"),
 }
+
+
+def _right_alias(name: str) -> str:
+    if name.startswith("Left"):
+        return "Right" + name[4:]
+    if name.startswith("left_"):
+        return "right_" + name[5:]
+    return "R" + name[1:]  # OptiTrack: LThigh -> RThigh
 _HIPS_ALIASES = ("Hips", "Hip", "Pelvis", "hip", "pelvis")
 
 # T-pose of the robot, matched to the human's reference frame one joint at a
@@ -73,6 +86,26 @@ _G1_TPOSE_CHAINS = [
     )
 ]
 TPOSE_CHAINS = {"unitree_g1": _G1_TPOSE_CHAINS, "unitree_g1_with_hands": _G1_TPOSE_CHAINS}
+
+# Then each limb is refined with its swing joints together: (joints, [(robot segment, human segment)]).
+# Twist joints (hip / shoulder yaw) stay out: matching a few degrees of kink in the
+# reference skeleton with them gave 75 deg twists that then skewed every frame.
+_G1_TPOSE_LIMBS = [
+    limb
+    for s, S in (("left", "Left"), ("right", "Right"))
+    for limb in (
+        ([f"{s}_hip_pitch_joint", f"{s}_hip_roll_joint", f"{s}_knee_joint"],
+         [((f"{s}_hip_roll_link", f"{s}_knee_link"), (f"{S}UpLeg", f"{S}Leg")),
+          ((f"{s}_knee_link", f"{s}_ankle_pitch_link"), (f"{S}Leg", f"{S}Foot"))]),
+        ([f"{s}_shoulder_pitch_joint", f"{s}_shoulder_roll_joint", f"{s}_elbow_joint"],
+         [((f"{s}_shoulder_roll_link", f"{s}_elbow_link"), (f"{S}Arm", f"{S}ForeArm")),
+          ((f"{s}_elbow_link", f"{s}_wrist_roll_link"), (f"{S}ForeArm", f"{S}Hand"))]),
+    )
+]
+TPOSE_LIMBS = {"unitree_g1": _G1_TPOSE_LIMBS, "unitree_g1_with_hands": _G1_TPOSE_LIMBS}
+# ...and the feet are levelled with the ankles: (ankle joints, foot body)
+_G1_TPOSE_FEET = [([f"{s}_ankle_pitch_joint", f"{s}_ankle_roll_joint"], f"{s}_ankle_roll_link") for s in ("left", "right")]
+TPOSE_FEET = {"unitree_g1": _G1_TPOSE_FEET, "unitree_g1_with_hands": _G1_TPOSE_FEET}
 
 # Robot body that sits at the human joint centre, where the IK body's origin does
 # not (G1 hip_yaw_link is mid-thigh, shoulder_yaw_link mid-upper-arm). The
@@ -211,11 +244,10 @@ def _resolve_bvh_bodies(names: list[str], parents: np.ndarray) -> dict[str, int]
     idx["Hips"] = hips
     for part, aliases in _LEFT_ALIASES.items():
         for side in ("Left", "Right"):
-            cands = [a.replace("Left", side) if a.startswith("Left") else ("R" + a[1:] if side == "Right" else a)
-                     for a in aliases]
+            cands = list(aliases) if side == "Left" else [_right_alias(a) for a in aliases]
             j = next((lookup[c] for c in cands if c in lookup), None)
             if j is None:
-                raise ValueError(f"BVH has no {side} {part} joint (tried {cands}); use --format or add an alias")
+                raise ValueError(f"skeleton has no {side} {part} joint (tried {cands}); use --format or add an alias")
             idx[f"{side}{part}"] = j
     # chest = the spine joint the arm hangs from (skip a clavicle/shoulder joint)
     p = int(parents[idx["LeftArm"]])
@@ -271,32 +303,62 @@ def load_bvh_tpose(path: str, up_axis: str = "y", ref: str | int = "auto", fps: 
     else:
         k = int(ref)
         ref_P, ref_R = P[k], R[k]
-    P, R = P[dropped:], R[dropped:]
-    P, R, fps_out = _resample(P, R, m.fps, fps)
+    end = m.joint_names.index("Head_end") if "Head_end" in m.joint_names else None
+    height = None
+    if end is not None:
+        height = float(ref_P[end, 2] - min(ref_P[idx["LeftFoot"], 2], ref_P[idx["RightFoot"], 2]))
+    info = {
+        "reference": "rest pose" if ref == "rest" else f"frame {ref}",
+        "dropped_leading_frames": dropped,
+        "source_fps_note": m.meta.get("fps_note") or None,
+        "unit_scale": m.meta["unit_scale"],
+    }
+    return _tpose_clip(m.joint_names, idx, P[dropped:], R[dropped:], m.fps, fps, ref_P, ref_R, "tpose", height, info)
+
+
+def _tpose_clip(names, idx, P, R, fps_in, fps, ref_P, ref_R, fmt, height, info) -> HumanClip:
+    """GMR human frames (TPOSE_BODIES) from world joint positions / frames + the reference pose."""
+    P, R, fps_out = _resample(P, R, fps_in, fps)
     Q = matrix_to_quat(R)
 
     def body(name: str) -> str:  # FootMod -> Foot joint (in a T-pose skeleton the foot frame is usable as is)
         return name.replace("FootMod", "Foot")
 
     frames = [{b: [P[t, idx[body(b)]], Q[t, idx[body(b)]]] for b in TPOSE_BODIES} for t in range(len(P))]
-    ref_pose = {b: (ref_P[i], ref_R[i]) for b, i in idx.items()}
-    end = m.joint_names.index("Head_end") if "Head_end" in m.joint_names else None
-    height = None
-    if end is not None:
-        height = float(ref_P[end, 2] - min(ref_P[idx["LeftFoot"], 2], ref_P[idx["RightFoot"], 2]))
     return HumanClip(
-        frames=frames, fps=fps_out, fmt="tpose", height_m=height,
+        frames=frames, fps=fps_out, fmt=fmt, height_m=height,
         info={
-            "reference": "rest pose" if ref == "rest" else f"frame {ref}",
-            "dropped_leading_frames": dropped,
-            "source_fps": m.fps,
-            "unit_scale": m.meta["unit_scale"],
-            "joint_map": {b: m.joint_names[i] for b, i in idx.items()},
-            "_ref_pose": ref_pose,
+            **info,
+            "source_fps": fps_in,
+            "joint_map": {b: names[i] for b, i in idx.items()},
+            "_ref_pose": {b: (ref_P[i], ref_R[i]) for b, i in idx.items()},
             "_hips_z": P[:, idx["Hips"], 2],
             "_feet": P[:, [idx["LeftFoot"], idx["RightFoot"]]],
         },
     )
+
+
+def load_smplx_tpose(path: str, model_dir: str | None, fps: float | None = 30.0) -> HumanClip:
+    """AMASS SMPL / SMPL-X npz -> GMR human frames for the T-pose config.
+
+    The body model's zero pose is a T-pose, so the same per-clip derivation as for
+    T-pose BVH applies (rotation offsets, scales, ground from that pose and the
+    robot), which keeps BVH and SMPL-X retargets of a clip directly comparable.
+    Joint positions and frames come from khumanoid.io.smpl (numpy FK of the body
+    model; hands, face and the toe joints are not used).
+    """
+    from .io.smpl import load_amass_npz
+
+    model_dir = model_dir or os.environ.get("SMPL_MODEL_DIR")
+    if not model_dir:
+        raise FileNotFoundError("SMPL-X retargeting needs the body model: pass --smpl-model-dir or set SMPL_MODEL_DIR")
+    m = load_amass_npz(path, model_dir=model_dir, body_only=True, with_rotations=True)
+    if m.fps <= 0:
+        raise ValueError(f"{path}: no mocap frame rate in the file")
+    idx = _resolve_bvh_bodies(m.joint_names, m.parents)
+    ref_P, ref_R = m.meta["rest_pose"]
+    info = {"reference": f"{m.meta['model_type']} zero pose ({m.meta['gender']})", "dropped_leading_frames": 0}
+    return _tpose_clip(m.joint_names, idx, m.positions, m.rotations, m.fps, fps, ref_P, ref_R, "smplx", None, info)
 
 
 def load_bvh_gmr(path: str, fmt: str, fps: float | None = 30.0) -> HumanClip:
@@ -342,6 +404,17 @@ def load_smplx_gmr(path: str, model_dir: str | None, fps: float | None = 30.0) -
     with _quiet():
         body_model = smplx.create(model_dir, "smplx", gender=gender, use_pca=False, num_betas=len(betas), ext="npz")
     nb = body_model.num_betas
+    # Frame rate: GMR interpolates onto a grid that is not exactly tgt_fps and reports
+    # a rate that differs from the sample spacing (02_01: 29.74 reported, 29.47 actual).
+    # For integer ratios (AMASS 120 -> 30) take every k-th frame instead, like the BVH
+    # path, so both retargets share the same time base.
+    src_fps = float(np.asarray(data["mocap_frame_rate"]))
+    n_src = len(data["pose_body"])
+    ratio = src_fps / fps if fps else 1.0
+    stride = int(round(ratio)) if ratio > 1 and abs(ratio - round(ratio)) < 1e-3 else 1
+    for key in ("root_orient", "pose_body", "trans"):
+        data[key] = np.asarray(data[key])[::stride]
+    data["mocap_frame_rate"] = np.array(src_fps / stride)
     n = len(data["pose_body"])
 
     def tensor(x):
@@ -358,11 +431,15 @@ def load_smplx_gmr(path: str, model_dir: str | None, fps: float | None = 30.0) -
             expression=torch.zeros(n, body_model.num_expression_coeffs),
             return_full_pose=True,
         )
+        cur_fps = src_fps / stride
+        interpolate = bool(fps) and fps < cur_fps * (1 - 1e-3)  # non-integer downsampling only
         with _quiet():
-            frames, fps_out = get_smplx_data_offline_fast(data, body_model, output, tgt_fps=fps or 30)
+            frames, _ = get_smplx_data_offline_fast(data, body_model, output, tgt_fps=fps if interpolate else cur_fps)
+    # GMR's interpolation grid is linspace(0, n - 1, n // int(src / tgt)): use its true spacing
+    fps_out = (len(frames) - 1) / ((n - 1) / cur_fps) if interpolate and len(frames) > 1 else cur_fps
     height = 1.66 + 0.1 * float(betas[0])  # GMR's estimate, matched by its smplx IK config
     return HumanClip(frames=frames, fps=float(fps_out), fmt="smplx", height_m=height,
-                     info={"source_fps": float(np.asarray(data["mocap_frame_rate"])), "gender": gender,
+                     info={"source_fps": src_fps, "source_frames": n_src, "stride": stride, "gender": gender,
                            "num_betas_file": int(len(betas)), "num_betas_model": int(nb)})
 
 
@@ -403,6 +480,64 @@ def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray):
             best = min(best, (_angle(data.xpos[b1] - data.xpos[b0], target), v))
         q[model.jnt_qposadr[j]] = best[1]
         chosen[joint] = {"rad": round(float(best[1]), 4), "residual_deg": round(float(np.degrees(best[0])), 1)}
+
+    # Refine each limb with all its joints at once: one axis per joint cannot follow a
+    # limb that also points forward (SMPL-X zero pose: arms forward and down, knees
+    # slightly bent). A small pull towards the 1-D solution keeps the free twist at 0.
+    from scipy.optimize import minimize
+
+    def body(name):
+        return mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
+
+    refined = {}
+    for joints, segments in TPOSE_LIMBS.get(robot, []):
+        ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in joints]
+        adr = [model.jnt_qposadr[j] for j in ids]
+        bounds = [tuple(model.jnt_range[j]) if model.jnt_limited[j] else (-np.pi, np.pi) for j in ids]
+        segs = [(body(r0), body(r1), face.T @ (ref_pose[h1][0] - ref_pose[h0][0])) for (r0, r1), (h0, h1) in segments]
+        x0 = q[adr].copy()
+
+        def cost(x):
+            q[adr] = x
+            data.qpos[:] = q
+            mj.mj_kinematics(model, data)
+            c = 0.0
+            for b0, b1, target in segs:
+                v = data.xpos[b1] - data.xpos[b0]
+                c += 1.0 - np.dot(v, target) / max(np.linalg.norm(v) * np.linalg.norm(target), 1e-12)
+            return c + 0.02 * float(np.sum((x - x0) ** 2))
+
+        res = minimize(cost, x0, method="L-BFGS-B", bounds=bounds)
+        q[adr] = res.x
+        cost(res.x)
+        for (r0, r1), (h0, h1) in segments:
+            target = face.T @ (ref_pose[h1][0] - ref_pose[h0][0])
+            refined[f"{r0}->{r1}"] = round(float(np.degrees(_angle(data.xpos[body(r1)] - data.xpos[body(r0)], target))), 1)
+        for n, v in zip(joints, res.x):
+            chosen[n] = {"rad": round(float(v), 4)}
+
+    # The reference skeletons stand flat-footed (cgspeed T-pose frame, SMPL-X zero pose),
+    # so level the robot's feet with the ankles; otherwise the foot would copy the
+    # shin's tilt into every frame's foot target.
+    for joints, foot in TPOSE_FEET.get(robot, []):
+        ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in joints]
+        adr = [model.jnt_qposadr[j] for j in ids]
+        bounds = [tuple(model.jnt_range[j]) if model.jnt_limited[j] else (-np.pi, np.pi) for j in ids]
+        fb = body(foot)
+
+        def tilt(x):
+            q[adr] = x
+            data.qpos[:] = q
+            mj.mj_kinematics(model, data)
+            return 1.0 - float(data.xmat[fb].reshape(3, 3)[2, 2])
+
+        res = minimize(tilt, q[adr].copy(), method="L-BFGS-B", bounds=bounds)
+        q[adr] = res.x
+        refined[f"{foot} tilt"] = round(float(np.degrees(np.arccos(np.clip(1.0 - tilt(res.x), -1, 1)))), 1)
+        for n, v in zip(joints, res.x):
+            chosen[n] = {"rad": round(float(v), 4)}
+    if refined:
+        chosen["segment_residual_deg"] = refined
     data.qpos[:] = q
     mj.mj_kinematics(model, data)
     return data, chosen
@@ -639,14 +774,17 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
     log = log or (lambda *_: None)
     fmt = detect_format(path) if fmt == "auto" else fmt
     config, ground, cfg_info = None, 0.0, {}
-    if fmt == "tpose":
-        clip = load_bvh_tpose(path, up_axis=up_axis, ref=ref, fps=fps)
+    if fmt in ("tpose", "smplx"):
+        if fmt == "tpose":
+            clip = load_bvh_tpose(path, up_axis=up_axis, ref=ref, fps=fps)
+        else:
+            clip = load_smplx_tpose(path, smpl_model_dir, fps=fps)
         config, ground, cfg_info = derive_tpose_config(robot, clip)
-        src_human = "bvh_tpose"
+        src_human = f"{fmt}_derived"
     elif fmt in ("lafan1", "nokov"):
         clip = load_bvh_gmr(path, fmt, fps=fps)
         src_human = f"bvh_{fmt}"
-    elif fmt == "smplx":
+    elif fmt == "smplx-gmr":
         clip = load_smplx_gmr(path, smpl_model_dir, fps=fps)
         src_human = "smplx"
     else:

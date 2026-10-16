@@ -130,6 +130,7 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 |---|---|---|
 | SMPL-X 바디모델 (`SMPLX_NEUTRAL.npz` 등) | AMASS SMPL-X 로딩·리타게팅 | smpl-x.is.tue.mpg.de 등록 후 다운로드 → `models/smplx/`, `--smpl-model-dir models` 또는 `SMPL_MODEL_DIR` |
 | SMPL+H 바디모델 | AMASS SMPL+H 로딩 | mano.is.tue.mpg.de → `models/smplh/` |
+| AMASS CMU (SMPL-X N) | BVH vs SMPL-X 비교, CMU 촬영 fps 표 재생성 | amass.is.tue.mpg.de 등록 후 다운로드 → `data/raw/amass_cmu_smplx/CMU/` (8.6 GB, 비상업 연구 라이선스) |
 | LG 휴머노이드 에셋 | G1 대신 실제 대상 로봇 | 미도착. 오면 `--robot-usd`(재생)와 GMR 등록(리타게팅)이 필요 |
 
 공개 샘플의 라이선스는 `data/raw/*/SOURCE.md`에 있습니다. CMU만 공개 데이터셋에 쓸 수 있고, LAFAN1과 Unitree csv(CC BY-NC-ND)는 내부 검증용입니다.
@@ -138,7 +139,7 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 
 ```powershell
 conda activate k-humanoid
-python -m pytest tests                     # 17 passed (GMR이 없으면 GMR이 필요한 3개만 skip)
+python -m pytest tests                     # 20 passed (GMR이 없으면 GMR이 필요한 4개, AMASS·SMPL-X 파일이 없으면 1개 skip)
 python -c "import general_motion_retargeting, mujoco, torch; print(mujoco.__version__, torch.__version__)"   # 3.11.0 2.10.0
 python tools\retarget.py data\raw\cmu_bvh\02_01.bvh --smooth 6 --out-dir data\retargeted\check
 #   -> 86 frames @ 30 fps, residual feet 약 0.66 cm

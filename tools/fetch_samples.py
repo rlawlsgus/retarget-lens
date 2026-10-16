@@ -53,7 +53,8 @@ SETS = {
                  "논문 사사: \"The data used in this project was obtained from mocap.cs.cmu.edu. "
                  "The database was created with funding from NSF EIA-0196217.\"",
         "notes": "cgspeed 변환본은 모든 파일의 0번 프레임에 T-pose를 끼워 넣었다(원본 캡처 아님). "
-                 "120 fps, Y-up, 단위 inch/0.45. 손가락·엄지 관절은 데이터 없음.",
+                 "파일에는 모두 120 fps로 적혀 있지만 143번 등 일부 피험자는 60 Hz 촬영이다(BVH 로더가 "
+                 "khumanoid/io/cmu_frame_rates.json으로 보정). Y-up, 단위 inch/0.45. 손가락·엄지 관절은 데이터 없음.",
     },
     "unitree": {
         "folder": "unitree_lafan1_g1",
