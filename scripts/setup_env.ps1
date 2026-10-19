@@ -13,7 +13,7 @@
      next to the project folder). Skip with -SkipGmr.
 
   -HooksOnly skips step 1, for an env created from environment.lock.txt
-  (see requirements.md): the env update would re-resolve the locked builds.
+  (see docs/setup.md): the env update would re-resolve the locked builds.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
@@ -46,7 +46,7 @@ Write-Host "conda: $conda"
 $env:CONDA_CHANNELS = "conda-forge"
 $exists = (& $conda env list) -match "^\s*$([regex]::Escape($EnvName))\s"
 if ($HooksOnly) {
-    if (-not $exists) { throw "env $EnvName not found; create it first (requirements.md)" }
+    if (-not $exists) { throw "env $EnvName not found; create it first (docs/setup.md)" }
 } else {
     Push-Location $ProjectRoot
     try {

@@ -70,7 +70,7 @@ def test_fbx_is_its_own_format(tmp_path):
 
 
 @pytest.mark.skipif(not (_blender() and os.path.isfile(os.path.join(RAW, "cmu_fbx_from_bvh", "02_03.fbx"))),
-                    reason="needs Blender (requirements.md) and data/raw/cmu_fbx_from_bvh")
+                    reason="needs Blender (docs/setup.md) and data/raw/cmu_fbx_from_bvh")
 def test_fbx_round_trip_matches_bvh():
     """BVH -> FBX (Blender) -> load_fbx gives the BVH's joints back (Z-up meters, same frames)."""
     from khumanoid.io.bvh import load_bvh

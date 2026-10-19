@@ -24,18 +24,18 @@ from typing import Callable
 
 import numpy as np
 
-from .. import analysis
+from .. import analysis, paths, settings
 from ..compare import Item, compute_metrics, load_item
 from ..diagnosis import CAUSE_KO
 from ..io import urdf_joint_limits
 from ..physics_runner import PHYSICS_CONFIG, PhysicsJob, PhysicsRunner
 from ..rotations import quat_mul, quat_to_matrix
-from .robots import OverlayBatch, RobotBatch
+from .robots import REGIONS, OverlayBatch, RobotBatch, align_on_pelvis, set_props
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-DEFAULT_URDF = os.path.join(os.path.dirname(ROOT), "GMR", "assets", "unitree_g1", "g1_custom_collision_29dof.urdf")
-PHYSICS_CACHE = os.path.join(ROOT, "data", "cache", "physics")
-VIDEO_DIR = os.path.join(ROOT, "reports", "videos", "viewer")
+ROOT = paths.REPO_ROOT
+DEFAULT_URDF = paths.robot_urdf()  # dev: ..\GMR\assets\unitree_g1\...; installed: shipped with the program
+PHYSICS_CACHE = paths.cache_dir("physics")
+VIDEO_DIR = paths.video_dir()
 PALETTE = [(230, 90, 50), (50, 125, 215), (60, 165, 90), (150, 90, 190), (215, 165, 40), (110, 110, 110),
            (0, 160, 170), (200, 70, 140)]
 GRAPH_FIXED = ("골반 높이 (m)", "골반 수평속도 (m/s)")
@@ -83,7 +83,7 @@ METRIC_HELP = [
     ("기준 모션과 비교", [
         ("기준 대비 다리 RMSE (°)", "기준과 겹치는 구간(시간 오프셋 반영)에서 다리 관절별 RMSE의 중앙값."),
         ("기준 대비 전체 RMSE (°)", "같은 방식으로 모든 관절의 RMSE 중앙값."),
-        ("QC", "검증 결과: PASS / WARN / FAIL (README의 \"검증(QC) 기준\")."),
+        ("QC", "검증 결과: PASS / WARN / FAIL (docs/pipeline.md의 \"검증(QC) 기준\")."),
     ]),
     ("물리 (Isaac PhysX 결과에만)", [
         ("물리: 보조 힘 (체중 %)", "골반을 받쳐 준 보조 힘의 평균, 체중 대비."),
@@ -97,9 +97,8 @@ METRIC_DESC = {name: desc for _, rows in METRIC_HELP for name, desc in rows}
 
 
 def rel(path: str) -> str:
-    """Path relative to the project when inside it."""
-    r = os.path.relpath(os.path.abspath(path), ROOT)
-    return path if r.startswith("..") else r
+    """For display: relative to the repository when inside it (dev layout), else absolute."""
+    return paths.rel(path)
 
 
 def _quiet_remove(handle) -> None:
@@ -194,29 +193,34 @@ def add_scene_arguments(ap) -> None:
     ap.add_argument("--urdf", default=DEFAULT_URDF, help="robot URDF for display")
     ap.add_argument("--smooth", type=float, default=6.0, help="smoothing for retargeted inputs (Hz, 0 = off)")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
-                    help="lift swing feet of retargeted inputs to at least CM off the floor (0 = off; 2.5 recommended)")
+                    help="lift swing feet of retargeted inputs to at least CM off the floor (0 = off; 2 recommended)")
     ap.add_argument("--fps", type=float, default=30.0, help="retarget output frame rate")
     ap.add_argument("--csv-fps", type=float, default=30.0, help="frame rate of Unitree csv files")
-    ap.add_argument("--smpl-model-dir", default=os.environ.get("SMPL_MODEL_DIR", os.path.join(ROOT, "models")))
+    ap.add_argument("--smpl-model-dir", default=None,
+                    help="folder holding smplx/SMPLX_*.npz (default: 환경 설정, $SMPL_MODEL_DIR, models/ in the repository)")
     ap.add_argument("--max-shift", type=float, default=3.0, help="search range of the automatic time alignment (s)")
     ap.add_argument("--mesh-cell", type=float, default=0.004,
                     help="simplify robot meshes on this grid (m) before sending them to the browser; 0 = full detail")
     ap.add_argument("--body-mesh", action="store_true", help="draw SMPL-X inputs as body meshes from the start")
     ap.add_argument("--library", action="append", default=None, metavar="DIR",
                     help="folder to list in the motion picker (repeatable; default: data/raw, data/samples, "
-                         "data/retargeted, data/uploads, reports)")
+                         "data/retargeted, data/uploads, reports and the 환경 설정 folders)")
     ap.add_argument("--physics", action="store_true", help="start in physics mode")
-    ap.add_argument("--video-dir", default=VIDEO_DIR, help="where \"동영상 저장\" writes its MP4s")
+    ap.add_argument("--video-dir", default=None, help="where \"동영상 저장\" writes its MP4s (default: 환경 설정, "
+                                                      "else reports/videos/viewer)")
     ap.add_argument("--physics-config", default=PHYSICS_CONFIG, help="PhysX settings for physics mode (yaml)")
     ap.add_argument("--isaac-accept-eula", action="store_true",
                     help="you accept the NVIDIA Omniverse EULA; physics mode runs Isaac Sim with OMNI_KIT_ACCEPT_EULA=YES")
 
 
 def scene_options(args) -> SceneOptions:
+    """Options from the command line; what it leaves out comes from 환경 설정 (khumanoid.settings)."""
+    s = settings.load()
+    smpl = args.smpl_model_dir or settings.find_smpl(s).path or paths.smpl_model_dir()
     return SceneOptions(robot=args.robot, urdf=args.urdf, smooth=args.smooth, swing_clearance_cm=args.swing_clearance,
-                        fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=args.smpl_model_dir, max_shift=args.max_shift,
+                        fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
                         physics_config=args.physics_config, isaac_accept_eula=args.isaac_accept_eula,
-                        video_dir=args.video_dir, library=args.library)
+                        video_dir=args.video_dir or settings.video_dir(s), library=args.library)
 
 
 @dataclass
@@ -233,6 +237,35 @@ class ViewSettings:
     show_balance: bool = True
     speed: float = 1.0
     loop: bool = True
+
+
+GHOST_COLOR = (200, 206, 218)  # the reference motion in an overlay comparison
+DIFF_COLORS = ((245, 205, 40), (240, 130, 30), (220, 40, 35))  # at 1x, 2x, 3x the tolerance
+
+
+@dataclass
+class CompareSettings:
+    """겹쳐 비교: motion B is drawn on motion A's pelvis (moved there, and turned to A's pelvis
+    heading when `heading`). A is a translucent ghost; of B only the parts more than tol_cm
+    away from A's are drawn, coloured yellow (tol) -> orange (2 tol) -> red (3 tol and more).
+    The pair's skeletons and balance marks are hidden meanwhile."""
+    on: bool = False
+    ref: Item | None = None  # A
+    item: Item | None = None  # B
+    heading: bool = True
+    tol_cm: float = 3.0
+    ghost_opacity: float = 0.3
+
+    def key(self) -> tuple:
+        return self.on, id(self.ref), id(self.item), self.heading, self.tol_cm, self.ghost_opacity
+
+
+def diff_colors(d_cm: np.ndarray, tol_cm: float) -> np.ndarray:
+    """(n,) deviations (cm) -> (n, 3) uint8: yellow at the tolerance, orange at 2x, red from 3x."""
+    x = np.clip((np.asarray(d_cm, dtype=np.float64) - tol_cm) / max(2.0 * tol_cm, 1e-6), 0.0, 1.0)[:, None]
+    lo, mid, hi = (np.array(c, dtype=np.float64) for c in DIFF_COLORS)
+    c = np.where(x < 0.5, lo + (mid - lo) * (x / 0.5), mid + (hi - mid) * ((x - 0.5) / 0.5))
+    return np.round(c).astype(np.uint8)
 
 
 @dataclass
@@ -267,6 +300,9 @@ class MotionScene:
                                     accept_eula=self.opts.isaac_accept_eula, log=self.log)
         self.robots = RobotBatch(server, urdf)  # every robot's meshes, posed together each tick
         self.overlays = OverlayBatch(server)  # skeletons, support polygons, CoM / ZMP of all motions
+        self.compare = CompareSettings()
+        self.compare_now: dict | None = None  # the drawn frame's difference (set by tick)
+        self._compare_cache: tuple = (None, None)
         server.scene.set_up_direction("+z")
         server.scene.add_grid("/floor", width=40, height=40, cell_size=0.5, section_size=1.0,
                               plane_color=(235, 235, 238), plane_opacity=1.0, shadow_opacity=0.25)
@@ -332,6 +368,8 @@ class MotionScene:
             self.items.remove(item)
             for i, it in enumerate(self.items):
                 it.handles["index"] = i
+            if item in (self.compare.ref, self.compare.item):
+                self.compare.on = False
             self._sync_robots()
         self.emit("items")
 
@@ -348,9 +386,140 @@ class MotionScene:
         self.emit("item", item)
 
     def _sync_robots(self) -> None:
-        """Robot meshes and overlays: one instance per motion, in list order, in its colour."""
-        self.robots.set_instances([it.color for it in self.items], 0.45 if self.view.robot_translucent else 1.0)
+        """Robot meshes and overlays: one instance per motion, in list order, in its colour
+        (the reference of an overlay comparison as a translucent ghost)."""
+        colors = [it.color for it in self.items]
+        base = 0.45 if self.view.robot_translucent else 1.0
+        opacities = None
+        pair = self.compare_pair()
+        if pair is not None:
+            colors[pair[0]] = GHOST_COLOR
+            opacities = [base] * len(colors)
+            opacities[pair[0]] = min(base, self.compare.ghost_opacity)
+        self.robots.set_instances(colors, base, opacities)
         self.overlays.sync([len(it.handles.get("bones", ())) for it in self.items], [it.color for it in self.items])
+
+    # ---------------------------------------------------------------- overlay comparison
+    def compare_pair(self) -> tuple[int, int] | None:
+        """(index of A, index of B) while an overlay comparison is on."""
+        c = self.compare
+        if not c.on or c.ref is None or c.item is None or c.ref is c.item:
+            return None
+        try:
+            return self.items.index(c.ref), self.items.index(c.item)
+        except ValueError:
+            return None
+
+    def compare_role(self, item: Item) -> str | None:
+        pair = self.compare_pair()
+        if pair is None:
+            return None
+        return "A" if item is self.items[pair[0]] else "B" if item is self.items[pair[1]] else None
+
+    def set_compare(self, on: bool | None = None, ref: Item | None = None, item: Item | None = None,
+                    heading: bool | None = None, tol_cm: float | None = None) -> None:
+        """Change the overlay comparison; arguments left None stay as they are. Turning it on
+        without a valid pair picks one (A: the first motion, B: the first other one)."""
+        with self.lock:
+            c = self.compare
+            if ref is not None:
+                c.ref = ref
+            if item is not None:
+                c.item = item
+            if heading is not None:
+                c.heading = bool(heading)
+            if tol_cm is not None:
+                c.tol_cm = max(0.1, float(tol_cm))
+            if on is not None:
+                c.on = bool(on)
+            if c.on:
+                if c.ref not in self.items:
+                    c.ref = self.items[0] if self.items else None
+                if c.item not in self.items or c.item is c.ref:
+                    c.item = next((it for it in self.items if it is not c.ref), None)
+                if c.ref is None or c.item is None:
+                    c.on = False
+                    self.log("겹쳐 비교: 모션이 두 개 이상 있어야 합니다")
+            self._sync_robots()
+        self.emit("compare")
+
+    def _compare_frame(self, T_base: np.ndarray, cfg: np.ndarray, visible: np.ndarray, pair) -> None:
+        """Draw the frame with B on A's pelvis and B's parts that differ coloured."""
+        a, b = pair
+        c = self.compare
+        T_base = T_base.copy()
+        T_base[b] = align_on_pelvis(T_base[a], T_base[b], c.heading)
+        T = self.robots.forward(T_base, cfg)
+        dev = self.robots.part_deviation(T[:, [a]], T[:, [b]])[0] * 100.0  # cm per part
+        n, K = len(T_base), len(dev)
+        part_visible = np.ones((K, n), bool)
+        part_visible[:, b] = dev > c.tol_cm
+        colors = np.broadcast_to(np.array(self.robots.colors, np.uint8)[None], (K, n, 3)).copy()
+        colors[:, b] = diff_colors(dev, c.tol_cm)
+        self.robots.send(T, visible, part_visible, colors)
+        regions = {r: float(max(d for d, g in zip(dev, self.robots.part_regions) if g == r))
+                   for r in REGIONS if r in self.robots.part_regions}
+        worst = max(regions, key=regions.get) if regions else None
+        self.compare_now = {"mean": float(dev.mean()), "regions": regions, "worst": worst,
+                            "over": int((dev > c.tol_cm).sum()), "parts": K}
+        lab = self.items[b].handles.get("label")
+        if lab is not None:  # above A's label, where B is drawn
+            lab.position = T_base[a][:3, 3] + np.array([0.0, 0.0, 1.05])
+
+    def _poses_at(self, item: Item, src: Item, local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Base transforms (F, 4, 4) in display space and robot-model joint values (F, joints)
+        of a motion at local times, as _pose draws them."""
+        pos, quat = analysis.sample_root(src.robot, local)
+        dof = analysis.sample_dof(src.robot, local)
+        qd, shift = self._display_transform(item)
+        R = quat_to_matrix(qd)
+        T = np.tile(np.eye(4), (len(local), 1, 1))
+        T[:, :3, :3] = R @ quat_to_matrix(quat)
+        T[:, :3, 3] = pos @ R.T + shift
+        jmap = src.handles.get("map", item.handles["map"])
+        cfg = np.stack([dof[:, i] if i is not None else np.zeros(len(local)) for i in jmap], axis=1)
+        return T, cfg
+
+    def compare_series(self, fps: float = 30.0) -> dict | None:
+        """The comparison over the whole stretch where both motions play (B on A's pelvis as
+        drawn): {"t": (F,) timeline s, "parts": (F, parts) cm, "mean": (F,) cm, "regions":
+        {region: (F,) cm, the region's largest part}}; None without a comparison. Cached."""
+        pair = self.compare_pair()
+        if pair is None:
+            return None
+        A, B = self.items[pair[0]], self.items[pair[1]]
+        sa, sb = self.shown(A), self.shown(B)
+        key = (id(A), id(B), A.offset, B.offset, self.compare.heading, id(sa), id(sb), self.view.align, fps)
+        if self._compare_cache[0] == key:
+            return self._compare_cache[1]
+        lo = max(A.offset, B.offset)
+        hi = min(A.offset + sa.robot.duration, B.offset + sb.robot.duration)
+        t = np.arange(lo, hi, 1.0 / fps) if hi > lo else np.zeros(0)
+        out = {"t": t, "parts": np.zeros((len(t), len(self.robots.meshes))), "mean": np.zeros(len(t)),
+               "regions": {}}
+        if len(t):
+            TA, ca = self._poses_at(A, sa, t - A.offset)
+            TB, cb = self._poses_at(B, sb, t - B.offset)
+            TB = align_on_pelvis(TA, TB, self.compare.heading)
+            dev = self.robots.part_deviation(self.robots.forward(TA, ca), self.robots.forward(TB, cb)) * 100.0
+            out["parts"], out["mean"] = dev, dev.mean(1)
+            for r in REGIONS:
+                idx = [k for k, g in enumerate(self.robots.part_regions) if g == r]
+                if idx:
+                    out["regions"][r] = dev[:, idx].max(1)
+        self._compare_cache = (key, out)
+        return out
+
+    def compare_table(self) -> list[tuple[str, str, str, str, str]]:
+        """Per region over the shared stretch: (region, mean cm, max cm, time of the max, % of
+        frames beyond the tolerance)."""
+        s = self.compare_series()
+        if s is None or not len(s["t"]):
+            return []
+        tol = self.compare.tol_cm
+        rows = [("전체 (부위 평균)", s["mean"])] + list(s["regions"].items())
+        return [(name, f"{v.mean():.1f}", f"{v.max():.1f}", f"{s['t'][int(np.argmax(v))]:.2f}",
+                 f"{100 * float((v > tol).mean()):.0f}") for name, v in rows]
 
     def _joint_map(self, motion) -> list:
         """Column of each robot-model joint in a motion's dof_pos (None = held at 0)."""
@@ -369,8 +538,18 @@ class MotionScene:
         item.handles["label"] = s.scene.add_label(f"{node}/label", item.label, font_screen_scale=0.9,
                                                   anchor="bottom-center")
         if item.human is not None:  # drawn by the shared skeleton node (OverlayBatch)
+            hm = item.human
             item.handles["scale"] = human_scale(item)
-            item.handles["bones"] = np.array(item.human.bones(), dtype=int).reshape(-1, 2)
+            bones = hm.meta.get("bones", []) if hm.kind == "markers" else hm.bones()
+            item.handles["bones"] = np.array(bones, dtype=int).reshape(-1, 2)
+            root = hm.positions[:, 0]
+            ok = np.isfinite(root).all(axis=1)
+            item.handles["anchor"] = root[int(np.argmax(ok))].copy() if ok.any() else np.zeros(3)  # first seen pelvis
+            if hm.kind == "markers":  # C3D: every placed marker as a dot, besides the marker-set sticks
+                item.handles["dots"] = np.array(hm.meta.get("dots") or range(1, len(hm.joint_names)), dtype=int)
+                item.handles["markers"] = s.scene.add_point_cloud(
+                    f"{node}/markers", np.zeros((1, 3), np.float32), np.array(item.color, np.uint8), point_size=0.022,
+                    point_shape="circle", precision="float32", point_shading="flat")
         # transform that starts the robot at the origin facing +x (applied when "align" is on)
         item.handles["yaw0"] = heading(item.robot.root_quat[0])
         item.handles["p0"] = item.robot.root_pos[0].copy()
@@ -399,6 +578,13 @@ class MotionScene:
                 for it in self.items:
                     if it.kind.startswith("SMPL-X") and "mesh" not in it.handles:
                         self._add_body_mesh(it)
+
+    def apply_settings(self, s: settings.Settings) -> None:
+        """Saved 환경 설정 take effect at once: the SMPL-X model folder and the video folder.
+        Isaac Sim and Blender are looked up when a job / an FBX needs them."""
+        self.opts.smpl_model_dir = settings.find_smpl(s).path or self.opts.smpl_model_dir
+        self.opts.video_dir = settings.video_dir(s)
+        self.emit("status")
 
     # ---------------------------------------------------------------- playback
     def time_range(self) -> tuple[float, float]:
@@ -434,7 +620,7 @@ class MotionScene:
                 else:
                     self.t, self.playing = hi, False
                     self.emit("time")
-        key = (self.t, self.physics_on, self.assist, self._version, astuple(self.view),
+        key = (self.t, self.physics_on, self.assist, self._version, astuple(self.view), self.compare.key(),
                tuple((id(it), it.visible, it.show_human, it.offset) for it in self.items))
         now = time.perf_counter()
         if key == self._drawn_key and not (self.runner.busy() and now - self._drawn_at > 0.5):
@@ -453,7 +639,12 @@ class MotionScene:
                 if pose is not None:
                     T_base[i], cfg[i], humans[i], balance[i] = pose
                     visible[i] = True
-            self.robots.update(T_base, cfg, visible)
+            pair = self.compare_pair()
+            if pair is not None and visible[pair[0]] and visible[pair[1]]:
+                self._compare_frame(T_base, cfg, visible, pair)
+            else:
+                self.robots.update(T_base, cfg, visible)
+                self.compare_now = None
             self.overlays.update(humans, balance)
 
     def fit_camera(self) -> None:
@@ -498,10 +689,13 @@ class MotionScene:
         nodes, or None when the motion is hidden."""
         h, v = item.handles, self.view
         visible = item.visible
+        role = self.compare_role(item)
         self._set_visible(item, "label", visible and bool(v.show_labels))
-        show_h = visible and item.show_human and bool(v.show_humans)
+        # in an overlay comparison the two robots are the picture: their skeletons, bodies and balance stay hidden
+        show_h = visible and item.show_human and bool(v.show_humans) and role is None
         mesh = h.get("mesh") if v.body_mesh else None
         self._set_visible(item, "mesh", show_h and mesh is not None)
+        self._set_visible(item, "markers", show_h)
         if not visible:
             return None
         src = self.shown(item)  # the physics result in physics mode
@@ -534,13 +728,15 @@ class MotionScene:
             else:
                 note = self.fall_note(src, local)
                 text += f" · 물리 · {note}" if note else " · 물리"
+        if role is not None:
+            text += " · 비교 기준 (반투명)" if role == "A" else " · 비교 대상 (벗어난 부위만 색칠)"
         if h.get("label_text") != text:  # one message less per robot per frame
             h["label"].text = h["label_text"] = text
-        balance = self._pose_balance(item, src.balance, local, R, shift)
+        balance = self._pose_balance(item, src.balance, local, R, shift) if role is None else None
         sticks = None
         if "bones" in h and show_h:
             hm = item.human
-            hips = hm.positions[0, 0]
+            hips = h["anchor"]
             start_r = item.robot.root_pos[0]
 
             def to_display(P: np.ndarray) -> np.ndarray:
@@ -562,7 +758,16 @@ class MotionScene:
                 f = int(np.clip(round(local * hm.fps), 0, hm.num_frames - 1))
                 Pd = to_display(hm.positions[f])
                 b = h["bones"]
-                sticks = np.nan_to_num(np.stack([Pd[b[:, 0]], Pd[b[:, 1]]], axis=1))
+                sticks = np.stack([Pd[b[:, 0]], Pd[b[:, 1]]], axis=1)
+                seen = Pd[np.isfinite(Pd).all(axis=1)]
+                bad = ~np.isfinite(sticks).all(axis=(1, 2))
+                if bad.any():  # a missing marker / joint: no stick (one to the origin would cross the scene)
+                    sticks[bad] = seen[0] if len(seen) else 0.0
+                if "markers" in h:  # placed markers only (not the virtual pelvis); occluded ones are left out
+                    dots = Pd[h["dots"]]
+                    dots = dots[np.isfinite(dots).all(axis=1)]
+                    set_props(h["markers"], points=(dots if len(dots) else seen[:1] if len(seen) else
+                                                    np.zeros((1, 3))).astype(np.float32))
         return T_base, cfg, sticks, balance
 
     def _pose_balance(self, item: Item, b, local: float, R: np.ndarray, shift: np.ndarray):
@@ -713,6 +918,8 @@ class MotionScene:
         stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.label).strip("_") or "motion"
         path = os.path.join(self.opts.video_dir, f"{stem}_{mode}.mp4")
         human = item.source if item.human is not None else None
+        if item.info.get("solved_motion"):  # C3D: Isaac draws a human in its file's own frame, so use the solved skeleton
+            human = item.info["solved_motion"]
         motion = replace(item.robot, name=stem)  # the video caption shows this name, not the cache file's
         job = self.runner.request_video(motion, path, human=human, physics=physics, assist=self.assist,
                                         smpl_model_dir=self.opts.smpl_model_dir,
@@ -753,6 +960,20 @@ class MotionScene:
         res = item.info.get("ik_position_residual")
         if res:
             rows.append(("IK 잔차(평균)", ", ".join(f"{k} {v['mean_cm']} cm" for k, v in res.items())))
+        c3d = item.info.get("c3d")
+        if c3d:  # raw markers drawn on the robot of the same take's solved skeleton
+            extra = (f" (파일에는 Vicon 모델 계산값까지 점 {c3d['points']}개)" if c3d["points"] != c3d["markers"] else "")
+            rows.append(("C3D 마커", f"{c3d['markers']}개{extra}, {c3d['fps']:g} Hz, {c3d['frames']} frames"))
+            worst = ", ".join(f"{n} {p}%" for n, p in c3d.get("most_missing", []))
+            text = f"빠짐 {c3d['missing_pct']:.1f}%" + (f" ({worst})" if worst else "")
+            if c3d.get("longest_gap_marker"):
+                text += f" · 가장 긴 공백 {c3d['longest_gap_s']:.2f} s ({c3d['longest_gap_marker']})"
+            text += (f" · 튐 {c3d['spike_frames']}프레임 ({', '.join(c3d['spike_markers'])})" if c3d.get("spike_frames")
+                     else " · 튐 없음")
+            rows.append(("마커 QC", text))
+            solved = rel(item.info.get("solved_motion", "?")).replace(os.sep, "/")
+            rows.append(("로봇 동작", f"{solved} 리타겟 · 마커를 그 좌표로 {c3d['yaw_deg']:.0f}° 돌려 "
+                                    f"맞춤 (골반 잔차 {c3d['residual_cm']:.1f} cm)"))
         if m.get("phys_ok"):
             rows.append(("물리 결과", f"{m['phys_ok']} · 보조 힘 {m['phys_harness_pct']:.0f}% 체중 · 넘어짐 "
                                     f"{m['phys_falls']} · 토크 한계 초과 {m['phys_saturated_pct']:.1f}%"))

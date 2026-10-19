@@ -17,6 +17,16 @@ from khumanoid.rotations import axis_rotation, quat_to_matrix  # noqa: E402
 from khumanoid.synthetic import g1_motion, walking_bvh_text  # noqa: E402
 
 NPZ_KEYS = {"fps", "joint_names", "root_pos", "root_quat_wxyz", "dof_pos"}
+LAFAN1_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "lafan1_bvh")
+
+
+def _need_retargeting():
+    """Skip without mink / mujoco / the G1 model (GMR's solver itself is vendored in khumanoid/gmr)."""
+    from khumanoid.retarget import unavailable
+
+    why = unavailable()
+    if why:
+        pytest.skip(why)
 
 
 def _qpos(n=5, yaw=np.pi / 2):
@@ -171,10 +181,10 @@ SMPLX_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "m
 
 @pytest.mark.skipif(not (os.path.isfile(AMASS_02_01) and os.path.isfile(os.path.join(SMPLX_MODELS, "smplx",
                                                                                      "SMPLX_NEUTRAL.npz"))),
-                    reason="needs licence-gated AMASS CMU 02_01 and the SMPL-X body model (see requirements.md)")
+                    reason="needs licence-gated AMASS CMU 02_01 and the SMPL-X body model (see docs/setup.md)")
 def test_retarget_amass_smplx_matches_bvh_time_base():
     """SMPL-X through the derived T-pose config: G1 npz at exactly 30 fps, same length as the BVH of the clip."""
-    pytest.importorskip("general_motion_retargeting")
+    _need_retargeting()
     from khumanoid.retarget import retarget_file
 
     m, info = retarget_file(AMASS_02_01, fps=30.0, smooth_hz=6.0, smpl_model_dir=SMPLX_MODELS, log=None)
@@ -198,7 +208,7 @@ def test_detect_format(tmp_path):
 
 def test_retarget_bvh_to_g1(tmp_path):
     """End to end through GMR: synthetic T-pose walker (faces and walks -Y) -> G1 npz."""
-    pytest.importorskip("general_motion_retargeting")
+    _need_retargeting()
     from khumanoid.retarget import retarget_file
 
     p = tmp_path / "walk.bvh"
@@ -224,7 +234,7 @@ def test_retarget_bvh_to_g1(tmp_path):
 
 def test_retarget_smoothed(tmp_path):
     """--smooth 6: same output format, joints inside the MJCF limits, residuals before/after recorded."""
-    pytest.importorskip("general_motion_retargeting")
+    _need_retargeting()
     from khumanoid.retarget import retarget_file, robot_joint_ranges, robot_model
 
     p = tmp_path / "walk.bvh"
@@ -237,3 +247,38 @@ def test_retarget_smoothed(tmp_path):
     sm = info["smoothing"]
     assert sm["cutoff_hz"] == 6.0 and "feet" in sm["ik_position_residual_before"]
     assert info["ik_position_residual"]["feet"]["mean_cm"] < 5.0
+
+
+def test_vendored_gmr_needs_no_torch():
+    """khumanoid/gmr: GMR's solver without GMR's package import (torch, MuJoCo viewer, imageio)."""
+    import subprocess
+
+    _need_retargeting()
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    code = ("import sys; from khumanoid import retarget; g = retarget._gmr(); "
+            "print(g.GeneralMotionRetargeting.__module__, 'torch' in sys.modules, 'general_motion_retargeting' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=root)
+    assert out.returncode == 0, out.stderr[-1500:]
+    assert out.stdout.split() == ["khumanoid.gmr.motion_retarget", "False", "False"]
+
+
+@pytest.mark.skipif(not os.path.isdir(LAFAN1_DIR), reason="needs data/raw/lafan1_bvh (internal LAFAN1 samples)")
+def test_lafan1_frames_match_gmr_loader(tmp_path):
+    """gmr_bvh_frames (khumanoid.io.bvh) gives what GMR's own LAFAN1 reader gives, to rounding."""
+    gmr_lafan1 = pytest.importorskip("general_motion_retargeting.utils.lafan1")
+    from khumanoid.retarget import gmr_bvh_frames
+
+    with open(os.path.join(LAFAN1_DIR, "dance1_subject1.bvh"), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    i = next(k for k, line in enumerate(lines) if line.startswith("Frames:"))
+    clip = tmp_path / "dance_60.bvh"
+    clip.write_text("\n".join(lines[:i] + ["Frames: 60", lines[i + 1]] + lines[i + 2:i + 62]) + "\n")
+    ours, height, fps = gmr_bvh_frames(str(clip), "lafan1")
+    theirs, their_height = gmr_lafan1.load_bvh_file(str(clip), format="lafan1")
+    assert len(ours) == len(theirs) == 60 and height == their_height and fps == pytest.approx(30.0, abs=1e-3)
+    for a, b in zip(ours, theirs):
+        assert set(a) == set(b)
+        for k in a:
+            assert np.allclose(a[k][0], b[k][0], atol=1e-9), k
+            q, r = np.asarray(a[k][1]), np.asarray(b[k][1])
+            assert min(np.abs(q - r).max(), np.abs(q + r).max()) < 1e-9, k  # same rotation (q ~ -q)

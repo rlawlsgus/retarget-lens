@@ -16,12 +16,13 @@ Physics results are keyed by the motion's arrays, the physics config, the harnes
 scale and CACHE_VERSION, so the same clip comes back instantly next time; a video
 that already exists is returned as is.
 
-Finding Isaac Sim (first match):
-  1. the KHUMANOID_ISAAC_PYTHON environment variable (python.bat / python.sh of a
-     standalone install, or any interpreter that can import isaacsim)
-  2. this interpreter, when it can import isaacsim (the k-humanoid dev env);
+Finding Isaac Sim (first match, khumanoid.settings.find_isaac):
+  1. the 환경 설정 value (python.bat / python.sh of a standalone install, or its folder)
+  2. the KHUMANOID_ISAAC_PYTHON environment variable (same, or any interpreter that can
+     import isaacsim)
+  3. this interpreter, when it can import isaacsim (the k-humanoid dev env);
      never in a frozen (packaged) build, where sys.executable is the program itself
-  3. the standalone install folders in ISAAC_DIRS (C:\\isaacsim)
+  4. the standalone install folders in ISAAC_DIRS (C:\\isaacsim)
 
 The Isaac EULA is never accepted here: pass accept_eula=True only after the user
 accepted it (viewer --isaac-accept-eula); otherwise a run fails with that message.
@@ -31,12 +32,10 @@ from __future__ import annotations
 
 import collections
 import hashlib
-import importlib.util
 import json
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -44,14 +43,17 @@ from typing import Callable
 
 import numpy as np
 
+from . import paths
 from .motion import RobotMotion
+from .settings import ISAAC_DIRS, ISAAC_ENV  # noqa: F401  (re-exported: where Isaac Sim is looked for)
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-REPLAY_SCRIPT = os.path.join(ROOT, "tools", "isaac_replay.py")
-PHYSICS_CONFIG = os.path.join(ROOT, "configs", "physics.yaml")
+# Isaac's Python runs isaac_replay.py from a folder of plain source files (the repository, or
+# the installed program's isaac/ folder); configs are passed explicitly, so it never relies on
+# its own folder holding them
+REPLAY_SCRIPT = paths.isaac_replay_script()
+PHYSICS_CONFIG = paths.resource("configs", "physics.yaml")
+QC_CONFIG = paths.resource("configs", "qc.yaml")
 CACHE_VERSION = 1  # bump when isaac_replay's physics output changes meaning
-ISAAC_ENV = "KHUMANOID_ISAAC_PYTHON"
-ISAAC_DIRS = [r"C:\isaacsim"] if os.name == "nt" else [os.path.expanduser("~/isaacsim")]
 
 # stage name in the "[isaac_replay] progress <stage> i/n" lines -> (label, start, end of the overall bar)
 STAGES = {"reference": ("기준 자세 기록", 0.25, 0.35), "simulate": ("시뮬레이션", 0.35, 0.95),
@@ -61,19 +63,15 @@ PROGRESS_RE = re.compile(r"\[isaac_replay\] progress (\w+) (\d+)/(\d+)")
 
 
 def isaac_command() -> list[str]:
-    """Command prefix that runs a Python script with Isaac Sim importable."""
-    p = os.environ.get(ISAAC_ENV)
-    if p:
-        if not os.path.isfile(p):
-            raise FileNotFoundError(f"{ISAAC_ENV}={p}: no such file")
-        return [p]
-    if not getattr(sys, "frozen", False) and importlib.util.find_spec("isaacsim") is not None:
-        return [sys.executable]
-    for d in ISAAC_DIRS:
-        launcher = os.path.join(d, "python.bat" if os.name == "nt" else "python.sh")
-        if os.path.isfile(launcher):
-            return [launcher]
-    raise FileNotFoundError(f"Isaac Sim을 찾지 못했습니다. 설치 폴더의 python.bat 경로를 환경변수 {ISAAC_ENV}에 넣어 주세요")
+    """Command prefix that runs a Python script with Isaac Sim importable (settings.find_isaac:
+    환경 설정, then $KHUMANOID_ISAAC_PYTHON, then this interpreter in the dev env, then C:\\isaacsim)."""
+    from . import settings
+
+    found = settings.find_isaac(settings.load(reload=True))
+    if found.path is None:
+        raise FileNotFoundError(f"{found.problem}. RetLens의 '파일 > 환경 설정'에서 Isaac Sim 설치 폴더를 지정하거나, "
+                                f"python.bat 경로를 환경변수 {ISAAC_ENV}에 넣어 주세요")
+    return [found.path]
 
 
 def motion_key(motion: RobotMotion, assist: float, config_text: str = "") -> str:
@@ -135,10 +133,14 @@ class PhysicsJob:
 
 class PhysicsRunner:
     def __init__(self, cache_dir: str, physics_config: str = PHYSICS_CONFIG, script: str = REPLAY_SCRIPT,
-                 command: list[str] | None = None, accept_eula: bool = False, log: Callable | None = None):
-        """command: interpreter prefix (default isaac_command(), looked up on the first run)."""
+                 command: list[str] | None = None, accept_eula: bool = False, log: Callable | None = None,
+                 robot_usd: str | None = None):
+        """command: interpreter prefix (default isaac_command(), looked up on the first run).
+        robot_usd: the robot's USD (a local file or a URL); None = the 환경 설정 value at each
+        request, where empty means Unitree G1 from NVIDIA's asset library (needs internet)."""
         self.cache_dir, self.physics_config, self.script = cache_dir, physics_config, script
         self.command, self.accept_eula = command, accept_eula
+        self._robot_usd = robot_usd
         self.log = log or (lambda *_: None)
         self.jobs: dict[str, PhysicsJob] = {}
         self._queue: collections.deque[PhysicsJob] = collections.deque()
@@ -149,12 +151,33 @@ class PhysicsRunner:
         self._worker.start()
 
     # ------------------------------------------------------------ public
+    def robot_usd(self) -> str:
+        """The robot USD Isaac loads ("" = the asset library's G1)."""
+        if self._robot_usd is not None:
+            return self._robot_usd
+        from . import settings
+
+        return settings.load(reload=True).robot_usd.strip().strip('"')
+
+    def _usd_text(self) -> str:
+        """Part of the result keys: another robot asset gives other results. Empty for the
+        default asset, so results computed before this option keep their keys."""
+        usd = self.robot_usd()
+        if not usd:
+            return ""
+        return "\n# robot_usd " + json.dumps(_file_id(usd) if os.path.isfile(usd) else usd)
+
+    def _robot_args(self) -> list[str]:
+        usd = self.robot_usd()
+        return ["--robot-usd", usd] if usd else []
+
     def _config_text(self) -> str:
         try:
             with open(self.physics_config, encoding="utf-8") as f:
-                return f.read()
+                text = f.read()
         except OSError:
-            return ""
+            text = ""
+        return text + self._usd_text()
 
     def key(self, motion: RobotMotion, assist: float) -> str:
         return motion_key(motion, assist, self._config_text())
@@ -177,7 +200,8 @@ class PhysicsRunner:
         job = PhysicsJob(key=self.key(motion, assist), name=name, assist=float(assist), out_dir=out_dir,
                          outputs=[os.path.join(out_dir, f"{name}_sim.npz")])
         job.args = ["--robot-motion", job.input_path, "--physics", "--assist", f"{assist:g}",
-                    "--physics-config", self.physics_config, "--check-out", out_dir, "--snapshots", "0"]
+                    "--physics-config", self.physics_config, "--qc-config", QC_CONFIG, "--check-out", out_dir,
+                    "--snapshots", "0", *self._robot_args()]
         return self._submit(job, motion, on_done)
 
     def request_video(self, motion: RobotMotion, video: str, human: str | None = None, physics: bool = False,
@@ -187,7 +211,7 @@ class PhysicsRunner:
         `isaac_replay.py --human ... --robot-motion ... --video` (--physics: as simulated).
         video: the .mp4 to write (a .gif next to it when ffmpeg is missing); returned as is
         when it already exists."""
-        cfg = self._config_text() if physics else ""
+        cfg = self._config_text() if physics else self._usd_text()
         key = hashlib.sha1(json.dumps([motion_key(motion, assist if physics else -1.0, cfg), _file_id(human),
                                        "video", physics]).encode()).hexdigest()[:12]
         name = _safe(motion.name)
@@ -197,7 +221,7 @@ class PhysicsRunner:
                          outputs=[base + ".mp4", base + ".gif"])
         # a huge stride: replay only the frames the video needs (a 120 fps human otherwise steps 4x as many)
         job.args = ["--robot-motion", job.input_path, "--video", base + ".mp4", "--check-out", out_dir,
-                    "--snapshots", "0", "--stride", "1000000"]
+                    "--qc-config", QC_CONFIG, "--snapshots", "0", "--stride", "1000000", *self._robot_args()]
         if human:
             job.args += ["--human", os.path.abspath(human)]
             if smpl_model_dir:
@@ -283,7 +307,7 @@ class PhysicsRunner:
             job.state, job.started = "running", time.time()
             job.stage, job.progress = STARTING[0], STARTING[1]
             job.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                        env=env, cwd=ROOT, text=True, encoding="utf-8", errors="replace",
+                                        env=env, cwd=paths.isaac_root(), text=True, encoding="utf-8", errors="replace",
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.log(f"{job.kind} running: {job.name}")
         with open(os.path.join(job.out_dir, "run.log"), "w", encoding="utf-8") as logf:
@@ -345,6 +369,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
     if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     else:
         proc.kill()

@@ -28,20 +28,24 @@ import time
 from html import escape
 
 import numpy as np
-from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter,
                            QPalette, QPen, QPixmap)
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDockWidget, QDoubleSpinBox,
-                               QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
-                               QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+                               QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+                               QSplitter,
                                QStyle, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import cmu_labels
-from ..compare import LIBRARY_ROOTS, MOTION_EXT, Item, library_files
-from .scene import GRAPH_FIXED, METRIC_DESC, METRIC_HELP, METRIC_HELP_FOOTER, ROOT, MotionScene, rel
+from .. import paths as app_paths  # "paths" is a common local name here
+from .. import settings
+from ..compare import MOTION_EXT, Item, library_files
+from .scene import GRAPH_FIXED, METRIC_DESC, METRIC_HELP, METRIC_HELP_FOOTER, MotionScene, rel
 
 APP_NAME = "RetLens"  # Retarget Lens
 APP_TAGLINE = "Retarget Lens · 모캡 리타게팅 검증 편집기"
@@ -61,9 +65,18 @@ def webengine_sandbox_workaround() -> bool:
     Library/bin; Chromium's sandboxed renderer cannot load them from there and crashes
     (0xC0000135). Turn the sandbox off in that layout only (a packaged build ships them side
     by side); the view shows nothing but the local scene server (ScenePage). Returns True
-    when it was turned off."""
+    when it was turned off.
+
+    The packaged build (packaging/retlens.spec) puts a copy of QtWebEngineProcess.exe next to
+    the Qt DLLs at the bundle's top and points Qt at it, so it runs sandboxed."""
     from PySide6.QtCore import QLibraryInfo
 
+    if app_paths.FROZEN and not os.environ.get("QTWEBENGINE_DISABLE_SANDBOX"):
+        top = getattr(__import__("sys"), "_MEIPASS", "")
+        proc = os.path.join(top, "QtWebEngineProcess.exe")
+        if os.path.isfile(proc) and os.path.isfile(os.path.join(top, "Qt6WebEngineCore.dll")):
+            os.environ.setdefault("QTWEBENGINEPROCESS_PATH", proc)
+            return False
     if os.environ.get("QTWEBENGINE_DISABLE_SANDBOX"):
         return True
     exe_dir = QLibraryInfo.path(QLibraryInfo.LibraryExecutablesPath)
@@ -108,6 +121,22 @@ def dark_palette() -> QPalette:
     p.setColor(QPalette.Disabled, QPalette.Text, QColor(120, 120, 128))
     p.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(120, 120, 128))
     return p
+
+
+class _GuiInvoker(QObject):
+    """Runs a callable on the GUI thread for another thread and waits for it (the AI API)."""
+    call = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.call.connect(self._run, Qt.BlockingQueuedConnection)
+
+    @staticmethod
+    def _run(box: dict) -> None:
+        try:
+            box["result"] = box["fn"]()
+        except Exception as e:  # handed back to the caller
+            box["error"] = e
 
 
 class SceneBridge(QObject):
@@ -253,6 +282,9 @@ class HierarchyPanel(QTreeWidget):
         if self.win.scene.video_file(it):
             m.addAction("저장된 동영상 열기", lambda: self.win.open_path(self.win.scene.video_file(it)))
         m.addAction("파일 위치 열기", lambda: self.win.open_path(os.path.dirname(it.source)))
+        m.addSeparator()
+        m.addAction("겹쳐 비교: 기준(A)으로", lambda: self.win.start_compare(ref=it))
+        m.addAction("겹쳐 비교: 대상(B)으로", lambda: self.win.start_compare(item=it))
         m.addSeparator()
         m.addAction("제거", lambda: self.win.remove(it))
         m.exec(self.viewport().mapToGlobal(pos))
@@ -641,7 +673,7 @@ class ProjectPanel(QWidget):
     def __init__(self, win: "EditorWindow", roots):
         super().__init__()
         self.win = win
-        self.roots = list(roots or LIBRARY_ROOTS)
+        self._fixed_roots = list(roots) if roots else None  # --library; else the 환경 설정 folders
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         top = QHBoxLayout()
@@ -677,6 +709,10 @@ class ProjectPanel(QWidget):
         lay.addWidget(split, 1)
         self._library: dict[str, list[str]] = {}
         self.reload()
+
+    @property
+    def roots(self) -> list[str]:
+        return self._fixed_roots or settings.library_dirs()
 
     def reload(self) -> None:
         self._library = library_files(self.roots)
@@ -723,7 +759,7 @@ class ProjectPanel(QWidget):
             name.setToolTip(rel(p))
             self.files.setItem(r, 0, name)
             self.files.setItem(r, 1, QTableWidgetItem(cmu_labels.label_for(p)))
-            self.files.setItem(r, 2, QTableWidgetItem(os.path.relpath(os.path.dirname(p), ROOT).replace(os.sep, "/")))
+            self.files.setItem(r, 2, QTableWidgetItem(rel(os.path.dirname(p)).replace(os.sep, "/")))
         self.files.resizeColumnToContents(0)
 
     def _add_row(self, r: int) -> None:
@@ -1003,6 +1039,247 @@ class AnalysisPanel(QWidget):
         self.plot.set_view(lo, hi, sc.t)
 
 
+# ------------------------------------------------------------------------------ overlay comparison
+REGION_COLORS = {"전체 (부위 평균)": QColor(235, 235, 240), "몸통·머리": QColor(160, 160, 175), "왼팔": QColor(90, 170, 255),
+                 "오른팔": QColor(255, 120, 90), "왼다리": QColor(80, 205, 140), "오른다리": QColor(235, 195, 60)}
+COMPARE_HELP = [
+    ("맞춤", "대상(B)의 골반을 기준(A)의 골반 위치로 옮깁니다. '골반 위치 + 방향'이면 골반이 향한 방향(수직축 회전)도 "
+           "A에 맞춥니다. 걸어간 경로·방향의 차이는 빠지고 자세의 차이만 남습니다."),
+    ("색", "A는 회색 반투명으로 그립니다. B는 A와의 거리가 허용 오차를 넘는 부위만 그리고, 노랑(허용 오차) → 주황(2배) → "
+          "빨강(3배 이상)으로 칠합니다. 회색만 보이는 곳은 두 모션이 겹치는 곳이고, 색이 칠해진 B 부위 옆의 회색이 A가 있던 자리입니다."),
+    ("부위 차이", "로봇 부품(고정 관절로 붙은 링크 묶음, G1은 30개)마다 중심과 바깥쪽 점 12개를 두 자세에서 비교한 평균 거리(cm)."),
+    ("그래프·표", "둘이 함께 재생되는 구간의 시간에 따른 차이입니다. '전체'는 부품 평균, 부위별 선은 그 부위에서 가장 많이 벗어난 "
+               "부품입니다. 표는 부위별 평균·최대·최대 시각·허용 오차를 넘은 시간 비율이고, 행을 두 번 클릭하면 그 시각으로 갑니다."),
+    ("시간·물리", "모션별 시간 오프셋과 물리 모드(시뮬레이션 결과)를 그대로 따릅니다. 분석 탭의 '기준에 시간 자동 정렬'로 "
+               "시간을 먼저 맞추면 비교가 정확해집니다."),
+]
+
+
+def compare_help_html() -> str:
+    rows = "".join(f"<tr><td style='padding-right:12px' nowrap><b>{escape(n)}</b></td><td>{escape(d)}</td></tr>"
+                   for n, d in COMPARE_HELP)
+    return f"<table width='560' cellspacing='0' cellpadding='3'>{rows}</table>"
+
+
+class DiffLegend(QWidget):
+    """Colour key of the overlay comparison: grey ghost = overlapping, yellow -> red = how far B is off."""
+
+    def __init__(self):
+        super().__init__()
+        self.tol = 3.0
+        self.setMinimumSize(420, 26)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def set_tol(self, tol: float) -> None:
+        self.tol = tol
+        self.update()
+
+    def paintEvent(self, _):
+        from PySide6.QtGui import QLinearGradient
+
+        from .scene import DIFF_COLORS, GHOST_COLOR
+
+        p = QPainter(self)
+        p.setPen(self.palette().color(QPalette.Text))
+        fm = p.fontMetrics()
+        h = self.height()
+        x = 0
+        ghost = QColor(*GHOST_COLOR)
+        ghost.setAlpha(120)
+        p.fillRect(QRectF(x, 5, 16, h - 10), ghost)
+        x += 20
+        text = f"겹침 (A, {self.tol:g} cm 이내)"
+        p.drawText(QPointF(x, h / 2 + fm.ascent() / 2 - 1), text)
+        x += fm.horizontalAdvance(text) + 14
+        w = 150
+        g = QLinearGradient(x, 0, x + w, 0)
+        for stop, c in zip((0.0, 0.5, 1.0), DIFF_COLORS):
+            g.setColorAt(stop, QColor(*c))
+        p.fillRect(QRectF(x, 5, w, h - 10), g)
+        small = QFont(self.font())
+        small.setPointSizeF(max(7.0, small.pointSizeF() - 1))
+        p.setFont(small)
+        p.setPen(QColor(20, 20, 20))
+        for frac, k in ((0.02, 1), (0.5, 2), (0.98, 3)):
+            label = f"{k * self.tol:g}" + ("+" if k == 3 else "")
+            tw = p.fontMetrics().horizontalAdvance(label)
+            p.drawText(QPointF(x + frac * w - frac * tw, h / 2 + p.fontMetrics().ascent() / 2 - 1), label)
+        p.setPen(self.palette().color(QPalette.Text))
+        p.setFont(self.font())
+        p.drawText(QPointF(x + w + 6, h / 2 + fm.ascent() / 2 - 1), "cm 벗어남 (B)")
+
+
+class ComparePanel(QWidget):
+    """겹쳐 비교 (overlay comparison): B on A's pelvis, A a translucent ghost, B's parts that are
+    off by more than the tolerance coloured; the difference over time and per body region."""
+
+    def __init__(self, win: "EditorWindow"):
+        super().__init__()
+        self.win = win
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        bar = QHBoxLayout()
+        self.toggle = QPushButton("겹쳐 보기")
+        self.toggle.setCheckable(True)
+        self.toggle.setStyleSheet("QPushButton:checked { background: palette(highlight); color: palette(highlighted-text); }")
+        self.toggle.setToolTip("켜면 대상(B)을 기준(A)의 골반 위치에 겹쳐 그립니다 (단축키 O)")
+        self.toggle.toggled.connect(self._toggled)
+        bar.addWidget(self.toggle)
+        bar.addWidget(QLabel("기준 A"))
+        self.ref = QComboBox()
+        self.ref.setToolTip("회색 반투명으로 그릴 모션")
+        bar.addWidget(self.ref, 1)
+        swap = QToolButton()
+        swap.setText("⇄")
+        swap.setToolTip("A와 B 바꾸기")
+        swap.clicked.connect(self._swap)
+        bar.addWidget(swap)
+        bar.addWidget(QLabel("대상 B"))
+        self.item = QComboBox()
+        self.item.setToolTip("A의 골반 위치로 옮겨, 벗어난 부위만 색칠해 그릴 모션")
+        bar.addWidget(self.item, 1)
+        for combo in (self.ref, self.item):
+            combo.currentIndexChanged.connect(lambda _: self._pair_changed())
+        bar.addWidget(QLabel("맞춤"))
+        self.align = QComboBox()
+        self.align.addItems(["골반 위치 + 방향", "골반 위치만"])
+        self.align.currentIndexChanged.connect(lambda i: self.win.scene.set_compare(heading=(i == 0)))
+        bar.addWidget(self.align)
+        bar.addWidget(QLabel("허용 오차"))
+        self.tol = QDoubleSpinBox()
+        self.tol.setRange(0.5, 50.0)
+        self.tol.setSingleStep(0.5)
+        self.tol.setValue(self.win.scene.compare.tol_cm)
+        self.tol.setSuffix(" cm")
+        self.tol.setToolTip("이보다 적게 벗어난 B 부위는 그리지 않습니다(A의 회색만 보임)")
+        self.tol.valueChanged.connect(lambda v: self.win.scene.set_compare(tol_cm=v))
+        bar.addWidget(self.tol)
+        bar.addWidget(help_button("보는 법", compare_help_html()))
+        lay.addLayout(bar)
+        row = QHBoxLayout()
+        self.legend = DiffLegend()
+        row.addWidget(self.legend)
+        self.now = QLabel()
+        row.addWidget(self.now, 1)
+        lay.addLayout(row)
+        split = QSplitter()
+        self.plot = LinePlot()
+        self.plot.setToolTip("끌기: 시간축 이동 · 휠: 확대/축소 · 두 번 클릭: 전체 구간")
+        self.plot.follow_requested.connect(self._full_view)
+        split.addWidget(self.plot)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["부위", "평균 (cm)", "최대 (cm)", "최대 시각 (s)", "허용 오차 넘음 (%)"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setToolTip("행을 두 번 클릭하면 그 부위가 가장 많이 벗어난 시각으로 갑니다")
+        self.table.cellDoubleClicked.connect(self._seek_row)
+        split.addWidget(self.table)
+        split.setSizes([620, 480])
+        lay.addWidget(split, 1)
+        self._filling = False
+        self._now_text = None
+
+    def showing(self) -> bool:
+        return self.isVisible() and not self.visibleRegion().isEmpty()
+
+    # ---------------------------------------------------------------- state
+    def _combo_item(self, combo: QComboBox) -> Item | None:
+        key = combo.currentData()
+        return self.win.item_by_id(key) if key is not None else None
+
+    def _toggled(self, on: bool) -> None:
+        if not self._filling:
+            self.win.start_compare(on=on)
+
+    def _pair_changed(self) -> None:
+        if self._filling:
+            return
+        a, b = self._combo_item(self.ref), self._combo_item(self.item)
+        if a is not None and a is b:  # keep them different: move B to another motion
+            b = next((it for it in self.win.scene.items if it is not a), None)
+        self.win.scene.set_compare(ref=a, item=b)
+
+    def _swap(self) -> None:
+        c = self.win.scene.compare
+        self.win.scene.set_compare(ref=c.item, item=c.ref)
+
+    def refresh(self) -> None:
+        """Controls follow the scene's comparison; the graph and table are rebuilt."""
+        sc, c = self.win.scene, self.win.scene.compare
+        self._filling = True
+        for combo, cur in ((self.ref, c.ref), (self.item, c.item)):
+            combo.clear()
+            for it in sc.items:
+                combo.addItem(color_icon(it.color), it.label, id(it))
+            i = combo.findData(id(cur)) if cur is not None else -1
+            combo.setCurrentIndex(i if i >= 0 else (1 if combo is self.item and combo.count() > 1 else 0))
+        self.toggle.setChecked(sc.compare_pair() is not None)
+        self.align.setCurrentIndex(0 if c.heading else 1)
+        if abs(self.tol.value() - c.tol_cm) > 1e-9:
+            self.tol.setValue(c.tol_cm)
+        self._filling = False
+        self.legend.set_tol(c.tol_cm)
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        sc = self.win.scene
+        s = sc.compare_series() if sc.compare_pair() is not None else None
+        self.table.setRowCount(0)
+        if s is None or not len(s["t"]):
+            self.plot.set_data([], "겹쳐 보기를 켜면 B − A 부위 차이(cm)가 시간에 따라 나옵니다"
+                               if s is None else "두 모션이 함께 재생되는 구간이 없습니다 (시간 오프셋 확인)")
+            self.plot.set_view(*sc.time_range(), sc.t)
+            return
+        t, tol = s["t"], sc.compare.tol_cm
+        series = [("전체 (부위 평균)", REGION_COLORS["전체 (부위 평균)"], t, s["mean"])]
+        series += [(r, REGION_COLORS.get(r, QColor(200, 200, 200)), t, v) for r, v in s["regions"].items()]
+        series.append((f"허용 오차 {tol:g} cm", QColor(130, 130, 140), t, np.full(len(t), tol)))
+        self.plot.set_data(series, "B − A 부위 차이 (cm), 골반 맞춤")
+        self._full_view()
+        rows = sc.compare_table()
+        self.table.setRowCount(len(rows))
+        for r, vals in enumerate(rows):
+            for col, v in enumerate(vals):
+                cell = QTableWidgetItem(v)
+                if col == 0:
+                    cell.setIcon(color_icon(REGION_COLORS.get(v, QColor(200, 200, 200)).getRgb()[:3]))
+                else:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(r, col, cell)
+        self.table.resizeColumnsToContents()
+
+    def _full_view(self) -> None:
+        s = self.win.scene.compare_series()
+        if s is not None and len(s["t"]) > 1:
+            self.plot.set_view(float(s["t"][0]), float(s["t"][-1]), self.win.scene.t)
+
+    def _seek_row(self, row: int, _col: int) -> None:
+        cell = self.table.item(row, 3)
+        if cell is not None:
+            self.win.scene.set_playing(False)
+            self.win.scene.seek(float(cell.text()))
+
+    def update_live(self) -> None:
+        """Playhead and the drawn frame's numbers (GUI timer); skipped while off screen."""
+        if not self.showing():
+            return
+        sc = self.win.scene
+        self.plot.set_view(self.plot.x0, self.plot.x1, sc.t)
+        now = sc.compare_now
+        if sc.compare_pair() is None:
+            text = "꺼짐: 툴바의 '겹쳐 비교'(O)나 이 탭의 '겹쳐 보기'로 켭니다. 계층 패널 우클릭으로 A·B를 고를 수도 있습니다."
+        elif now is None:
+            text = "지금 시각에는 A나 B가 보이지 않습니다(숨김)."
+        else:
+            worst = now["worst"]
+            text = (f"지금 {sc.t:.2f} s · 평균 {now['mean']:.1f} cm · 허용 오차 넘은 부품 {now['over']}/{now['parts']}"
+                    + (f" · 가장 큰 차이: {worst} {now['regions'][worst]:.1f} cm" if worst else ""))
+        if text != self._now_text:
+            self._now_text = text
+            self.now.setText(text)
+
+
 def metric_tip(name: str) -> str:
     """Hover text of one metric row: its name and what it measures."""
     desc = METRIC_DESC.get(name)
@@ -1042,6 +1319,230 @@ def short_text(v: str, limit: int = 18) -> str:
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
+# ------------------------------------------------------------------------------ settings
+OK_COLOR, WARN_COLOR, BAD_COLOR = "#5cb85c", "#e0a030", "#e05050"
+
+
+def check_html(c: settings.Check) -> str:
+    """One line of a check: ✓ what was found, or ⚠/✗ what is missing, what it is for and how to fix it."""
+    if c.ok:
+        what = c.detail or c.path
+        return f"<span style='color:{OK_COLOR}'>✓</span> {escape(what)}" + (
+            f" <span style='color:gray'>({escape(c.path)})</span>" if c.path and c.detail and c.key != "library" else "")
+    color, mark = (BAD_COLOR, "✗") if c.required else (WARN_COLOR, "⚠")
+    text = f"<span style='color:{color}'>{mark} {escape(c.detail or '없음')}</span>"
+    if c.needed_for:
+        text += f"<br><span style='color:gray'>쓸 수 없는 기능: {escape(c.needed_for)}</span>"
+    if c.hint:
+        text += f"<br><span style='color:gray'>{escape(c.hint)}</span>"
+    return text
+
+
+class SettingsDialog(QDialog):
+    """환경 설정: where the external programs and the folders are, each checked as it is typed.
+    Empty fields mean "find it" (environment variables, the usual install places)."""
+    ROWS = [  # key, label, picks a file (filter) or a folder (None), settings field
+        ("isaac", "Isaac Sim", "Isaac Sim python.bat (python.bat);;모든 파일 (*)", "isaac_python"),
+        ("blender", "Blender 4.5", "blender.exe (blender.exe);;모든 파일 (*)", "blender"),
+        ("smpl", "SMPL-X 모델 폴더", None, "smpl_model_dir"),
+        ("robot_usd", "로봇 USD (선택)", "USD (*.usd *.usda *.usdc *.usdz);;모든 파일 (*)", "robot_usd"),
+        ("video", "동영상 저장 폴더", None, "video_dir"),
+    ]
+    TIPS = {"isaac": "물리 모드와 동영상 저장에 씁니다. 설치 폴더(python.bat이 있는 곳)나 python.bat을 고르세요.",
+            "robot_usd": "Isaac이 시뮬레이션·녹화에 쓰는 로봇 USD입니다. 비우면 NVIDIA 에셋 서버의 Unitree G1을 받아 씁니다"
+                         "(인터넷 필요). 오프라인이면 로컬에 둔 G1 USD(참조 파일 포함)나 사내 Nucleus 주소를 지정하세요. "
+                         "바꾸면 물리 결과를 따로 계산합니다.",
+            "blender": "FBX 파일을 읽을 때 씁니다. blender.exe를 고르세요.",
+            "smpl": "AMASS SMPL-X 파일을 열 때 씁니다. smplx\\SMPLX_NEUTRAL.npz가 들어 있는 폴더를 고르세요.",
+            "video": "'동영상 저장'이 MP4를 쓰는 폴더입니다."}
+
+    def __init__(self, win: "EditorWindow"):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle(f"{APP_NAME} 환경 설정")
+        self.resize(900, 640)
+        s = settings.load(reload=True)
+        lay = QVBoxLayout(self)
+        intro = QLabel("비워 두면 자동으로 찾습니다(환경변수, 기본 설치 위치). 찾지 못한 항목은 그 기능만 쓸 수 없고, "
+                       "나머지는 그대로 동작합니다.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        box = QGroupBox("외부 프로그램과 폴더")
+        grid = QGridLayout(box)
+        grid.setColumnStretch(1, 1)
+        self.edits: dict[str, QLineEdit] = {}
+        self.status: dict[str, QLabel] = {}
+        for r, (key, label, filt, field_name) in enumerate(self.ROWS):
+            name = QLabel(f"<b>{label}</b>")
+            name.setToolTip(self.TIPS[key])
+            edit = QLineEdit(getattr(s, field_name))
+            edit.setClearButtonEnabled(True)
+            edit.setToolTip(self.TIPS[key])
+            edit.textChanged.connect(lambda _=None: self._schedule())
+            browse = QPushButton("찾아보기...")
+            browse.clicked.connect(lambda _=False, k=key, f=filt: self._browse(k, f))
+            grid.addWidget(name, 2 * r, 0)
+            grid.addWidget(edit, 2 * r, 1)
+            grid.addWidget(browse, 2 * r, 2)
+            url = settings.URLS.get(key)
+            if url:
+                get = QPushButton("받는 곳")
+                get.setToolTip(url)
+                get.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
+                grid.addWidget(get, 2 * r, 3)
+            st = QLabel()
+            st.setWordWrap(True)
+            st.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(st, 2 * r + 1, 1, 1, 3)
+            self.edits[key], self.status[key] = edit, st
+        lay.addWidget(box)
+
+        libbox = QGroupBox("모션 폴더 (프로젝트 패널에 나오는 폴더)")
+        lv = QHBoxLayout(libbox)
+        self.libs = QListWidget()
+        self.libs.setToolTip("회색은 기본 폴더(항상 나옴), 흰색은 추가한 폴더")
+        lv.addWidget(self.libs, 1)
+        col = QVBoxLayout()
+        for text, fn in (("추가...", self._add_lib), ("제거", self._remove_lib)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            col.addWidget(b)
+        col.addStretch(1)
+        lv.addLayout(col)
+        self.lib_status = QLabel()
+        self._extra_libs = list(s.library_dirs)
+        lay.addWidget(libbox, 1)
+        lay.addWidget(self.lib_status)
+
+        ai = QGroupBox("AI 연동")
+        ag = QGridLayout(ai)
+        ag.setColumnStretch(2, 1)
+        self.api_on = QCheckBox("AI용 로컬 API 켜기")
+        self.api_on.setChecked(s.api_enabled)
+        self.api_on.setToolTip("Claude 같은 AI나 스크립트가 이 창을 조작합니다(모션 열기, 재생, 겹쳐 비교, 물리, 지표, 스크린샷). "
+                               "127.0.0.1에서만, 실행할 때마다 바뀌는 토큰이 있어야 받습니다")
+        ag.addWidget(self.api_on, 0, 0)
+        ag.addWidget(QLabel("포트"), 0, 1, Qt.AlignRight)
+        self.api_port = QSpinBox()
+        self.api_port.setRange(1024, 65535)
+        self.api_port.setValue(int(s.api_port))
+        self.api_port.setToolTip("쓰고 있으면 빈 포트를 고릅니다. 실제 주소와 토큰은 api.json에 있습니다")
+        ag.addWidget(self.api_port, 0, 2, Qt.AlignLeft)
+        api = getattr(win, "api", None)
+        from .api_server import discovery_path
+
+        info = QLabel(f"{'실행 중: ' + api.url if api else '꺼짐'} · 주소·토큰 파일: {escape(discovery_path())}<br>"
+                      "<span style='color:gray'>명령줄: retlens-cli (창 없이 리타게팅·QC·지표·비교·물리). "
+                      "AI 사용 안내는 스킬(SKILL.md)에 있습니다.</span>")
+        info.setWordWrap(True)
+        info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        ag.addWidget(info, 1, 0, 1, 3)
+        guide = QPushButton("AI 가이드 열기")
+        guide.clicked.connect(lambda: self.win.open_path(self.win.skill_path()))
+        skill = QPushButton("Claude Code에 스킬 설치")
+        skill.setToolTip("SKILL.md를 사용자 폴더의 .claude\\skills\\retlens에 복사합니다. 그러면 Claude Code가 RetLens를 다룰 때 이 안내를 씁니다")
+        skill.clicked.connect(self.win.install_skill)
+        ag.addWidget(guide, 0, 3)
+        ag.addWidget(skill, 1, 3)
+        lay.addWidget(ai)
+
+        prog = QGroupBox("프로그램")
+        pf = QGridLayout(prog)
+        pf.setColumnStretch(1, 1)
+        self.prog_status: dict[str, QLabel] = {}
+        for r, (key, label) in enumerate((("robot", "로봇 모델"), ("gmr", "리타게팅 (GMR)"))):
+            pf.addWidget(QLabel(f"<b>{label}</b>"), r, 0)
+            st = QLabel()
+            st.setWordWrap(True)
+            pf.addWidget(st, r, 1, 1, 2)
+            self.prog_status[key] = st
+        pf.addWidget(QLabel("<b>사용자 데이터</b>"), 2, 0)
+        data = QLabel(f"{escape(app_paths.user_dir())} <span style='color:gray'>(캐시·업로드·로그, 설정 파일)</span>")
+        data.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        pf.addWidget(data, 2, 1)
+        open_data = QPushButton("열기")
+        open_data.clicked.connect(lambda: self.win.open_path(app_paths.user_dir()))
+        pf.addWidget(open_data, 2, 2)
+        lay.addWidget(prog)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("저장")
+        buttons.button(QDialogButtonBox.Cancel).setText("취소")
+        again = buttons.addButton("다시 점검", QDialogButtonBox.ResetRole)
+        again.clicked.connect(self.refresh)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.refresh)
+        self.refresh()
+
+    def current(self) -> settings.Settings:
+        """The settings as filled in (not saved yet)."""
+        vals = {f: self.edits[k].text().strip().strip('"') for k, _, _, f in self.ROWS}
+        return settings.Settings(**vals, library_dirs=list(self._extra_libs), api_enabled=self.api_on.isChecked(),
+                                 api_port=int(self.api_port.value()))
+
+    def _schedule(self) -> None:
+        self._timer.start(250)  # check once typing pauses
+
+    def refresh(self) -> None:
+        s = self.current()
+        checks = {c.key: c for c in settings.check_all(s)}
+        auto = settings.Settings(library_dirs=s.library_dirs)  # what is found with the field left empty
+        found_auto = {"isaac": settings.find_isaac(auto).path, "blender": settings.find_blender(auto).path,
+                      "smpl": settings.find_smpl(auto).path, "video": settings.video_dir(auto)}
+        for key, _, _, _ in self.ROWS:
+            if key == "robot_usd":
+                self.edits[key].setPlaceholderText("비우면 NVIDIA 에셋 서버의 Unitree G1 (인터넷 필요)")
+            else:
+                self.edits[key].setPlaceholderText(f"자동: {found_auto[key]}" if found_auto[key] else "자동: 찾지 못함")
+            self.status[key].setText(check_html(checks[key]))
+        for key, st in self.prog_status.items():
+            st.setText(check_html(checks[key]))
+        self.libs.clear()
+        defaults = app_paths.library_roots()
+        for d in settings.library_dirs(s):
+            is_default = any(os.path.normcase(d) == os.path.normcase(os.path.abspath(x)) for x in defaults)
+            row = QListWidgetItem(d + ("  (기본)" if is_default else "") + ("" if os.path.isdir(d) else "  - 없음"))
+            row.setData(Qt.UserRole, d)
+            if is_default:
+                row.setForeground(QBrush(QColor(140, 140, 150)))
+                row.setFlags(row.flags() & ~Qt.ItemIsSelectable)
+            self.libs.addItem(row)
+        self.lib_status.setText(check_html(checks["library"]))
+
+    def _browse(self, key: str, filt: str | None) -> None:
+        hint = self.edits[key].placeholderText()
+        cur = self.edits[key].text().strip() or (hint[len("자동: "):] if hint.startswith("자동: ") else "")
+        start = cur if os.path.isdir(cur) else os.path.dirname(cur) if cur else app_paths.documents_dir()
+        if filt is None:
+            path = QFileDialog.getExistingDirectory(self, "폴더 고르기", start)
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, "파일 고르기", start, filt)
+        if path:
+            self.edits[key].setText(os.path.normpath(path))
+
+    def _add_lib(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "모션 폴더 추가", app_paths.documents_dir())
+        if path and os.path.normcase(os.path.normpath(path)) not in {os.path.normcase(d) for d in self._extra_libs}:
+            self._extra_libs.append(os.path.normpath(path))
+            self.refresh()
+
+    def _remove_lib(self) -> None:
+        for row in self.libs.selectedItems():
+            d = row.data(Qt.UserRole)
+            self._extra_libs = [x for x in self._extra_libs if os.path.normcase(x) != os.path.normcase(d)]
+        self.refresh()
+
+    def accept(self) -> None:
+        settings.save(self.current())
+        self.win.apply_settings()
+        super().accept()
+
+
 # ------------------------------------------------------------------------------ main window
 class EditorWindow(QMainWindow):
     def __init__(self, scene: MotionScene, url: str, library=None, accept_eula: bool = False):
@@ -1073,6 +1574,7 @@ class EditorWindow(QMainWindow):
         self.timeline = TimelinePanel(self)
         self.project = ProjectPanel(self, library)
         self.analysis = AnalysisPanel(self)
+        self.compare_panel = ComparePanel(self)
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(5000)
@@ -1089,6 +1591,9 @@ class EditorWindow(QMainWindow):
             self.resize(1600, 960)
         if state is not None:
             self.restoreState(state)
+            if not self.settings.value("layout/has_compare", False, type=bool):  # layout saved before the 비교 tab
+                self.tabifyDockWidget(self.docks["analysis"], self.docks["compare"])
+        self.settings.setValue("layout/has_compare", True)
 
         # The scene is posed on its own thread at 30 Hz, so the window (and the embedded 3D view,
         # which Qt composites on this thread) never waits for it; the timer below only refreshes
@@ -1101,6 +1606,9 @@ class EditorWindow(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(33)
         self._refresh_all()
+        QTimer.singleShot(0, self._startup_check)  # once the window is up (환경 점검)
+        self._invoker = _GuiInvoker()  # API request threads -> this thread
+        self._start_api()
 
     def _tick_loop(self, hz: float = 30.0) -> None:
         last = time.perf_counter()
@@ -1133,10 +1641,12 @@ class EditorWindow(QMainWindow):
         tl = self._dock("timeline", "타임라인", self.timeline, B)
         proj = self._dock("project", "프로젝트", self.project, B)
         ana = self._dock("analysis", "분석", self.analysis, B)
+        cmp = self._dock("compare", "비교", self.compare_panel, B)
         con = self._dock("console", "콘솔", self.console, B)
         self.splitDockWidget(tl, proj, Qt.Vertical)
         self.tabifyDockWidget(proj, ana)
-        self.tabifyDockWidget(ana, con)
+        self.tabifyDockWidget(ana, cmp)
+        self.tabifyDockWidget(cmp, con)
         proj.raise_()
         self.resizeDocks([hier, insp], [220, 520], Qt.Vertical)
         self.resizeDocks([hier], [420], Qt.Horizontal)
@@ -1176,16 +1686,24 @@ class EditorWindow(QMainWindow):
                                  "백그라운드에서 계산, 짧은 클립 약 1분)")
         self.a_cancel = act("Isaac 작업 취소", sc.cancel_jobs, icon=QStyle.SP_BrowserStop,
                             tip="대기 중이거나 돌고 있는 물리 계산과 동영상 녹화를 멈춥니다")
+        self.a_compare = act("겹쳐 비교", lambda on: self.start_compare(on=on), "O", QStyle.SP_FileDialogContentsView,
+                             checkable=True, tip="대상(B)을 기준(A)의 골반 위치에 겹쳐 그리고, A에서 벗어난 B의 부위만 색칠합니다 "
+                                                 "(A·B는 '비교' 탭이나 계층 패널 우클릭에서 고름)")
         self.a_fit = act("카메라 맞추기", sc.fit_camera, "F", QStyle.SP_DesktopIcon)
         self.a_reset = act("레이아웃 초기화", self.reset_layout)
         self.a_browser = act("브라우저에서 씬 열기", lambda: QDesktopServices.openUrl(QUrl(self.url)))
-        self.a_readme = act("README 열기", lambda: self.open_path(os.path.join(ROOT, "README.md")))
-        self.a_labels = act("CMU 동작 라벨 목록", lambda: self.open_path(os.path.join(ROOT, "docs", "cmu_motion_labels.md")))
+        self.a_readme = act("사용 안내", lambda: self.open_path(app_paths.doc("docs", "retlens.md")))
+        self.a_labels = act("CMU 동작 라벨 목록", lambda: self.open_path(app_paths.doc("docs", "cmu_motion_labels.md")))
+        self.a_folders = act("데이터 폴더 열기", lambda: self.open_path(app_paths.user_dir()),
+                             tip="캐시·업로드·로그가 있는 폴더 (설치판: %LOCALAPPDATA%\\RetLens)")
+        self.a_settings = act("환경 설정...", lambda: self.open_settings(), "Ctrl+,", QStyle.SP_FileDialogDetailedView,
+                              tip="Isaac Sim·Blender·SMPL-X 모델·모션 폴더·동영상 폴더 위치와 점검")
         self.a_about = act("정보", self._about)
 
         mb = self.menuBar()
         m = mb.addMenu("파일(&F)")
-        for a in (self.a_open, None, self.a_video, self.a_video_dir, None, self.a_quit):
+        for a in (self.a_open, None, self.a_video, self.a_video_dir, self.a_folders, None, self.a_settings, None,
+                  self.a_quit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("편집(&E)")
         m.addAction(self.a_remove)
@@ -1194,7 +1712,7 @@ class EditorWindow(QMainWindow):
         for d in self.docks.values():
             m.addAction(d.toggleViewAction())
         m.addSeparator()
-        for a in (self.a_fit, self.a_reset, self.a_browser):
+        for a in (self.a_compare, self.a_fit, self.a_reset, self.a_browser):
             m.addAction(a)
         m = mb.addMenu("재생(&P)")
         for a in (self.a_play, self.a_home, self.a_prev, self.a_next):
@@ -1221,18 +1739,150 @@ class EditorWindow(QMainWindow):
         tb.setMovable(True)
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         for a in (self.a_open, None, self.a_home, self.a_prev, self.a_play, self.a_next, None, self.a_physics,
-                  self.a_cancel, None, self.a_fit, self.a_video):
+                  self.a_cancel, None, self.a_compare, self.a_fit, self.a_video):
             tb.addSeparator() if a is None else tb.addAction(a)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
     def _build_status(self) -> None:
         sb = self.statusBar()
+        self.st_env = QToolButton()  # 환경 점검 at a glance; opens 환경 설정
+        self.st_env.setAutoRaise(True)
+        self.st_env.clicked.connect(lambda: self.open_settings())
+        sb.addPermanentWidget(self.st_env)
+        self.st_api = QLabel("API")  # the AI API's port (khumanoid/app/api_server.py)
+        self.st_api.setContentsMargins(8, 0, 8, 0)
+        sb.addPermanentWidget(self.st_api)
         self.st_physics = QLabel()
         self.st_jobs = QLabel()
         self.st_time = QLabel()
         for w in (self.st_jobs, self.st_physics, self.st_time):
             w.setContentsMargins(8, 0, 8, 0)
             sb.addPermanentWidget(w)
+
+    # ---------------------------------------------------------------- 환경 설정
+    auto_setup = True  # open 환경 설정 on the first start when something is missing (off for smoke tests)
+
+    def _refresh_env(self, checks: list | None = None) -> list:
+        checks = checks if checks is not None else settings.check_all()
+        missing = [c for c in checks if not c.ok]
+        if not missing:
+            self.st_env.setText("환경 ✓")
+            self.st_env.setToolTip("모든 기능을 쓸 수 있습니다 (눌러서 환경 설정)")
+        else:
+            self.st_env.setText(f"환경 ⚠ {len(missing)}")
+            self.st_env.setToolTip("쓸 수 없는 기능이 있습니다 (눌러서 환경 설정):\n" + "\n".join(
+                f"- {c.name}: {c.needed_for}" for c in missing))
+        return checks
+
+    def _startup_check(self) -> None:
+        checks = self._refresh_env()
+        for c in checks:
+            if not c.ok:
+                self.scene.log(f"환경 점검: {c.name} 없음 - {c.detail} ({c.needed_for} 사용 불가)")
+        first = not self.settings.value("setup/checked", False, type=bool)
+        self.settings.setValue("setup/checked", True)
+        if first and self.auto_setup and any(not c.ok for c in checks):
+            self.open_settings()
+
+    def open_settings(self) -> None:
+        SettingsDialog(self).exec()
+
+    def apply_settings(self) -> None:
+        """Saved 환경 설정 take effect now (scene folders, project panel, the status bar)."""
+        s = settings.load()
+        self.scene.apply_settings(s)
+        self.project.reload()
+        self._refresh_env()
+        if bool(self.api) != s.api_enabled or (self.api is not None and self.api.port != s.api_port
+                                               and self._api_port_asked != s.api_port):
+            self._stop_api()
+            self._start_api()
+        self.status("환경 설정을 저장했습니다", 4000)
+
+    # ---------------------------------------------------------------- AI API
+    api = None
+    _api_port_asked = None
+
+    def _start_api(self) -> None:
+        """The local HTTP API for AI agents (khumanoid/app/api_server.py), when 환경 설정 has it on."""
+        from .api_server import ApiBackend, ApiServer, discovery_path
+
+        s = settings.load()
+        self._api_port_asked = s.api_port
+        if not s.api_enabled:
+            self._refresh_api_status()
+            return
+        try:
+            self.api = ApiServer(ApiBackend(self.scene, self, on_gui=self._gui_call), s.api_port).start()
+            self.scene.log(f"AI용 로컬 API: {self.api.url} (토큰: {discovery_path()})")
+        except Exception as e:
+            self.api = None
+            self.scene.log(f"AI용 로컬 API를 열지 못함: {type(e).__name__}: {e}")
+        self._refresh_api_status()
+
+    def _stop_api(self) -> None:
+        if self.api is not None:
+            self.api.stop()
+            self.api = None
+
+    def _refresh_api_status(self) -> None:
+        if self.api is not None:
+            self.st_api.setText(f"API :{self.api.port}")
+            self.st_api.setToolTip(f"AI용 로컬 API가 {self.api.url}에서 동작 중입니다 (토큰 필요, 환경 설정에서 끔)")
+        else:
+            self.st_api.setText("API 꺼짐")
+            self.st_api.setToolTip("AI용 로컬 API가 꺼져 있습니다 (환경 설정 > AI 연동)")
+
+    def _gui_call(self, fn):
+        """Run fn on the GUI thread and return its result (from the API's request threads)."""
+        if QThread.currentThread() is self.thread():
+            return fn()
+        box = {"fn": fn}
+        self._invoker.call.emit(box)  # blocking queued: returns once the GUI thread ran it
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    @staticmethod
+    def skill_path() -> str:
+        """The AI guide: the installed program's ai\\retlens\\SKILL.md, or the repository's
+        .claude\\skills\\retlens\\SKILL.md ("" when neither is there)."""
+        for p in (app_paths.resource("ai", "retlens", "SKILL.md"),
+                  os.path.join(app_paths.REPO_ROOT, ".claude", "skills", "retlens", "SKILL.md")):
+            if os.path.isfile(p):
+                return p
+        return ""
+
+    def install_skill(self) -> None:
+        """Copy SKILL.md into the user's Claude Code skills folder (~/.claude/skills/retlens)."""
+        import shutil
+
+        src = self.skill_path()
+        if not src:
+            QMessageBox.warning(self, "AI 가이드", "SKILL.md를 찾지 못했습니다.")
+            return
+        dst = os.path.join(os.path.expanduser("~"), ".claude", "skills", "retlens", "SKILL.md")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        QMessageBox.information(self, "AI 가이드", f"스킬을 설치했습니다:\n{dst}\n\nClaude Code에서 RetLens 작업을 하면 이 안내를 씁니다.")
+
+    def need(self, key: str, what: str) -> bool:
+        """True when what `key` stands for is there; otherwise say what is missing and offer 환경 설정."""
+        c = next((c for c in settings.check_all() if c.key == key), None)
+        if c is None or c.ok:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(f"{c.name} 필요")
+        box.setTextFormat(Qt.RichText)
+        box.setText(f"{escape(what)}에는 <b>{escape(c.name)}</b>이(가) 필요합니다.<br><br>{escape(c.detail)}<br>"
+                    f"{escape(c.hint)}")
+        go = box.addButton("환경 설정 열기", QMessageBox.AcceptRole)
+        box.addButton("닫기", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is go:
+            self.open_settings()
+        return False
 
     def reset_layout(self) -> None:
         self.restoreState(self._default_state)
@@ -1256,6 +1906,25 @@ class EditorWindow(QMainWindow):
         if item is not None:
             self.scene.remove(item)
 
+    def start_compare(self, on: bool = True, ref: Item | None = None, item: Item | None = None) -> None:
+        """Turn the overlay comparison on (A and B from the 비교 tab unless given; B defaults to
+        the selected motion) or off."""
+        sc = self.scene
+        if on:
+            items = sc.items
+            p = self.compare_panel
+            a = ref or (sc.compare.ref if sc.compare.ref in items else p._combo_item(p.ref))
+            b = item or (self.selected if self.selected in items and self.selected is not a and ref is None
+                         else sc.compare.item if sc.compare.item in items else p._combo_item(p.item))
+            if a is None or a is b:
+                a = next((it for it in items if it is not b), None)
+            if b is None or b is a:
+                b = next((it for it in items if it is not a), None)
+            sc.set_compare(on=True, ref=a, item=b)
+            self.docks["compare"].raise_()
+        else:
+            sc.set_compare(on=False)
+
     def remove_all(self) -> None:
         for it in list(self.scene.items):
             self.scene.remove(it)
@@ -1273,6 +1942,9 @@ class EditorWindow(QMainWindow):
                 try:
                     self.bridge.added.emit(self.scene.add(p))
                 except Exception as e:
+                    import traceback
+
+                    traceback.print_exc()  # the whole story goes to the console / log file
                     self.bridge.added.emit(f"{os.path.basename(p)}: {type(e).__name__}: {e}")
 
         threading.Thread(target=work, daemon=True, name="add-motion").start()
@@ -1286,11 +1958,25 @@ class EditorWindow(QMainWindow):
                 self.scene.fit_camera()
         else:
             self.status(f"열지 못함: {result}", 10000)
-            QMessageBox.warning(self, "모션을 열지 못했습니다", str(result))
+            self.scene.log(f"failed to open: {result}")  # into the console panel and the log file
+            text = str(result)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("모션을 열지 못했습니다")
+            box.setText(text)
+            go = None
+            if any(k in text for k in ("Blender", "SMPL", "smplx", "GMR", "general_motion_retargeting", "환경 설정")):
+                go = box.addButton("환경 설정 열기", QMessageBox.AcceptRole)  # a missing tool / model: say where to set it
+            box.addButton("닫기", QMessageBox.RejectRole)
+            box.exec()
+            if go is not None and box.clickedButton() is go:
+                self.open_settings()
 
     def open_dialog(self) -> None:
         pats = " ".join(f"*{e}" for e in MOTION_EXT)
-        paths, _ = QFileDialog.getOpenFileNames(self, "모션 파일 열기", self.settings.value("dialog/dir", ROOT),
+        start = self.settings.value("dialog/dir", "") or next(
+            (d for d in app_paths.library_roots() if os.path.isdir(d)), app_paths.documents_dir())
+        paths, _ = QFileDialog.getOpenFileNames(self, "모션 파일 열기", start,
                                                 f"모션 파일 ({pats});;모든 파일 (*)")
         if paths:
             self.settings.setValue("dialog/dir", os.path.dirname(paths[0]))
@@ -1331,7 +2017,7 @@ class EditorWindow(QMainWindow):
         return True
 
     def set_physics(self, on: bool) -> None:
-        if on and not self._ensure_eula():
+        if on and not (self.need("isaac", "물리 모드") and self._ensure_eula()):
             self.a_physics.blockSignals(True)
             self.a_physics.setChecked(False)
             self.a_physics.blockSignals(False)
@@ -1339,7 +2025,7 @@ class EditorWindow(QMainWindow):
         self.scene.set_physics(on, "editor")
 
     def save_video(self, item: Item | None) -> None:
-        if item is None or not self._ensure_eula():
+        if item is None or not self.need("isaac", "동영상 저장") or not self._ensure_eula():
             return
         try:
             job = self.scene.save_video(item)
@@ -1375,6 +2061,13 @@ class EditorWindow(QMainWindow):
             self._refresh_status()
         elif event == "log":
             self._append_log(str(payload))
+        if event in ("items", "item", "status", "compare"):
+            self.compare_panel.refresh()
+            on = self.scene.compare_pair() is not None
+            if self.a_compare.isChecked() != on:
+                self.a_compare.blockSignals(True)
+                self.a_compare.setChecked(on)
+                self.a_compare.blockSignals(False)
         self.timeline.refresh()
 
     def refresh_analysis(self) -> None:
@@ -1399,6 +2092,7 @@ class EditorWindow(QMainWindow):
         self.analysis.refresh_lists()
         self.refresh_analysis()
         self._refresh_status()
+        self.compare_panel.refresh()
         self.timeline.refresh()
 
     def _tick(self) -> None:
@@ -1412,6 +2106,7 @@ class EditorWindow(QMainWindow):
             self._play_icon = sc.playing
             self.a_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if sc.playing else QStyle.SP_MediaPlay))
         self.analysis.update_view()  # follows the playhead; skipped when the 분석 tab is not on screen
+        self.compare_panel.update_live()
         if sc.runner.busy() and int(now * 2) != int(prev * 2):  # job progress, twice a second
             self.hierarchy.refresh()
             self.inspector.refresh(metrics=False)
@@ -1420,13 +2115,22 @@ class EditorWindow(QMainWindow):
     _play_icon = None
 
     def _about(self) -> None:
-        QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME}</b><br>{APP_TAGLINE}<br>K-Humanoid 프로젝트<br><br>"
-                                          f"씬: viser ({self.url})<br>물리·녹화: NVIDIA Isaac Sim (PhysX)")
+        from . import runtime
+
+        rows = [*app_paths.describe(), ("로그 파일", runtime.log_path() or "콘솔 (저장소에서 실행)")]
+        where = "".join(f"<tr><td style='padding-right:10px'>{escape(k)}</td><td>{escape(v)}</td></tr>"
+                        for k, v in rows)
+        from .. import __version__
+
+        QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME} {__version__}</b><br>{APP_TAGLINE}<br>K-Humanoid 프로젝트<br><br>"
+                                          f"씬: viser ({self.url})<br>물리·녹화: NVIDIA Isaac Sim (PhysX)<br><br>"
+                                          f"<b>파일 위치</b><table>{where}</table>")
 
     def closeEvent(self, e):
         self.settings.setValue("window/geometry", self.saveGeometry())
         self.settings.setValue("window/state", self.saveState())
         self.timer.stop()
+        self._stop_api()
         self._ticking = False
         self._ticker.join(timeout=1.0)
         self.scene.runner.shutdown()
@@ -1449,21 +2153,45 @@ def run(argv=None) -> int:
     ap.add_argument("--quit-after", type=float, default=0.0, help="close after N seconds (smoke tests)")
     args = ap.parse_args(argv)
 
+    from . import runtime
+
     no_sandbox = webengine_sandbox_workaround()  # before QApplication / the first web view
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
-    app = QApplication(sys.argv[:1])
+    if os.name == "nt":  # its own taskbar entry and icon (not python.exe's) when run from the repository
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("KHumanoid.RetLens")
+        except Exception:
+            pass
+    app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
+    from .. import __version__
+
+    app.setApplicationVersion(__version__)
+    icon =os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")  # tools/make_icon.py
+    if os.path.isfile(icon):
+        app.setWindowIcon(QIcon(icon))
     app.setStyle("Fusion")
     if not args.light:
         app.setPalette(dark_palette())
+    runtime.install_error_hooks()  # uncaught errors: log + dialog
 
     def log(msg: str) -> None:
         print(f"[editor] {msg}", flush=True)
 
+    if runtime.log_path():
+        log(f"log file: {runtime.log_path()}")
     if no_sandbox:
         log("scene view: Chromium sandbox off (conda Qt layout); it only shows the local scene server")
     port = args.port or free_port()
-    urdf = load_robot_urdf(args.urdf, args.mesh_cell, log=log)
+    try:
+        urdf = load_robot_urdf(args.urdf, args.mesh_cell, log=log)
+    except Exception as e:  # without the robot model nothing can be shown: say why instead of vanishing
+        robot = next(c for c in settings.check_all() if c.key == "robot")
+        QMessageBox.critical(None, APP_NAME, f"로봇 모델을 불러오지 못해 시작할 수 없습니다.\n\n{args.urdf}\n"
+                                             f"{type(e).__name__}: {e}\n\n{robot.hint}")
+        return 1
     server = viser.ViserServer(host="127.0.0.1", port=port, label=APP_NAME, verbose=False)
     scene = MotionScene(server, urdf, scene_options(args), log=log)
     if args.body_mesh:
@@ -1472,6 +2200,7 @@ def run(argv=None) -> int:
     server.initial_camera.look_at = (0.0, 0.0, 0.75)
     url = f"http://127.0.0.1:{port}/?hideViserLogo"
     win = EditorWindow(scene, url, args.library, accept_eula=args.isaac_accept_eula)
+    win.auto_setup = args.quit_after <= 0  # smoke tests must not stop at the first-start 환경 설정
     win.show()
     if args.physics:
         win.a_physics.setChecked(True)

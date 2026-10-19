@@ -7,7 +7,7 @@ for %%C in (conda.exe) do set "CONDA_EXE_PATH=%%~$PATH:C"
 if not defined CONDA_EXE_PATH if exist "%LOCALAPPDATA%\miniconda3\Scripts\conda.exe" set "CONDA_EXE_PATH=%LOCALAPPDATA%\miniconda3\Scripts\conda.exe"
 if not defined CONDA_EXE_PATH if exist "%USERPROFILE%\miniconda3\Scripts\conda.exe" set "CONDA_EXE_PATH=%USERPROFILE%\miniconda3\Scripts\conda.exe"
 if not defined CONDA_EXE_PATH (
-  echo conda was not found. Create the k-humanoid environment as described in README.md, then run this again.
+  echo conda was not found. Create the k-humanoid environment as described in docs\setup.md, then run this again.
   pause
   exit /b 1
 )

@@ -1,12 +1,14 @@
 """Human mocap -> humanoid robot retargeting with GMR (General Motion Retargeting).
 
 GMR (MIT, github.com/YanjieZe/GMR) solves per-frame differential IK with mink
-on a MuJoCo robot model. Install it with ``scripts/install_gmr.ps1``. GMR,
-mujoco and scipy are imported inside functions, so ``khumanoid`` itself still
-imports without them (e.g. from Isaac Sim's Python).
+on a MuJoCo robot model. Its solver and G1 configs are vendored in khumanoid/gmr
+(without GMR's torch-importing package); the robot meshes come from
+khumanoid.paths.robot_assets_dir() (``scripts/install_gmr.ps1`` puts them next to
+the repository). mink, mujoco and scipy are imported inside functions, so
+``khumanoid`` itself still imports without them (e.g. from Isaac Sim's Python).
 
 Source formats:
-  ``lafan1`` / ``nokov``  GMR's own BVH loaders and IK configs, unchanged.
+  ``lafan1`` / ``nokov``  GMR's BVH frame convention (read with khumanoid.io.bvh) and IK configs.
   ``tpose``   Any BVH whose reference pose is a T-pose: CMU (cgspeed conversion,
               frame 0) and the usual Vicon / OptiTrack / Xsens / Rokoko exports
               (rest pose). GMR ships no config for these skeletons, so one is
@@ -142,25 +144,33 @@ def _quiet():
 
 
 def _gmr():
+    """GMR's IK solver and config tables, vendored in khumanoid.gmr (no torch); needs mink and mujoco."""
     try:
         with _quiet():
-            import general_motion_retargeting as gmr
+            from . import gmr
     except ImportError as e:
-        raise ImportError("GMR is not installed. Run: powershell -File scripts\\install_gmr.ps1") from e
+        raise ImportError(f"retargeting needs mink and mujoco ({e})") from e
     return gmr
 
 
+def unavailable(robot: str = "unitree_g1") -> str | None:
+    """Why retargeting cannot run here (mink / mujoco missing, no robot model), or None."""
+    import importlib.util
+
+    missing = [m for m in ("mink", "mujoco", "scipy") if importlib.util.find_spec(m) is None]
+    if missing:
+        return f"retargeting needs {', '.join(missing)}"
+    xml = _gmr().ROBOT_XML_DICT.get(robot)
+    if xml is None or not os.path.isfile(xml):
+        return f"no robot model for {robot} ({xml}; scripts\\install_gmr.ps1 puts it next to the repository)"
+    return None
+
+
 def gmr_version() -> str:
-    """'gmr@<commit>' from the GMR_COMMIT.txt that install_gmr.ps1 writes."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(_gmr().__file__)))
-    try:
-        with open(os.path.join(root, "GMR_COMMIT.txt"), encoding="ascii") as f:
-            for line in f:
-                if line.startswith("commit:"):
-                    return "gmr@" + line.split(":", 1)[1].strip()[:12]
-    except OSError:
-        pass
-    return "gmr@unknown"
+    """'gmr@<commit>' of the vendored GMR code (khumanoid/gmr)."""
+    from .gmr import GMR_COMMIT
+
+    return "gmr@" + GMR_COMMIT[:12]
 
 
 def robot_model(robot: str):
@@ -409,18 +419,32 @@ def load_smplx_tpose(path: str, model_dir: str | None, fps: float | None = 30.0)
     return _tpose_clip(m.joint_names, idx, m.positions, m.rotations, m.fps, fps, ref_P, ref_R, "smplx", None, info)
 
 
+def gmr_bvh_frames(path: str, fmt: str) -> tuple[list[dict], float, float]:
+    """LAFAN1 / Nokov BVH as GMR's own loader returns it (utils/lafan1.load_bvh_file):
+    {joint: [position (m, Z-up), world orientation wxyz]} per frame with the joint's axes as in
+    the file, plus <Side>FootMod (the foot's position with the toe's orientation), the fixed
+    human height 1.75 m and the file's frame rate. Read with khumanoid.io.bvh, which uses the
+    same frame convention, instead of the LAFAN1 reader GMR bundles."""
+    from .io.bvh import load_bvh
+
+    toe = {"lafan1": "Toe", "nokov": "ToeBase"}.get(fmt)
+    if toe is None:
+        raise ValueError(f"Invalid format: {fmt}")
+    m = load_bvh(path, scale=0.01, include_end_sites=False, with_rotations=True, drop_tpose=False)  # cm -> m like GMR
+    q = matrix_to_quat(m.rotations)  # (T, J, 4) wxyz
+    names = m.joint_names
+    frames = []
+    for f in range(m.num_frames):
+        result = {n: [m.positions[f, j], q[f, j]] for j, n in enumerate(names)}
+        for s in ("Left", "Right"):
+            result[f"{s}FootMod"] = [result[f"{s}Foot"][0], result[f"{s}{toe}"][1]]
+        frames.append(result)
+    return frames, 1.75, float(m.meta["file_fps"])
+
+
 def load_bvh_gmr(path: str, fmt: str, fps: float | None = 30.0) -> HumanClip:
-    """LAFAN1 / Nokov BVH through GMR's own loader (nearest-frame resampling)."""
-    _gmr()
-    from general_motion_retargeting.utils.lafan1 import load_bvh_file
-
-    from .io.bvh import _parse
-
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        _, frame_time, _ = _parse(f.read())
-    src_fps = 1.0 / frame_time
-    with _quiet():
-        frames, height = load_bvh_file(path, format=fmt)
+    """LAFAN1 / Nokov BVH in GMR's convention (gmr_bvh_frames), nearest-frame resampling."""
+    frames, height, src_fps = gmr_bvh_frames(path, fmt)
     if fps and abs(fps - src_fps) > 1e-3 * src_fps:
         n = int(len(frames) / src_fps * fps)
         frames = [frames[min(int(round(k * src_fps / fps)), len(frames) - 1)] for k in range(n)]
@@ -430,16 +454,24 @@ def load_bvh_gmr(path: str, fmt: str, fps: float | None = 30.0) -> HumanClip:
 
 
 def load_smplx_gmr(path: str, model_dir: str | None, fps: float | None = 30.0) -> HumanClip:
-    """AMASS SMPL-X npz through GMR (body model: <model_dir>/smplx/SMPLX_<GENDER>.npz)."""
+    """AMASS SMPL-X npz through GMR's own loader (body model: <model_dir>/smplx/SMPLX_<GENDER>.npz).
+
+    Development comparison only (``--format smplx-gmr``): it needs the GMR checkout's
+    utils/smpl.py, the ``smplx`` package (MPI non-commercial licence) and torch, none of which
+    the packaged program ships. The default SMPL-X path (``smplx``) uses khumanoid.io.smpl."""
     model_dir = model_dir or os.environ.get("SMPL_MODEL_DIR")
     if not model_dir or not os.path.isdir(os.path.join(model_dir, "smplx")):
         raise FileNotFoundError(
             "SMPL-X retargeting needs the SMPL-X body model (licence-gated, https://smpl-x.is.tue.mpg.de): "
             "pass --smpl-model-dir or set SMPL_MODEL_DIR to the folder holding smplx/SMPLX_NEUTRAL.npz")
-    _gmr()
-    import smplx
-    import torch
-    from general_motion_retargeting.utils.smpl import get_smplx_data_offline_fast
+    try:
+        with _quiet():
+            import smplx
+            import torch
+            from general_motion_retargeting.utils.smpl import get_smplx_data_offline_fast
+    except ImportError as e:
+        raise ImportError("--format smplx-gmr is a development path: it needs the GMR checkout "
+                          "(scripts\\install_gmr.ps1), smplx and torch; use the default smplx format") from e
 
     data = dict(np.load(path, allow_pickle=True))
     gender = data.get("gender", "neutral")
@@ -782,7 +814,7 @@ def smooth_motion(m: RobotMotion, cutoff_hz: float, order: int = 4, limits=None)
     GMR solves every frame on its own, so its output carries frame-to-frame jitter
     that a low-pass removes without lag. Quaternions are made sign-continuous,
     filtered per component and renormalised (fine for the small per-frame steps
-    of mocap). See README "리타게팅" for how 6 Hz was chosen.
+    of mocap). See docs/results.md "평활화 설정 비교" for how 6 Hz was chosen.
     """
     from scipy.signal import butter, filtfilt
 

@@ -685,7 +685,8 @@ def encode_video(frame_dir: str, n: int, fps: float, path: str) -> str | None:
             r = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-framerate", f"{fps:g}",
                                 "-i", os.path.join(frame_dir, "f%05d.png"),
                                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", path],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console from a windowless run
             if r.returncode == 0:
                 log(f"wrote {path} ({n} frames @ {fps:g} fps)")
                 return path
@@ -1345,5 +1346,6 @@ if __name__ == "__main__":
             app_utils.stop()
         except Exception:
             pass
-        simulation_app.close()
+        # fast shutdown ends the process inside close(): hand it the status, or a failed run exits 0
+        simulation_app.close(exit_code=code)
     sys.exit(code)

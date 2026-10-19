@@ -1,4 +1,4 @@
-# motion data and generated outputs stay out of git
+# motion data and generated outputs stay out of git (docs/data.md)
 data/
 reports/
 *.usd
@@ -9,16 +9,21 @@ reports/
 # body-model files are licence-gated (SMPL / SMPL-X / MANO)
 models/
 
-# project documents kept next to the code (internal; the kick-off deck is also
-# over GitHub's 100 MB file limit)
+# packaging output (scripts\build_retlens.ps1, scripts\package_release.ps1)
+/build/
+/dist/
+
+# internal project documents (kick-off deck, plan): not for the repository, and the deck
+# is over GitHub's 100 MB file limit
+/docs/internal/
 /*.pptx
 /*.pdf
 
-# machine-specific Claude Code settings (launch.json has local paths)
-.claude/
+# machine-specific Claude Code settings (launch.json has local paths); the project's skills are shared
+.claude/*
+!.claude/skills/
 
 __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
-_isaac_sim

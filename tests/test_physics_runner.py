@@ -159,6 +159,7 @@ def test_cancel_stops_the_process(tmp_path, fake, monkeypatch):
 
 
 def test_isaac_command_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("KHUMANOID_USER_DIR", str(tmp_path / "user"))  # no saved 환경 설정 in the way
     monkeypatch.setenv(physics_runner.ISAAC_ENV, str(tmp_path / "missing.bat"))
     with pytest.raises(FileNotFoundError):
         isaac_command()

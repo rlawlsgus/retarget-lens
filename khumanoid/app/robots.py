@@ -42,6 +42,47 @@ def _quiet_remove(handle) -> None:
         handle.remove()
 
 
+REGIONS = ("몸통·머리", "왼팔", "오른팔", "왼다리", "오른다리")
+
+
+def body_region(link: str) -> str:
+    """Body region of a robot link from its name (G1: left_knee_link, right_wrist_yaw_link, ...)."""
+    n = link.lower()
+    side = "왼" if n.startswith("left") or "_left" in n else "오른" if n.startswith("right") or "_right" in n else ""
+    if side and any(k in n for k in ("hip", "knee", "ankle", "foot", "toe", "leg", "thigh", "shin")):
+        return side + "다리"
+    if side and any(k in n for k in ("shoulder", "elbow", "wrist", "hand", "arm", "finger", "thumb", "palm")):
+        return side + "팔"
+    return REGIONS[0]
+
+
+def farthest_points(v: np.ndarray, k: int) -> np.ndarray:
+    """k well-spread vertices (farthest-point sampling from the centroid): a part's extremities."""
+    if len(v) <= k:
+        return v.copy()
+    c = v.mean(0)
+    idx = [int(np.argmax(np.linalg.norm(v - c, axis=1)))]
+    d = np.linalg.norm(v - v[idx[0]], axis=1)
+    for _ in range(k - 1):
+        idx.append(int(np.argmax(d)))
+        d = np.minimum(d, np.linalg.norm(v - v[idx[-1]], axis=1))
+    return v[idx]
+
+
+def align_on_pelvis(TA: np.ndarray, TB: np.ndarray, heading: bool = True) -> np.ndarray:
+    """B's base transforms (..., 4, 4) moved onto A's pelvis, and turned about the vertical to
+    A's pelvis heading when `heading`: what is left is the difference in posture."""
+    out = np.array(TB, dtype=np.float64, copy=True)
+    if heading:
+        d = np.arctan2(TA[..., 1, 0], TA[..., 0, 0]) - np.arctan2(TB[..., 1, 0], TB[..., 0, 0])
+        c, s = np.cos(d), np.sin(d)
+        Rz = np.zeros(d.shape + (3, 3))
+        Rz[..., 0, 0], Rz[..., 0, 1], Rz[..., 1, 0], Rz[..., 1, 1], Rz[..., 2, 2] = c, -s, s, c, 1.0
+        out[..., :3, :3] = Rz @ out[..., :3, :3]
+    out[..., :3, 3] = TA[..., :3, 3]
+    return out
+
+
 class RobotBatch:
     def __init__(self, server, urdf, root: str = "/robots"):
         """urdf: a yourdfpy URDF with its visual scene graph (meshes loaded)."""
@@ -52,7 +93,9 @@ class RobotBatch:
         self.handles: list = []
         self.colors: list[tuple] = []
         self.opacity = 1.0
-        self._scales = None
+        self._opac = None  # per-instance opacities in use (tuple) or None
+        self._scales = None  # (parts, N) last sent
+        self._sent_colors = None  # (parts, N, 3) last sent when parts were coloured
 
     # ---------------------------------------------------------------- model
     def _build_kinematics(self) -> None:
@@ -116,26 +159,36 @@ class RobotBatch:
                 f.append(np.asarray(m.faces, np.int64) + n)
                 n += len(m.vertices)
             self.meshes.append((root, np.concatenate(v), np.concatenate(f).astype(np.uint32)))
+        self.mesh_links = np.array([li for li, _, _ in self.meshes], dtype=int)
+        self.part_names = [self.links[li] for li in self.mesh_links]
+        self.part_regions = [body_region(n) for n in self.part_names]
+        # points that stand for each part when two poses are compared (centroid + extremities)
+        self.samples = np.stack([np.vstack([v.mean(0, keepdims=True), farthest_points(v.astype(np.float64), 12)])
+                                 if len(v) >= 12 else np.resize(v.astype(np.float64), (13, 3))
+                                 for _, v, _ in self.meshes])
 
     # ---------------------------------------------------------------- instances
-    def set_instances(self, colors: list[tuple], opacity: float = 1.0) -> None:
-        """One instance per robot, in this order. Instances start hidden (scale 0) until the
-        next update() poses them.
+    def set_instances(self, colors: list[tuple], opacity: float = 1.0, opacities=None) -> None:
+        """One instance per robot, in this order, with `opacity` (or per-instance `opacities`).
+        Instances start hidden (scale 0) until the next update() poses them.
 
         Existing nodes are resized in place: re-creating them would send every mesh to the
         browser again, and a batched mesh being re-created can be drawn once before its
         instances exist (Chromium then logs 'glDrawElementsInstanced: Vertex shader input
         type does not match ...')."""
         colors = [tuple(int(c) for c in rgb) for rgb in colors]
-        opacity = float(opacity)
-        if colors == self.colors and opacity == self.opacity and (self.handles or not colors):
-            return
         n = len(colors)
+        if opacities is not None and len(opacities) == n and min(opacities, default=1.0) < 1.0:
+            opac_key = tuple(round(float(o), 4) for o in opacities)
+        else:
+            opac_key = tuple([round(float(opacity), 4)] * n) if float(opacity) < 1.0 else None
+        if colors == self.colors and opac_key == self._opac and (self.handles or not colors):
+            return
         props = dict(batched_wxyzs=np.tile([1.0, 0.0, 0.0, 0.0], (n, 1)).astype(np.float32),
                      batched_positions=np.zeros((n, 3), np.float32), batched_scales=np.zeros(n, np.float32),
                      batched_colors=np.array(colors, dtype=np.uint8).reshape(n, 3))
-        opac = np.full(n, opacity, np.float32) if opacity < 1.0 else None
-        if n and self.handles and (opac is None) == (self.opacity >= 1.0):
+        opac = None if opac_key is None else np.array(opac_key, np.float32)
+        if n and self.handles and (opac is None) == (self._opac is None):
             if opac is not None:
                 props["batched_opacities"] = opac
             for h in self.handles:
@@ -147,8 +200,8 @@ class RobotBatch:
                     self.server.scene.add_batched_meshes_simple(
                         f"{self.root}/mesh{i}", v, f, batched_opacities=opac, lod="off", **props)
                     for i, (_, v, f) in enumerate(self.meshes)]
-        self.colors, self.opacity = colors, opacity
-        self._scales = None
+        self.colors, self.opacity, self._opac = colors, float(opacity), opac_key
+        self._scales = self._sent_colors = None
 
     def remove(self) -> None:
         for h in self.handles:
@@ -184,18 +237,49 @@ class RobotBatch:
         if not self.handles or len(T_base) != len(self.colors):
             return np.empty((len(self.links), 0, 4, 4))
         T = self.forward(T_base, cfg)
-        scales = np.where(visible, 1.0, 0.0).astype(np.float32)
-        set_scales = self._scales is None or not np.array_equal(scales, self._scales)
-        self._scales = scales
-        M = T[[li for li, _, _ in self.meshes]]  # (meshes, N, 4, 4)
-        quats = matrix_to_quat(M[..., :3, :3].reshape(-1, 3, 3)).reshape(len(self.meshes), -1, 4).astype(np.float32)
+        self.send(T, visible)
+        return T
+
+    def send(self, T: np.ndarray, visible: np.ndarray, part_visible: np.ndarray | None = None,
+             part_colors: np.ndarray | None = None) -> None:
+        """Send link transforms T (links, N, 4, 4) from forward(). part_visible (parts, N) hides
+        single parts; part_colors (parts, N, 3) paints parts (None: each robot's own colour).
+        Scales and colours go out only when they change."""
+        if not self.handles or T.shape[1] != len(self.colors):
+            return
+        K, n = len(self.meshes), T.shape[1]
+        vis = np.broadcast_to(np.asarray(visible, bool)[None, :], (K, n))
+        if part_visible is not None:
+            vis = vis & np.asarray(part_visible, bool)
+        scales = vis.astype(np.float32)
+        M = T[self.mesh_links]  # (parts, N, 4, 4)
+        quats = matrix_to_quat(M[..., :3, :3].reshape(-1, 3, 3)).reshape(K, n, 4).astype(np.float32)
         positions = M[..., :3, 3].astype(np.float32)
+        if part_colors is None and self._sent_colors is not None:  # back to each robot's own colour
+            part_colors = np.broadcast_to(np.array(self.colors, np.uint8)[None], (K, n, 3))
+            restore = True
+        else:
+            restore = False
         for k, h in enumerate(self.handles):
             props = dict(batched_wxyzs=quats[k], batched_positions=positions[k])
-            if set_scales:
-                props["batched_scales"] = scales
+            if self._scales is None or not np.array_equal(scales[k], self._scales[k]):
+                props["batched_scales"] = scales[k]
+            if part_colors is not None:
+                c = np.ascontiguousarray(part_colors[k], dtype=np.uint8)
+                if self._sent_colors is None or not np.array_equal(c, self._sent_colors[k]):
+                    props["batched_colors"] = c
             set_props(h, **props)
-        return T
+        self._scales = scales
+        self._sent_colors = None if restore or part_colors is None else np.array(part_colors, np.uint8)
+
+    def part_deviation(self, Ma: np.ndarray, Mb: np.ndarray) -> np.ndarray:
+        """Mean distance (m) between the sample points of every part in two poses.
+        Ma, Mb: (links, F, 4, 4) link transforms (forward() output, F poses each); returns (F, parts)."""
+        A, B = Ma[self.mesh_links], Mb[self.mesh_links]  # (parts, F, 4, 4)
+        S = self.samples  # (parts, m, 3)
+        pa = np.einsum("kfij,kmj->kfmi", A[..., :3, :3], S) + A[..., None, :3, 3]
+        pb = np.einsum("kfij,kmj->kfmi", B[..., :3, :3], S) + B[..., None, :3, 3]
+        return np.linalg.norm(pa - pb, axis=-1).mean(-1).T
 
 
 class OverlayBatch:

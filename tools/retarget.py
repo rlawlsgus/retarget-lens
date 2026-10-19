@@ -3,10 +3,10 @@
     python tools/retarget.py data/raw/cmu_bvh/02_01.bvh            # -> data/retargeted/02_01_g1.npz
     python tools/retarget.py data/raw/cmu_bvh                       # every .bvh / .npz in the folder
     python tools/retarget.py data/raw/cmu_bvh --smooth 6            # + 6 Hz zero-phase low-pass (recommended)
-    python tools/retarget.py data/raw/cmu_bvh --smooth 6 --swing-clearance 2.5   # + swing feet >= 2.5 cm off the floor
-    python tools/retarget.py data/raw/lafan1_bvh --out-dir data/retargeted/lafan1
+    python tools/retarget.py data/raw/cmu_bvh --smooth 6 --swing-clearance 2     # + swing feet >= 2 cm off the floor
+    python tools/retarget.py data/raw/lafan1_bvh --out-dir data/retargeted/lafan1_bvh
     python tools/retarget.py clip_stageii.npz --smpl-model-dir models   # AMASS SMPL-X
-    python tools/retarget.py data/raw/cmu_fbx --smooth 6           # FBX (needs Blender, see requirements.md)
+    python tools/retarget.py data/raw/cmu_fbx --smooth 6           # FBX (needs Blender, see docs/setup.md)
 
 Input formats (--format auto picks one):
   tpose    BVH with a T-pose reference: CMU cgspeed files (their inserted frame-0
@@ -83,7 +83,7 @@ def main() -> int:
     ap.add_argument("--smooth", type=float, default=0.0, metavar="HZ",
                     help="zero-phase low-pass of the result at HZ (recommended 6; default off)")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
-                    help="lift swing feet to at least CM above the floor, after smoothing (recommended 2.5; default off)")
+                    help="lift swing feet to at least CM above the floor, after smoothing (recommended 2; default off)")
     ap.add_argument("--velocity-limit", action="store_true",
                     help="GMR's IK velocity limit (caps each IK iteration; no effect on LAFAN1 tests)")
     ap.add_argument("--pkl", action="store_true", help="also write GMR's pkl (root_rot xyzw)")

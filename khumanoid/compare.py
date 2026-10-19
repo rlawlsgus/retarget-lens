@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import analysis
+from . import analysis, paths
 from .io import load_motion
 from .io.bvh import load_bvh
 from .io.fbx import load_fbx
@@ -23,40 +23,42 @@ from .io.smpl import load_amass_npz
 from .motion import RobotMotion, SkeletonMotion
 from .qc import QCConfig, add_balance_flags, check_robot
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-CACHE = os.path.join(ROOT, "data", "cache", "retarget")  # not under data/retargeted: QC reports scan that
+ROOT = paths.REPO_ROOT
+CACHE = paths.cache_dir("retarget")  # dev: data/cache/retarget (not data/retargeted: QC reports scan that)
 HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
+MARKER_EXT = (".c3d",)  # raw optical markers: shown on the same take's retargeted robot
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
 PIPELINE_VERSION = 3  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config
-MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",)
-# folders the viewer lists motions from (relative to ROOT); uploads land in data/uploads
-LIBRARY_ROOTS = ("data/raw", "data/samples", "data/retargeted", "data/uploads", "reports")
-UPLOADS = os.path.join(ROOT, "data", "uploads")
+MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",) + MARKER_EXT
+# folders the viewer lists motions from (dev: data/raw, data/samples, data/retargeted,
+# data/uploads, reports; installed: see khumanoid.paths); uploads land in UPLOADS
+LIBRARY_ROOTS = tuple(paths.library_roots())
+UPLOADS = paths.uploads_dir()
 
 
 def is_motion_file(path: str) -> bool:
     """A file the viewer can open: motion extensions, minus AMASS body-shape files
     (*_stagei.npz), anything under a cache folder, and report tables (only the
-    physics results *_sim.npz count under reports/)."""
-    rel = os.path.relpath(os.path.abspath(path), ROOT).replace(os.sep, "/").lower()
+    physics results *_sim.npz count under the repository's reports/)."""
+    rel = paths.rel(path, ROOT).replace(os.sep, "/").lower()
     name = os.path.basename(rel)
     if not name.endswith(MOTION_EXT) or name.endswith("_stagei.npz") or "/cache/" in f"/{rel}":
         return False
     return not rel.startswith("reports/") or name.endswith("_sim.npz")
 
 
-def library_files(roots=LIBRARY_ROOTS) -> dict[str, list[str]]:
-    """{folder (relative to ROOT, '/'-separated): sorted motion file paths} for the viewer's picker."""
+def library_files(roots=None) -> dict[str, list[str]]:
+    """{folder ('/'-separated, relative to the repository in the dev layout): sorted motion file
+    paths} for the viewer's picker. roots: absolute, or relative to the repository."""
     out: dict[str, list[str]] = {}
-    for root in roots:
+    for root in LIBRARY_ROOTS if roots is None else roots:
         top = os.path.normpath(root if os.path.isabs(root) else os.path.join(ROOT, root))
         for d, dirs, files in os.walk(top):
             dirs[:] = sorted(x for x in dirs if x.lower() != "cache")
-            paths = [os.path.join(d, f) for f in sorted(files) if is_motion_file(os.path.join(d, f))]
-            if paths:
-                rel = os.path.relpath(d, ROOT).replace(os.sep, "/")
-                out[rel if not rel.startswith("..") else d] = paths
+            found = [os.path.join(d, f) for f in sorted(files) if is_motion_file(os.path.join(d, f))]
+            if found:
+                out[paths.rel(d, ROOT).replace(os.sep, "/")] = found
     return out
 
 
@@ -137,6 +139,9 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
     path = os.path.abspath(path)
     name = os.path.splitext(os.path.basename(path))[0]
     folder = os.path.basename(os.path.dirname(path))
+    if path.lower().endswith(MARKER_EXT):
+        return _load_marker_item(path, log=log, robot=robot, smooth=smooth, fps=fps, csv_fps=csv_fps,
+                                 smpl_model_dir=smpl_model_dir, swing_clearance=swing_clearance)
     fmt = human_format(path)
     if fmt is None:
         m = load_motion(path, fps=csv_fps)
@@ -158,7 +163,7 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
         m = load_motion(cached)
         with open(cached[:-4] + ".json", encoding="utf-8") as f:
             info = json.load(f)
-        log(f"{name}: retarget from cache {os.path.relpath(cached, ROOT)}")
+        log(f"{name}: retarget from cache {paths.rel(cached)}")
     else:
         log(f"{name}: retargeting ({fmt}) ...")
         m, info = retarget_file(path, robot=robot, fmt=fmt, fps=fps, smooth_hz=smooth,
@@ -180,6 +185,49 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
         smooth_txt += f", swing >= {100 * swing_clearance:g} cm"
     return Item(label=f"{folder}/{name}", source=path, kind=f"{label_fmt} -> GMR{smooth_txt}", robot=m,
                 human=human, info=info)
+
+
+def find_take(path: str, files: list[str] | None = None) -> str | None:
+    """The same take's solved motion for a marker file: same name as BVH (first), FBX, or AMASS
+    SMPL-X (<name>_stageii.npz / _poses.npz), from the library folders and the file's own folder.
+    FBX converted from BVH (cmu_fbx_from_bvh) comes last."""
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    if files is None:
+        files = [f for fs in library_files().values() for f in fs]
+        here = os.path.dirname(os.path.abspath(path))
+        files += [os.path.join(here, f) for f in os.listdir(here)]
+    best = None
+    for f in files:
+        s, ext = os.path.splitext(os.path.basename(f).lower())
+        rank = ({".bvh": 0, ".fbx": 1}.get(ext) if s == stem else
+                2 if ext == ".npz" and s in (f"{stem}_stageii", f"{stem}_poses") else None)
+        if rank is None:
+            continue
+        rank += 3 * ("from_bvh" in f.replace(os.sep, "/").lower())
+        if best is None or rank < best[0]:
+            best = (rank, os.path.abspath(f))
+    return best[1] if best else None
+
+
+def _load_marker_item(path: str, log, **opts) -> Item:
+    """A C3D take: the robot from the same take's solved skeleton (retargeted, cached), the
+    markers as its human part, turned into that skeleton's frame; marker QC in info['c3d']."""
+    from .io.c3d import load_c3d
+    from .markers import align_to_skeleton, marker_qc, marker_skeleton
+
+    name = os.path.splitext(os.path.basename(path))[0]
+    raw = load_c3d(path)
+    match = find_take(path)
+    if match is None:
+        raise ValueError(f"{os.path.basename(path)}: C3D에는 마커만 있어 그대로는 로봇에 옮길 수 없습니다. 같은 촬영의 "
+                         f"솔버 결과({name}.bvh / {name}.fbx / {name}_stageii.npz)를 data/raw 아래나 같은 폴더에 두면, "
+                         f"그것을 리타게팅한 로봇 옆에 마커를 그립니다.")
+    log(f"{name}: markers on the robot retargeted from {paths.rel(match)}")
+    base = load_item(match, log=log, **opts)
+    markers, fit = align_to_skeleton(marker_skeleton(raw), base.human)
+    info = {**base.info, "c3d": {**marker_qc(raw), **fit}, "solved_motion": match}  # absolute path
+    return Item(label=f"{os.path.basename(os.path.dirname(path))}/{name}", source=path,
+                kind=f"C3D 마커 + {base.kind}", robot=base.robot, human=markers, info=info)
 
 
 def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> None:

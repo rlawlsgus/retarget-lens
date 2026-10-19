@@ -15,6 +15,15 @@ from khumanoid.qc import QCResult, add_balance_flags  # noqa: E402
 from khumanoid.synthetic import g1_motion  # noqa: E402
 
 
+def _need_retargeting():
+    """Skip without mink / mujoco / the G1 model (GMR's solver itself is vendored in khumanoid/gmr)."""
+    from khumanoid.retarget import unavailable
+
+    why = unavailable()
+    if why:
+        pytest.skip(why)
+
+
 def test_hull_and_signed_margin():
     square = stability.convex_hull([[0, 0], [1, 0], [1, 1], [0, 1], [0.5, 0.5], [0.2, 0.7]])
     assert len(square) == 4
@@ -130,7 +139,7 @@ def test_fall_diagnosis_picks_the_first_new_cause():
 
 
 def test_g1_standing_flat_vs_on_the_heels():
-    pytest.importorskip("general_motion_retargeting")
+    _need_retargeting()
     from khumanoid import analysis
 
     fk = analysis.FootKinematics("unitree_g1")

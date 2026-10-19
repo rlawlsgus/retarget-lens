@@ -12,8 +12,9 @@ import functools
 import os
 import re
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-METADATA = os.path.join(ROOT, "data", "raw", "cmu_fbx", "metadata.csv")
+from . import paths
+
+METADATA = paths.cmu_metadata()  # dev: data/raw/cmu_fbx/metadata.csv
 TRIAL_RE = re.compile(r"^(\d{1,3}_\d{1,3})(?:_|\.|$)")
 
 

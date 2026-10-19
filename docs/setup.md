@@ -1,6 +1,7 @@
-# 환경 재현 요구사항
+# 개발 환경 설치
 
-이 프로젝트를 다른 PC에서 그대로 돌리기 위해 필요한 것을 모았습니다. 버전은 2026-10-15에 개발 PC에서 직접 확인한 값입니다. 설치 명령과 사용법은 [README](README.md)에 있습니다.
+저장소에서 RetLens와 명령줄 도구를 돌리기 위한 환경입니다. 설치판(`RetLens.exe`)만 쓰는 사람은 이 문서가 필요 없고, [RetLens 사용 안내](retlens.md)의 "환경 설정"만 보면 됩니다.
+버전은 개발 PC에서 직접 확인한 값입니다(2026-10-15 설치, 2026-10-19 갱신).
 
 ## 1. 한눈에 보기
 
@@ -53,17 +54,69 @@ python tools\fetch_samples.py
 Expand-Archive blender-4.5.14-windows-x64.zip -DestinationPath C:\blender
 ```
 
-- Blender는 FBX를 읽을 때만 씁니다(`khumanoid/io/fbx.py`가 헤드리스로 실행). 다른 위치에 풀었으면 `BLENDER=<blender.exe>`를 설정합니다. 4.5 LTS 밖의 버전은 확인하지 않았습니다.
-- PyPI `ufbx` 0.0.5는 시험 후 쓰지 않기로 했습니다(메타데이터가 비어 있고, 노드 접근에서 접근 위반·잘못된 부모 값). env에서 제거했습니다.
+- Isaac Sim zip은 `https://downloads.isaacsim.nvidia.com/isaac-sim-standalone-6.1.0-windows-x86_64.zip`이고 MD5는 `a07968e980072c9ca27b2166443e2d89`입니다.
 
-- Isaac Sim zip은 `https://downloads.isaacsim.nvidia.com/isaac-sim-standalone-6.1.0-windows-x86_64.zip`이고 MD5는 `a07968e980072c9ca27b2166443e2d89`입니다. 스크립트가 받기·확인·압축 해제·`post_install.bat`을 처리합니다.
-- `post_install.bat`은 GUI 예제 링크만 만듭니다. 관리자 권한이 없어 실패해도 시뮬레이터는 정상입니다.
-- 처음 실행할 때 NVIDIA 라이선스(EULA) 동의가 필요합니다. 무인 실행에서는 `OMNI_KIT_ACCEPT_EULA=YES`로 동의합니다.
-- 첫 실행은 셰이더 컴파일 때문에 약 2분, 이후에는 약 20초 걸립니다.
+### Isaac Sim 6.1.0: 전역 설치 (`C:\isaacsim`)
 
+프로젝트 폴더가 아닌 `C:\isaacsim`에 설치해 다른 프로젝트와 공유합니다. 이 PC에는 이미 설치되어 있습니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_isaacsim.ps1
+```
+
+- 스크립트가 하는 일: NVIDIA 공식 zip(10.4 GB)을 받아 MD5를 확인하고, `C:\isaacsim`에 압축을 풀고, `post_install.bat`을 실행합니다.
+- `post_install.bat`은 GUI 예제 링크만 만듭니다. 관리자 권한이 없으면 실패하지만 무시해도 됩니다.
+- **NVIDIA 드라이버 595.97 이상**이 필요합니다(6.x 테스트 드라이버). 이 PC는 617.42입니다.
+- 공식 최소 사양은 RTX 4080 / 16 GB입니다. 이 PC의 RTX 3070 8 GB는 미달이지만, 로봇 1대와 스틱 피겨를 재생하는 데는 문제없었습니다.
+- 첫 실행은 셰이더 컴파일 때문에 약 2분 걸리고, 이후에는 약 20초 걸립니다.
+- 처음 실행할 때 NVIDIA 라이선스(EULA) 동의를 묻습니다. 무인 실행에서는 `OMNI_KIT_ACCEPT_EULA=YES`로 동의합니다.
+
+### conda 환경 `k-humanoid`
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
+conda activate k-humanoid
+```
+
+- [environment.yml](../environment.yml)로 환경을 만듭니다. Python 3.12, numpy 2.3, scipy 1.17로 Isaac Sim 6.1 내장 버전과 맞춰 고정되어 있습니다.
+- activate 훅이 `C:\isaacsim`을 연결합니다. 그래서 env 안의 `python`에서 바로 `from isaacsim import SimulationApp`이 됩니다. Isaac Sim 파일은 env에 복사되지 않습니다.
+- 이 네트워크는 Anaconda `defaults` 채널이 막혀 있어(HTTP 429, 클라이언트 등록 필요) conda-forge만 씁니다.
+- 마지막에 아래 GMR 설치까지 실행합니다(`-SkipGmr`로 생략).
+- 모션 편집기용 PySide6와 qt6-webengine(약 180 MB, 둘 다 Qt 6.11)도 들어 있습니다. 기존 환경에 더할 때는 `conda install --override-channels -c conda-forge qt6-webengine=6.11.2`입니다.
+
+### GMR 리타게터 (`..\GMR`, 프로젝트 폴더 밖)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_gmr.ps1
+```
+
+- [GMR](https://github.com/YanjieZe/GMR)(MIT)은 패키지 인덱스에 없어서, 고정 커밋(`bb1bbe4`)에서 코드와 `assets/unitree_g1`만 받습니다(약 53 MB, 전체 트리는 1.2 GB). 파일마다 git blob SHA-1을 확인합니다.
+- 받은 폴더(`C:\Users\<user>\Documents\Github\GMR`)를 env의 `gmr_k_humanoid.pth`로 연결합니다(`pip install -e`와 같은 효과, git·빌드 도구 불필요).
+- GMR 의존성은 environment.yml에 있습니다. conda-forge: mujoco-python 3.11.0(Isaac Sim 내장 버전과 동일), qpsolvers+daqp 등. PyPI: mink 1.3.0(conda-forge에 없음). pytorch CPU와 smplx 0.1.28(PyPI)은 개발용 비교에만 씁니다(아래).
+- **리타게팅이 쓰는 GMR 코드는 저장소에 들어 있습니다**(`khumanoid/gmr/`, 2026-10-19).
+  - GMR 패키지는 import할 때 torch(자기 운동학 모델), MuJoCo 뷰어, imageio까지 불러오지만, 리타게팅에는 필요 없습니다.
+  - 그래서 IK 풀이(`motion_retarget.py`)와 G1 IK 설정 JSON은 그대로 가져오고, 설정 표(`params.py`)는 G1만 남겨 가져왔습니다(MIT, LICENSE 동봉). 필요한 것은 mink·MuJoCo·scipy·rich뿐입니다.
+  - LAFAN1/Nokov BVH는 GMR에 딸린 LAFAN1 리더(Ubisoft 저장소 코드) 대신 `khumanoid.io.bvh`로 같은 좌표 규약에 맞춰 읽습니다(`gmr_bvh_frames`).
+  - 결과는 이전과 같습니다. T-pose BVH·FBX·SMPL-X·`smplx-gmr`는 비트 단위로 같고, LAFAN1은 관절각 차이가 2.8×10⁻¹² rad 이하입니다(`tests/test_retarget.py`가 GMR 원래 리더와 비교).
+  - `..\GMR` 체크아웃은 이제 G1 메시(`assets/`)와 개발용 비교에만 씁니다.
+- torch와 `smplx`는 개발용 `--format smplx-gmr` 비교 경로에만 씁니다. 기본 SMPL-X 경로는 자체 numpy FK(`khumanoid/io/smpl.py`)입니다. `smplx` 코드는 MPI 비상업 연구 라이선스라 배포판에 넣지 않습니다.
+- env에 torch가 생기면 `from isaacsim import SimulationApp`이 Kit 시작 전에 env의 torch와 numpy를 불러와 Isaac 확장이 깨집니다(numpy.fft DLL 오류). `tools/isaac_replay.py`는 그 import 동안만 torch를 숨겨 해결했습니다. 다른 Isaac 스크립트를 이 env에서 돌릴 때도 같은 처리가 필요합니다.
+
+### Blender 4.5 LTS: FBX 읽기용 (`C:\blender`, 프로젝트 폴더 밖)
+
+FBX는 Autodesk 비공개 포맷이라 Blender의 FBX 임포터로 읽습니다. 설치 프로그램 없이 공식 zip을 풀기만 합니다.
+
+```powershell
+# download.blender.org/release/Blender4.5/blender-4.5.14-windows-x64.zip (380 MB, sha256 b9533d23…c8b9)
+Expand-Archive blender-4.5.14-windows-x64.zip -DestinationPath C:\blender
+```
+
+- RetLens "환경 설정" → `$BLENDER` → `C:\blender\*\blender.exe` → PATH 순서로 찾습니다(`khumanoid/settings.py`). 다른 곳에 풀었으면 환경 설정에서 blender.exe를 고르거나 `BLENDER=<blender.exe 경로>`를 설정하세요.
+- 클립마다 Blender를 헤드리스로 띄워(약 2초) 관절 궤적을 뽑고 `data/cache/fbx/`에 캐시합니다. BVH·SMPL-X만 쓰면 Blender는 필요 없습니다.
+- 처음에는 PyPI `ufbx` 0.0.5(파이썬 바인딩)를 시험했지만, 노드 부모를 읽을 때 접근 위반으로 죽거나 틀린 값을 돌려줘 쓰지 않습니다(바인딩 이슈 #12와 같은 증상).
 ## 3. Python 환경 `k-humanoid`
 
-정의는 [environment.yml](environment.yml)이고, 개발 PC에 실제로 설치된 버전은 아래와 같습니다. 같은 패키지 빌드까지 맞추려면 4절의 잠금 파일을 쓰세요.
+정의는 [environment.yml](../environment.yml)이고, 개발 PC에 실제로 설치된 버전은 아래와 같습니다. 같은 패키지 빌드까지 맞추려면 4절의 잠금 파일을 쓰세요.
 
 | 패키지 | 버전 | 출처 | 용도 / 고정 이유 |
 |---|---|---|---|
@@ -82,9 +135,11 @@ Expand-Archive blender-4.5.14-windows-x64.zip -DestinationPath C:\blender
 | rich / natsort / imageio | 14.3.4 / 8.4.0 / 2.38.1 | conda-forge | GMR 의존성. rich는 viser 때문에 15 미만 |
 | viser | 1.1.1 | conda-forge | 비교 뷰어(`tools/compare_viewer.py`)의 브라우저 3D 화면과 GUI (MIT) |
 | yourdfpy / trimesh / plotly | 0.0.60 / 4.12.2 / 7.1.0 | conda-forge | 뷰어의 G1 URDF 로딩, 그래프 |
-| pytorch (CPU) | 2.10.0 (cpu_mkl) | conda-forge | GMR이 import할 때 요구. GPU 빌드는 필요 없음. 이 빌드 때문에 BLAS가 MKL(mkl 2026.1.0)로 바뀜 |
+| pytorch (CPU) | 2.10.0 (cpu_mkl) | conda-forge | 개발용만: `--format smplx-gmr` 비교, GMR 원본과의 동일성 테스트. 리타게팅과 설치판에는 필요 없음. 이 빌드 때문에 BLAS가 MKL(mkl 2026.1.0)로 바뀜 |
 | mink | 1.3.0 | PyPI | GMR의 differential IK (Apache-2.0). conda-forge에 없음 |
-| smplx | 0.1.28 | PyPI | AMASS SMPL-X 경로 전용. 코드가 MPI 비상업 연구 라이선스 |
+| smplx | 0.1.28 | PyPI | 개발용 `--format smplx-gmr` 비교 전용. 코드가 MPI 비상업 연구 라이선스라 설치판에 넣지 않음 |
+| pyside6 / qt6-webengine | 6.11.2 / 6.11.2 | conda-forge | RetLens 화면(Qt), 씬 뷰(내장 Chromium) |
+| pyinstaller | 6.22.3 | conda-forge | 실행파일 빌드(`scripts\build_retlens.ps1`) |
 
 환경에 들어가는 연결 설정:
 - **Isaac Sim 연결 훅** (`setup_env.ps1`이 `etc\conda\activate.d\isaacsim_link.{bat,ps1}`로 설치): `ISAACSIM_PATH`, `CARB_APP_PATH`, `ISAAC_PATH`, `EXP_PATH`를 설정하고 `PYTHONPATH`에 `C:\isaacsim\site`를 붙입니다. 그래서 env의 `python`에서 `from isaacsim import SimulationApp`이 됩니다.
@@ -98,7 +153,7 @@ Expand-Archive blender-4.5.14-windows-x64.zip -DestinationPath C:\blender
 
 ## 4. 정확한 재현용 잠금 파일
 
-[environment.lock.txt](environment.lock.txt)는 개발 PC의 conda 패키지 목록을 빌드와 다운로드 URL까지 그대로 담은 파일입니다(`conda list --explicit`, win-64 전용). 같은 빌드로 env를 만들려면 아래처럼 합니다.
+[environment.lock.txt](../environment.lock.txt)는 개발 PC의 conda 패키지 목록을 빌드와 다운로드 URL까지 그대로 담은 파일입니다(`conda list --explicit`, win-64 전용). 같은 빌드로 env를 만들려면 아래처럼 합니다.
 
 ```powershell
 $env:CONDA_CHANNELS = "conda-forge"
@@ -151,13 +206,13 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 
 ```powershell
 conda activate k-humanoid
-python -m pytest tests                     # 28 passed (GMR, AMASS·SMPL-X 파일, Blender·FBX 샘플, 리타겟 결과가 없으면 해당 테스트만 skip)
-python -c "import general_motion_retargeting, mujoco, torch; print(mujoco.__version__, torch.__version__)"   # 3.11.0 2.10.0
-python tools\retarget.py data\raw\cmu_bvh\02_01.bvh --smooth 6 --out-dir data\retargeted\check
+python -m pytest tests                     # 2026-10-19: 68 passed (G1 에셋, AMASS·SMPL-X 파일, Blender·FBX 샘플이 없으면 해당 테스트만 skip)
+python -c "import mink, mujoco; from khumanoid import gmr; print(mujoco.__version__, gmr.GMR_COMMIT[:7])"   # 3.11.0 bb1bbe4
+python tools\retarget.py data\raw\cmu_bvh\02_01.bvh --smooth 6 --out-dir $env:TEMP\khumanoid_check
 #   -> 86 frames @ 30 fps, residual feet 약 0.66 cm
 $env:OMNI_KIT_ACCEPT_EULA = "YES"
-python tools\isaac_replay.py --human data\raw\cmu_bvh\02_01.bvh --robot-motion data\retargeted\check\02_01_g1.npz --headless --check-out reports\check
-#   -> reports\check\02_01_sim_check.json: human_qc / robot_qc 모두 PASS
-python tools\isaac_replay.py --robot-motion data\retargeted\check\02_01_g1.npz --physics --check-out reports\check
-#   -> reports\check\02_01_g1_sim.json / _sim.npz: 넘어짐 0, 관절 추종 RMSE 중앙값 약 0.4°
+python tools\isaac_replay.py --human data\raw\cmu_bvh\02_01.bvh --robot-motion $env:TEMP\khumanoid_check\02_01_g1.npz --headless --check-out $env:TEMP\khumanoid_check
+#   -> $env:TEMP\khumanoid_check\02_01_sim_check.json: human_qc / robot_qc 모두 PASS
+python tools\isaac_replay.py --robot-motion $env:TEMP\khumanoid_check\02_01_g1.npz --physics --check-out $env:TEMP\khumanoid_check
+#   -> $env:TEMP\khumanoid_check\02_01_g1_sim.json / _sim.npz: 넘어짐 0, 관절 추종 RMSE 중앙값 약 0.4°
 ```

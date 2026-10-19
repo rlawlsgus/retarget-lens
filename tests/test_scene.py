@@ -57,7 +57,7 @@ def test_add_play_measure_remove(scene):
     assert list(scene.overlays.handles["com"].batched_scales) == [1.0, 1.0]  # both show their CoM
     scene.set_visible(a, False)
     scene.tick(0.0)
-    assert list(scene.robots._scales) == [0.0, 1.0]  # hidden robot scaled away
+    assert scene.robots._scales[:, 0].max() == 0.0 and scene.robots._scales[:, 1].min() == 1.0  # hidden robot scaled away
     scene.set_visible(a, True)
 
     keys = scene.graph_keys()
@@ -75,6 +75,48 @@ def test_add_play_measure_remove(scene):
     assert scene.items == [b] and b.handles["index"] == 0 and scene.robots.colors == [b.color]
     scene.remove(b)
     assert scene.items == [] and scene.robots.handles == []
+
+
+def test_overlay_comparison(scene):
+    """겹쳐 비교: B on A's pelvis, A a ghost, only B's parts beyond the tolerance drawn and coloured."""
+    from khumanoid.app.robots import REGIONS
+    from khumanoid.app.scene import GHOST_COLOR, diff_colors
+
+    assert set(scene.robots.part_regions) == set(REGIONS)  # every G1 part has a body region
+    assert diff_colors(np.array([3.0, 9.0, 30.0]), 3.0).tolist() == [[245, 205, 40], [220, 40, 35], [220, 40, 35]]
+    scene.view.robot_translucent = False
+    a = scene.add(SAMPLE)
+    b = scene.add(SAMPLE)
+    scene.set_compare(on=True, ref=a, item=b, tol_cm=3.0)
+    assert scene.compare_pair() == (0, 1) and scene.compare_role(b) == "B"
+    assert scene.robots.colors[0] == GHOST_COLOR and scene.robots._opac == (0.3, 1.0)
+    scene.seek(0.6)
+    scene.tick(0.0)
+    now = scene.compare_now
+    assert now["mean"] < 1e-6 and now["over"] == 0  # the same motion: nothing differs
+    assert scene.robots._scales[:, 1].max() == 0.0 and scene.robots._scales[:, 0].min() == 1.0  # B hidden, A ghost
+    assert "비교 기준" in a.handles["label_text"] and "비교 대상" in b.handles["label_text"]
+
+    scene.set_offset(b, 0.4)  # same motion 0.4 s later: limbs differ, the pelvis is put on A's
+    scene.tick(0.0)
+    now = scene.compare_now
+    assert now["over"] > 0 and now["worst"] in REGIONS
+    pelvis = scene.robots.part_names.index(scene.robots.links[0])
+    assert scene.robots._scales[pelvis, 1] == 0.0  # the pelvis itself lines up
+    shown = scene.robots._scales[:, 1] > 0
+    assert (scene.robots._sent_colors[shown, 1] != np.array(b.color, np.uint8)).any(axis=-1).all()  # painted
+    s = scene.compare_series()
+    assert len(s["t"]) and s["t"][0] == pytest.approx(0.4) and s["parts"].shape[1] == len(scene.robots.meshes)
+    assert s["mean"].max() > 0.5 and set(s["regions"]) == set(REGIONS)
+    rows = scene.compare_table()
+    assert rows[0][0].startswith("전체") and len(rows) == 1 + len(REGIONS)
+
+    scene.set_compare(on=False)
+    scene.tick(0.0)
+    assert scene.robots._opac is None and scene.robots._sent_colors is None and scene.compare_now is None
+    assert scene.robots.colors == [a.color, b.color]
+    scene.remove(a)
+    scene.remove(b)
 
 
 def test_batched_kinematics_match_the_urdf(scene):

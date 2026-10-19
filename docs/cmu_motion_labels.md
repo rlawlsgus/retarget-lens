@@ -1,11 +1,11 @@
 # CMU 모캡 동작 라벨
 
-`python tools/cmu_motion_index.py`로 만든 파일입니다(2026-10-16). 손으로 고치지 말고 스크립트를 다시 돌리세요.
+`python tools/cmu_motion_index.py`로 만든 파일입니다(2026-10-19). 손으로 고치지 말고 스크립트를 다시 돌리세요.
 
 - **라벨:** CMU Graphics Lab Motion Capture Database의 시도별 설명입니다. Hugging Face CMU FBX 세트의 `metadata.csv`(`data/raw/cmu_fbx/`)에서 가져왔습니다. 설명은 영어 원문 그대로입니다.
-- **이 PC에 있는 것:** CMU 2548개 시도 중 AMASS SMPL-X 1983개(`data/raw/amass_cmu_smplx/CMU`, AMASS 라이선스라 내부 검증 전용), BVH 6개, FBX 6개입니다.
+- **이 PC에 있는 것:** CMU 2548개 시도 중 AMASS SMPL-X 1983개(`data/raw/amass_cmu_smplx/CMU`, AMASS 라이선스라 내부 검증 전용), BVH 6개, FBX 6개, C3D 9개입니다.
 - **길이:** AMASS 파일의 실제 촬영 속도로 계산했습니다. AMASS에 없고 BVH만 있으면 BVH에서 계산했습니다.
-- **뷰어에서 열기:** `tools/compare_viewer.py`의 "모션" 탭 "이름 검색"에 번호(예: `143_11`)를 넣고 파일을 고릅니다. SMPL-X는 "사람 표시: 몸 메시"로 몸 표면까지 볼 수 있습니다. 처음 여는 사람 모션은 리타게팅에 수십 초가 걸립니다.
+- **열기:** RetLens 프로젝트 패널의 검색 칸(또는 `tools/compare_viewer.py`의 "모션" 탭 "이름 검색")에 번호(예: `143_11`)를 넣고 파일을 고릅니다. 비교 뷰어에서는 SMPL-X를 "사람 표시: 몸 메시"로 몸 표면까지 볼 수 있습니다. 처음 여는 사람 모션은 리타게팅에 수십 초가 걸립니다.
 
 ## 동작 종류별 대표 시도
 
@@ -15,7 +15,7 @@
 
 | 번호 | CMU 설명 | 메모 | 길이 (s) | 있는 형식 |
 |---|---|---|---|---|
-| `02_01` | walk | BVH·FBX·SMPL-X 모두 있음 | 2.9 | SMPL-X BVH FBX |
+| `02_01` | walk | BVH·FBX·SMPL-X 모두 있음 | 2.9 | SMPL-X BVH FBX C3D |
 | `91_57` | WalkForward |  | 9.8 | SMPL-X |
 | `132_46` | Walk Slow | 느리게 | 10.2 | SMPL-X |
 | `136_03` | Walk Backwards Bent Forward | 뒤로 걷기 | 10.0 | SMPL-X |
@@ -25,7 +25,7 @@
 
 | 번호 | CMU 설명 | 메모 | 길이 (s) | 있는 형식 |
 |---|---|---|---|---|
-| `02_03` | run/jog | BVH·FBX·SMPL-X 모두 있음 | 1.4 | SMPL-X BVH FBX |
+| `02_03` | run/jog | BVH·FBX·SMPL-X 모두 있음 | 1.4 | SMPL-X BVH FBX C3D |
 | `111_23` | Run |  | 9.4 | SMPL-X |
 | `77_10` | careful run | 조심스럽게 | 11.5 | SMPL-X |
 
@@ -42,7 +42,7 @@
 
 | 번호 | CMU 설명 | 메모 | 길이 (s) | 있는 형식 |
 |---|---|---|---|---|
-| `16_17` | walk, 90-degree left turn | BVH·FBX만 있음(AMASS에 없음) | 4.3 | BVH FBX |
+| `16_17` | walk, 90-degree left turn | BVH·FBX만 있음(AMASS에 없음) | 4.3 | BVH FBX C3D |
 | `83_36` | walk forward turn 90 degrees left walk forward | 걷다 왼쪽 90° | 8.8 | SMPL-X |
 | `47_01` | walk forward, turn around, walk back | 걷다 뒤돌아 돌아옴 | 11.0 | SMPL-X |
 
@@ -50,7 +50,7 @@
 
 | 번호 | CMU 설명 | 메모 | 길이 (s) | 있는 형식 |
 |---|---|---|---|---|
-| `05_02` | dance - expressive arms, pirouette | 발레 | 9.4 | SMPL-X |
+| `05_02` | dance - expressive arms, pirouette | 발레 | 9.4 | SMPL-X C3D |
 | `93_08` | xtra fancY charleston | 찰스턴 | 9.3 | SMPL-X |
 | `60_10` | salsa dance | 살사(2인 중 1명) | 19.9 | SMPL-X |
 | `141_12` | Dance, Twist | 트위스트 | 9.5 | SMPL-X |
@@ -78,9 +78,9 @@
 
 | 번호 | CMU 설명 | 메모 | 길이 (s) | 있는 형식 |
 |---|---|---|---|---|
-| `143_11` | Walk And Pick up Box | 상자 들기 (BVH·FBX·SMPL-X) | 10.9 | SMPL-X BVH FBX |
-| `143_13` | Walk and Pick up Laundry Basket | 빨래바구니 들기 (BVH·FBX·SMPL-X) | 9.7 | SMPL-X BVH FBX |
-| `143_28` | Sweeping, Push Broom | 빗자루질 (BVH·FBX·SMPL-X) | 10.7 | SMPL-X BVH FBX |
+| `143_11` | Walk And Pick up Box | 상자 들기 (BVH·FBX·SMPL-X) | 10.9 | SMPL-X BVH FBX C3D |
+| `143_13` | Walk and Pick up Laundry Basket | 빨래바구니 들기 (BVH·FBX·SMPL-X) | 9.7 | SMPL-X BVH FBX C3D |
+| `143_28` | Sweeping, Push Broom | 빗자루질 (BVH·FBX·SMPL-X) | 10.7 | SMPL-X BVH FBX C3D |
 | `143_26` | Washing Window | 창문 닦기 | 10.6 | SMPL-X |
 | `82_07` | Pushing on heavy object | 무거운 물체 밀기 | 10.0 | SMPL-X |
 | `70_05` | carry 19.5lb suitcase | 여행가방 들고 걷기 | 7.5 | SMPL-X |
@@ -125,7 +125,7 @@
 | 번호 | CMU 설명 | 메모 | 길이 (s) | 있는 형식 |
 |---|---|---|---|---|
 | `79_53` | dog | 개 흉내 | 12.4 | SMPL-X |
-| `143_34` | Chicken Dance | 치킨 댄스 | 13.1 | SMPL-X |
+| `143_34` | Chicken Dance | 치킨 댄스 | 13.1 | SMPL-X C3D |
 | `141_16` | Wave Hello | 손 흔들기 | 5.0 | SMPL-X |
 
 ### 바닥에서 일어나기
@@ -145,7 +145,7 @@
 |---|---|---|---|---|
 | `90_03` | cartwheel | 옆돌기 | 7.4 | SMPL-X |
 | `90_15` | front hand flip | 앞 손짚고 돌기 | 9.9 | SMPL-X |
-| `90_28` | breakdance | 브레이크댄스 | 6.4 | SMPL-X |
+| `90_28` | breakdance | 브레이크댄스 | 6.4 | SMPL-X C3D |
 
 ## 전체 목록 (피험자별)
 
@@ -172,9 +172,9 @@
 
 | 번호 | CMU 설명 | 길이 (s) | 있는 형식 |
 |---|---|---|---|
-| `02_01` | walk | 2.9 | SMPL-X BVH FBX |
+| `02_01` | walk | 2.9 | SMPL-X BVH FBX C3D |
 | `02_02` | walk | 2.5 | SMPL-X |
-| `02_03` | run/jog | 1.4 | SMPL-X BVH FBX |
+| `02_03` | run/jog | 1.4 | SMPL-X BVH FBX C3D |
 | `02_04` | jump, balance | 4.0 | SMPL-X |
 | `02_05` | punch/strike | 15.4 | SMPL-X |
 | `02_06` | bend over, scoop up, rise, lift arm | 18.6 | SMPL-X |
@@ -197,7 +197,7 @@
 | 번호 | CMU 설명 | 길이 (s) | 있는 형식 |
 |---|---|---|---|
 | `05_01` | walk | 5.0 | SMPL-X |
-| `05_02` | dance - expressive arms, pirouette | 9.4 | SMPL-X |
+| `05_02` | dance - expressive arms, pirouette | 9.4 | SMPL-X C3D |
 | `05_03` | dance - sideways arabesque, turn step, folding arms | 3.6 | SMPL-X |
 | `05_04` | dance - sideways arabesque, folding arms, bending back | 10.0 | SMPL-X |
 | `05_05` | dance - quasi-cou-de-pied, raised leg above hip-height, jete en tourant | 7.6 | SMPL-X |
@@ -441,7 +441,7 @@
 | `16_14` | walk, veer right | - | - |
 | `16_15` | walk | - | - |
 | `16_16` | walk | - | - |
-| `16_17` | walk, 90-degree left turn | 4.3 | BVH FBX |
+| `16_17` | walk, 90-degree left turn | 4.3 | BVH FBX C3D |
 | `16_18` | walk, 90-degree left turn | - | - |
 | `16_19` | walk, 90-degree right turn | - | - |
 | `16_20` | walk, 90-degree right turn | - | - |
@@ -1943,7 +1943,7 @@
 | `90_25` | fwd ball walk | 10.6 | SMPL-X |
 | `90_26` | fwd ball walk | 11.9 | SMPL-X |
 | `90_27` | bwk ball walk | 10.2 | SMPL-X |
-| `90_28` | breakdance | 6.4 | SMPL-X |
+| `90_28` | breakdance | 6.4 | SMPL-X C3D |
 | `90_29` | sequesnce | 12.3 | SMPL-X |
 | `90_30` | russian dance | 11.9 | SMPL-X |
 | `90_31` | russian dance | 8.2 | SMPL-X |
@@ -3190,9 +3190,9 @@
 | `143_08` | Jumping Twists | 6.5 | SMPL-X |
 | `143_09` | Jumping Twists | 9.1 | SMPL-X |
 | `143_10` | Walk And Pick up Tool Box | 9.6 | SMPL-X |
-| `143_11` | Walk And Pick up Box | 10.9 | SMPL-X BVH FBX |
+| `143_11` | Walk And Pick up Box | 10.9 | SMPL-X BVH FBX C3D |
 | `143_12` | Walk And Pick up Toolbox | 9.8 | SMPL-X |
-| `143_13` | Walk and Pick up Laundry Basket | 9.7 | SMPL-X BVH FBX |
+| `143_13` | Walk and Pick up Laundry Basket | 9.7 | SMPL-X BVH FBX C3D |
 | `143_14` | Walk And Step Over | 12.1 | SMPL-X |
 | `143_15` | Walk And Step Over | 11.8 | SMPL-X |
 | `143_16` | Walk And Step Over | 10.2 | SMPL-X |
@@ -3207,13 +3207,13 @@
 | `143_25` | Waving | 11.0 | SMPL-X |
 | `143_26` | Washing Window | 10.6 | SMPL-X |
 | `143_27` | Washing Window | 11.7 | SMPL-X |
-| `143_28` | Sweeping, Push Broom | 10.7 | SMPL-X BVH FBX |
+| `143_28` | Sweeping, Push Broom | 10.7 | SMPL-X BVH FBX C3D |
 | `143_29` | Pacing | 18.0 | SMPL-X |
 | `143_30` | Stretch And Yawn | 6.2 | SMPL-X |
 | `143_31` | Hopscotch | 7.0 | SMPL-X |
 | `143_32` | Walk | 13.0 | SMPL-X |
 | `143_33` | Peek A Boo | 6.0 | SMPL-X |
-| `143_34` | Chicken Dance | 13.1 | SMPL-X |
+| `143_34` | Chicken Dance | 13.1 | SMPL-X C3D |
 | `143_35` | Macarena Dance | 21.3 | SMPL-X |
 | `143_36` | Airplane | 12.7 | SMPL-X |
 | `143_37` | Climb Up And Down Ladder | 9.2 | SMPL-X |

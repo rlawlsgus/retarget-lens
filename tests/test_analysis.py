@@ -11,6 +11,15 @@ from khumanoid.motion import RobotMotion  # noqa: E402
 from khumanoid.synthetic import g1_motion  # noqa: E402
 
 
+def _need_retargeting():
+    """Skip without mink / mujoco / the G1 model (GMR's solver itself is vendored in khumanoid/gmr)."""
+    from khumanoid.retarget import unavailable
+
+    why = unavailable()
+    if why:
+        pytest.skip(why)
+
+
 def _shifted(m: RobotMotion, seconds: float) -> RobotMotion:
     """Same motion starting `seconds` later in its own clip (frames dropped from the front)."""
     k = int(round(seconds * m.fps))
@@ -54,7 +63,7 @@ def test_common_joints_and_smoothness():
 
 
 def test_foot_metrics_with_gmr_model():
-    pytest.importorskip("general_motion_retargeting")
+    _need_retargeting()
     fk = analysis.FootKinematics("unitree_g1")
     m = g1_motion(seconds=1.0, fps=30.0)
     r = fk.run(m)
@@ -72,7 +81,7 @@ def test_foot_metrics_with_gmr_model():
 
 
 def test_swing_clearance_lifts_only_skimming_swing_feet():
-    pytest.importorskip("general_motion_retargeting")
+    _need_retargeting()
     from khumanoid.retarget import ensure_swing_clearance
 
     fk = analysis.FootKinematics("unitree_g1")
@@ -106,18 +115,20 @@ def test_swing_clearance_lifts_only_skimming_swing_feet():
     assert np.array_equal(out.dof_pos[:, others], drag.dof_pos[:, others])  # arms / waist untouched
 
 
-FBX_02_01 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "retargeted", "cmu_fbx_smooth6",
-                         "02_01_g1.npz")
+FBX_02_01 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "cmu_fbx", "02_01.fbx")
 
 
-@pytest.mark.skipif(not os.path.isfile(FBX_02_01), reason="needs the FBX retarget of CMU 02_01 (README)")
+@pytest.mark.skipif(not os.path.isfile(FBX_02_01), reason="needs data/raw/cmu_fbx (tools/fetch_samples.py cmu_fbx)")
 def test_swing_clearance_on_fbx_walk():
     """The HF FBX retarget of 02_01 drags its toes at toe-off (mid-swing minimum below the floor level)."""
-    pytest.importorskip("general_motion_retargeting")
-    from khumanoid.io import load_motion
+    _need_retargeting()
+    from khumanoid.compare import load_item
     from khumanoid.retarget import ensure_swing_clearance
+    from khumanoid.settings import find_blender
 
-    m = load_motion(FBX_02_01)
+    if not find_blender().path:
+        pytest.skip("needs Blender 4.5 (docs/setup.md)")
+    m = load_item(FBX_02_01, smooth=6.0, log=lambda *_: None).robot  # smoothed, no swing lift (cached)
     out, info = ensure_swing_clearance(m, clearance=0.02)
     assert info["fast_foot_min_clearance_cm"]["before"] < 0.0 < 1.0 <= info["fast_foot_min_clearance_cm"]["after"]
     fk = analysis.FootKinematics("unitree_g1")

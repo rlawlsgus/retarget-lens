@@ -7,9 +7,10 @@ pivots, rotation orders, units, axes, takes) is the reader here: Blender runs
 headless with blender_fbx_script.py and dumps the armature's world joint
 matrices per frame (about 2 s per clip). Dumps are cached in data/cache/fbx/.
 
-Blender is found through $BLENDER, then C:\\blender\\*\\blender.exe, then PATH
-(see requirements.md). The ufbx Python binding was tried first and dropped: its
-0.0.5 wheel crashes and returns wrong parents on plain node access.
+Blender is found through RetLens's 환경 설정, then $BLENDER, then
+C:\\blender\\*\\blender.exe, then PATH (khumanoid.settings.find_blender; docs/setup.md).
+The ufbx Python binding was tried first and dropped: its 0.0.5 wheel crashes and returns
+wrong parents on plain node access.
 
 The armature's rest pose is the "rest" pose of the clip. Blender and most mocap
 exporters write the skeleton's T-pose there; when a file does not, retargeting
@@ -18,20 +19,18 @@ can take a frame of the clip instead (``--ref``).
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import os
-import shutil
 import subprocess
 
 import numpy as np
 
+from .. import paths
 from ..motion import SkeletonMotion
 from .bvh import cmu_capture_fps
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-CACHE_DIR = os.path.join(ROOT, "data", "cache", "fbx")
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_fbx_script.py")
+CACHE_DIR = paths.cache_dir("fbx")  # dev: data/cache/fbx
+SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_fbx_script.py")  # Blender runs this file
 SCRIPT_VERSION = 1  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
 
 # Extra factors to meters: files whose numbers are 100x off (centimetre values in a
@@ -42,20 +41,21 @@ _CGSPEED_FPS = 120.0
 
 
 def find_blender() -> str:
-    cands = [os.environ.get("BLENDER", "")]
-    cands += sorted(glob.glob(r"C:\blender\*\blender.exe"), reverse=True)
-    cands.append(shutil.which("blender") or "")
-    for c in cands:
-        if c and os.path.isfile(c):
-            return c
-    raise FileNotFoundError("FBX needs Blender 4.5 LTS: unzip it to C:\\blender or set BLENDER=<path to blender.exe> "
-                            "(see requirements.md)")
+    """blender.exe: 환경 설정, then $BLENDER, then C:\\blender\\*\\blender.exe, then PATH."""
+    from .. import settings
+
+    found = settings.find_blender(settings.load(reload=True))
+    if found.path is None:
+        raise FileNotFoundError(f"FBX를 읽으려면 Blender 4.5 LTS가 필요합니다: {found.problem}. RetLens의 '파일 > 환경 설정'에서 "
+                                "blender.exe를 지정하거나, C:\\blender에 풀거나, BLENDER=<blender.exe 경로>를 설정하세요")
+    return found.path
 
 
 def run_blender(*args: str, timeout: float = 1800) -> str:
     """Run blender_fbx_script.py in a headless Blender; returns its log, raises on failure."""
     cmd = [find_blender(), "-b", "--factory-startup", "--python-exit-code", "2", "--python", SCRIPT, "--", *args]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
+                       stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console flash
     log = "\n".join(line for line in (r.stdout + r.stderr).splitlines() if "[blender_fbx]" in line or "Error" in line)
     if r.returncode != 0:
         raise RuntimeError(f"Blender failed ({r.returncode}) on {args}:\n{log or r.stdout[-2000:] + r.stderr[-2000:]}")

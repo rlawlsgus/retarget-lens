@@ -1,7 +1,7 @@
 """Compare motions retargeted to the same humanoid, side by side, in the browser.
 
     python tools/compare_viewer.py data/raw/cmu_bvh/143_11.bvh data/raw/amass_cmu_smplx/143_11_stageii.npz
-    python tools/compare_viewer.py data/raw/unitree_lafan1_g1/walk1_subject1.csv data/retargeted/lafan1/walk1_subject1_g1.npz
+    python tools/compare_viewer.py data/raw/unitree_lafan1_g1/walk1_subject1.csv data/retargeted/lafan1_bvh/walk1_subject1_g1.npz
     -> open http://127.0.0.1:8080
 
 The desktop editor (tools/editor.py) shows the same scene with editor-style panels;
@@ -43,7 +43,8 @@ import viser  # noqa: E402
 
 from khumanoid.app.scene import (METRIC_NOTES, MotionScene, add_scene_arguments, hexcolor,  # noqa: E402
                                  load_robot_urdf, scene_options)
-from khumanoid.compare import LIBRARY_ROOTS, MOTION_EXT, Item, library_files, save_upload  # noqa: E402
+from khumanoid import paths, settings  # noqa: E402
+from khumanoid.compare import MOTION_EXT, Item, library_files, save_upload  # noqa: E402
 
 ASSIST_OPTIONS = {"켬 (기본)": 1.0, "끔 (--assist 0)": 0.0}
 
@@ -57,7 +58,7 @@ class Viewer:
 
     def __init__(self, server: viser.ViserServer, scene: MotionScene, library: list | None = None):
         self.server, self.scene = server, scene
-        self.library_roots = library or list(LIBRARY_ROOTS)
+        self.library_roots = library or settings.library_dirs()  # the defaults + RetLens 환경 설정 folders
         self._last_plot = 0.0
         self._plot_dirty = True
         self._last_status = 0.0
@@ -224,7 +225,7 @@ class Viewer:
         if q:  # every folder, shown with its folder; names that start with the query first (05_02 before 105_02)
             hits = [p for v in self._library.values() for p in v if q in os.path.basename(p).lower()]
             hits = sorted(hits, key=lambda p: not os.path.basename(p).lower().startswith(q))[:300]
-            self._lib_options = {os.path.relpath(p, ROOT).replace(os.sep, "/"): p for p in hits}
+            self._lib_options = {paths.rel(p).replace(os.sep, "/"): p for p in hits}
         else:
             folder = self.lib_folder.value.rsplit("  (", 1)[0]
             self._lib_options = {os.path.basename(p): p for p in self._library.get(folder, [])}

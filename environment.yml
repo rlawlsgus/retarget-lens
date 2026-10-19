@@ -13,8 +13,9 @@
 # torch unless the env's were imported before Kit started (tools/isaac_replay.py
 # keeps the env's torch out for that reason).
 #
-# Retargeting: GMR itself is not a package on any index; scripts\install_gmr.ps1
-# downloads a pinned commit and links it in (setup_env.ps1 runs it).
+# Retargeting: GMR's solver and G1 IK configs are vendored in khumanoid/gmr (MIT). GMR itself is
+# not a package on any index; scripts\install_gmr.ps1 downloads a pinned commit for the robot
+# meshes (assets/) and for development comparisons (setup_env.ps1 runs it).
 name: k-humanoid
 channels:
   - conda-forge
@@ -38,7 +39,7 @@ dependencies:
   - rich<15                # viser 1.1.1 requires < 15; GMR works with any
   - natsort
   - imageio
-  - pytorch=*=cpu*         # GMR imports torch at package import; the CPU build is enough
+  - pytorch=*=cpu*         # dev only: GMR's own package imports torch; RetLens uses the vendored khumanoid/gmr (no torch)
   # --- comparison viewer (tools/compare_viewer.py) ---
   - viser=1.1.1            # MIT, browser-based 3D viewer + GUI
   - yourdfpy               # URDF loader used by viser's robot display
@@ -46,6 +47,8 @@ dependencies:
   # --- desktop editor (tools/editor.py) ---
   - pyside6=6.11           # LGPL-3.0, Qt 6 widgets
   - qt6-webengine=6.11     # LGPL-3.0, shows the viser scene inside the editor (same Qt version as pyside6)
+  # --- packaging (scripts\build_retlens.ps1) ---
+  - pyinstaller            # GPL-2.0 with the bootloader exception (the built program is not GPL)
   - pip:
     - mink==1.3.0          # Apache-2.0, differential IK on MuJoCo; not on conda-forge
-    - smplx==0.1.28        # AMASS SMPL-X path only. Code licence: non-commercial research (MPI)
+    - smplx==0.1.28        # dev only (--format smplx-gmr comparison). Code licence: non-commercial research (MPI); not shipped

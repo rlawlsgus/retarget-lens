@@ -27,6 +27,7 @@ METADATA = os.path.join(ROOT, "data", "raw", "cmu_fbx", "metadata.csv")
 AMASS = os.path.join(ROOT, "data", "raw", "amass_cmu_smplx", "CMU")
 BVH = os.path.join(ROOT, "data", "raw", "cmu_bvh")
 FBX = os.path.join(ROOT, "data", "raw", "cmu_fbx")
+C3D = os.path.join(ROOT, "data", "raw", "cmu_c3d")
 
 # (motion type, note, [(trial, short Korean note)]); picked from the labels, about 10 s where possible
 PICKS = [
@@ -95,6 +96,7 @@ def main() -> int:
     seconds = amass_lengths(AMASS)
     bvh = {f[:-4] for f in os.listdir(BVH) if f.endswith(".bvh")} if os.path.isdir(BVH) else set()
     fbx = {f[:-4] for f in os.listdir(FBX) if f.endswith(".fbx")} if os.path.isdir(FBX) else set()
+    c3d = {f[:-4] for f in os.listdir(C3D) if f.endswith(".c3d")} if os.path.isdir(C3D) else set()
     from khumanoid.io.bvh import load_bvh
 
     for t in sorted(bvh - set(seconds)):  # BVH-only trials: length from the BVH (60 Hz subjects fixed)
@@ -103,7 +105,7 @@ def main() -> int:
 
     def have(t: str) -> str:
         return " ".join(k for k, ok in (("SMPL-X", t in seconds and os.path.isfile(
-            os.path.join(AMASS, t.split("_")[0], f"{t}_stageii.npz"))), ("BVH", t in bvh), ("FBX", t in fbx)) if ok) or "-"
+            os.path.join(AMASS, t.split("_")[0], f"{t}_stageii.npz"))), ("BVH", t in bvh), ("FBX", t in fbx), ("C3D", t in c3d)) if ok) or "-"
 
     def sec(t: str) -> str:
         return f"{seconds[t]:.1f}" if t in seconds else "-"
@@ -118,10 +120,11 @@ def main() -> int:
         "- **라벨:** CMU Graphics Lab Motion Capture Database의 시도별 설명입니다. Hugging Face CMU FBX 세트의 "
         "`metadata.csv`(`data/raw/cmu_fbx/`)에서 가져왔습니다. 설명은 영어 원문 그대로입니다.",
         f"- **이 PC에 있는 것:** CMU {len(trials)}개 시도 중 AMASS SMPL-X {local_amass}개"
-        f"(`data/raw/amass_cmu_smplx/CMU`, AMASS 라이선스라 내부 검증 전용), BVH {len(bvh)}개, FBX {len(fbx)}개입니다.",
+        f"(`data/raw/amass_cmu_smplx/CMU`, AMASS 라이선스라 내부 검증 전용), BVH {len(bvh)}개, FBX {len(fbx)}개, C3D {len(c3d)}개입니다.",
         "- **길이:** AMASS 파일의 실제 촬영 속도로 계산했습니다. AMASS에 없고 BVH만 있으면 BVH에서 계산했습니다.",
-        "- **뷰어에서 열기:** `tools/compare_viewer.py`의 \"모션\" 탭 \"이름 검색\"에 번호(예: `143_11`)를 넣고 파일을 고릅니다. "
-        "SMPL-X는 \"사람 표시: 몸 메시\"로 몸 표면까지 볼 수 있습니다. 처음 여는 사람 모션은 리타게팅에 수십 초가 걸립니다.",
+        "- **열기:** RetLens 프로젝트 패널의 검색 칸(또는 `tools/compare_viewer.py`의 \"모션\" 탭 \"이름 검색\")에 번호(예: `143_11`)를 "
+        "넣고 파일을 고릅니다. 비교 뷰어에서는 SMPL-X를 \"사람 표시: 몸 메시\"로 몸 표면까지 볼 수 있습니다. "
+        "처음 여는 사람 모션은 리타게팅에 수십 초가 걸립니다.",
         "",
         "## 동작 종류별 대표 시도",
         "",

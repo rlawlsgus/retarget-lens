@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
-from khumanoid.app.editor import run  # noqa: E402
+from khumanoid.app.runtime import main  # noqa: E402  (log file + error dialogs when installed / windowless)
 
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main())
