@@ -8,6 +8,7 @@ K-온디바이스 휴머노이드 과제의 1차년도 산출물인 **Human MoCa
 3. **리타게팅**: 사람 모캡(BVH, FBX, AMASS SMPL-X)을 GMR로 Unitree G1(29 DoF)에 옮겨 프로젝트 표준 로봇 npz로 저장합니다. → `tools/retarget.py`
 4. **Isaac Sim 재현과 물리 검증**: 사람 모캡(스틱 피겨)과 리타게팅된 로봇 모션을 Isaac Sim에서 나란히 재생합니다. `--physics`를 주면 중력·바닥 접촉·관절 PD로 실제 물리 시뮬레이션을 돌려 물리 정합성을 잽니다. → `tools/isaac_replay.py`
 5. **비교 뷰어**: 여러 포맷을 같은 G1에 올려 브라우저에서 나란히 보고 수치로 비교합니다(SMPL-X 몸 메시, Isaac 물리 결과 포함). → `tools/compare_viewer.py`, `tools/compare_report.py`
+6. **RetLens (모션 편집기, 데스크톱 앱)**: 같은 기능을 블렌더·유니티 같은 편집기 화면(씬 뷰, 계층, 인스펙터, 타임라인, 프로젝트 탐색기)으로 묶은 Qt 프로그램입니다. 나중에 배포할 실행파일의 바탕입니다. → `scripts\editor.bat`, `tools/editor.py`
 
 공개 샘플(CMU BVH, LAFAN1, Unitree G1 csv)로 위 과정을 끝까지 돌려 확인했습니다(2026-10-15, 아래 "실데이터 점검").
 
@@ -41,6 +42,7 @@ conda activate k-humanoid
 - activate 훅이 `C:\isaacsim`을 연결합니다. 그래서 env 안의 `python`에서 바로 `from isaacsim import SimulationApp`이 됩니다. Isaac Sim 파일은 env에 복사되지 않습니다.
 - 이 네트워크는 Anaconda `defaults` 채널이 막혀 있어(HTTP 429, 클라이언트 등록 필요) conda-forge만 씁니다.
 - 마지막에 아래 3)의 GMR 설치까지 실행합니다(`-SkipGmr`로 생략).
+- 모션 편집기용 PySide6와 qt6-webengine(약 180 MB, 둘 다 Qt 6.11)도 들어 있습니다. 기존 환경에 더할 때는 `conda install --override-channels -c conda-forge qt6-webengine=6.11.2`입니다.
 
 ### 3) GMR 리타게터 (`..\GMR`, 프로젝트 폴더 밖)
 
@@ -221,6 +223,55 @@ CMU 17클립(BVH 6, FBX 6, SMPL-X 5, `--smooth 6 --swing-clearance 2`, `reports/
 - 같은 LAFAN1 4클립을 GMR과 Unitree 공식 리타겟(csv)으로 비교했습니다. 관절각 차이 중앙값은 7–12°로, 대부분 어깨 yaw·손목 roll 같은 팔 비틀림입니다. 골반 높이 차이는 2.5 cm 미만입니다. Unitree csv의 월드 좌표는 우리 것보다 z축으로 90° 돌아가 있습니다(관례 차이).
 - GMR 원본 결과는 Unitree보다 관절 가속도가 30–50% 커서 더 거칩니다(프레임별 IK). `--smooth 6`으로 Unitree 수준이 됩니다(아래).
 - 사람과 나란히 재생하면 로봇은 줄어든 보폭으로 걷기 때문에, 클립이 길수록 둘 사이 간격이 벌어집니다.
+
+## RetLens: 모션 편집기 (데스크톱 앱)
+
+RetLens는 Retarget Lens의 줄임말로, 이 저장소의 데스크톱 프로그램 이름입니다.
+
+```powershell
+scripts\editor.bat                                   # 더블클릭으로도 실행
+python tools\editor.py data\raw\cmu_bvh\02_01.bvh data\raw\amass_cmu_smplx\CMU\143\143_11_stageii.npz
+```
+
+블렌더·유니티처럼 패널을 도킹해 쓰는 Qt 프로그램입니다. 아래 "비교 뷰어"와 같은 기능을 편집기 화면으로 묶었고, 둘은 같은 코어(`khumanoid/app/scene.py`)를 씁니다.
+
+```
++-- 메뉴 (파일·편집·보기·재생·물리·도움말) / 툴바 --------------------------+
+|                                        | 계층: 불러온 모션, 보이기 체크   |
+|   씬 뷰 (3D)                           +---------------------------------+
+|                                        | 인스펙터 | 씬 설정 (탭)          |
++----------------------------------------+  선택한 모션의 속성·물리·동영상·지표 |
+| 타임라인: 재생 버튼, 모션마다 트랙(오프셋·길이, 넘어진 시점 빨간 표시)      |
+| 프로젝트 (데이터 폴더 탐색기) | 분석 (그래프·지표 표) | 콘솔 (로그)      |
++-- 상태바: Isaac 작업, 물리 모드, 현재 시각 ------------------------------+
+```
+
+- **패널:** 모든 패널은 끌어서 옮기거나, 탭으로 합치거나, 떼어 띄우거나, 닫을 수 있습니다. 배치는 다음 실행 때 그대로 열리고, "보기 > 레이아웃 초기화"로 위 배치로 돌아옵니다.
+- **모션 추가:** 프로젝트 패널에서 두 번 클릭하거나 "추가"를 누릅니다. "파일 > 열기"(Ctrl+O)는 PC의 아무 폴더에서 엽니다. 탐색기에서 편집기 창으로 파일을 끌어다 놓아도 됩니다.
+  - 프로젝트 패널은 `data/raw`, `data/retargeted`, `reports`(물리 결과) 같은 데이터 폴더를 트리로 보여 줍니다. 파일 옆에 CMU 동작 설명(예: 143_11 → Walk And Pick up Box)이 나오고, 검색 칸은 번호와 설명(예: `dance`)을 모두 찾습니다.
+  - 처음 여는 사람 모션은 리타게팅에 수십 초가 걸립니다. 그동안에도 화면은 멈추지 않습니다.
+- **선택:** 계층 패널이나 타임라인의 이름을 누르면 인스펙터에 그 모션의 정보가 나옵니다(종류, 파일, 길이, QC, IK 잔차, 표시·시간 오프셋, 물리 상태, 동영상, 지표 표). 계층 패널에서 우클릭하면 동영상 저장, 파일 위치 열기, 제거 메뉴가 나옵니다.
+  - 계층 패널 이름 옆 체크와 인스펙터의 "보이기"는 같은 설정이라 한쪽을 바꾸면 다른 쪽도 바뀝니다.
+- **분석 패널:**
+  - 그래프는 "타임라인 따라가기"(기본 켬)가 눌려 있으면 재생 위치를 가운데에 두고 "구간" 길이만큼 보여 주며, 재생·스크럽을 따라 움직입니다. "구간"을 0으로 하면 전체 길이를 봅니다.
+  - 그래프 배경을 끌면 좌우로 옮겨지고, 휠로 확대·축소합니다. 그러면 따라가기가 꺼지고, 버튼을 다시 누르거나 그래프를 두 번 클릭하면 다시 따라갑니다.
+  - 지표 표의 칸은 좁게 유지합니다. "물리 판정"처럼 긴 값은 첫 항목만 줄여 보여 주고(예: "넘어짐 1회 외 2"), 칸에 마우스를 올리면 전체 문장이 나옵니다. 인스펙터 지표 표도 같습니다.
+  - 지표 설명은 표 밑에 늘어놓지 않고 마우스를 올릴 때 나옵니다. 위쪽 막대의 "지표 설명"(?)에 올리거나 누르면 모든 지표가 주제별 표로 나오고, 표의 행 이름(인스펙터 지표 표도)에 올리면 그 지표 설명만 나옵니다. 설명 문구는 `khumanoid/app/scene.py`의 `METRIC_HELP`에 있습니다.
+- **동영상:** 인스펙터의 "동영상 저장"은 비교 뷰어와 같은 Isaac 녹화입니다. 다 되면 "열기"로 기본 동영상 플레이어에서, "폴더"로 탐색기에서 엽니다.
+- **물리 모드:** 툴바나 물리 메뉴(P)에서 켭니다. 골반 보조 힘은 "물리 > 골반 보조 힘"에서 바꿉니다. 물리 계산이나 동영상 녹화를 처음 할 때 NVIDIA Omniverse 라이선스 동의 창이 한 번 뜹니다. 동의하면 다시 묻지 않습니다(`--isaac-accept-eula`로 미리 동의할 수도 있습니다).
+- **단축키:** 열기 Ctrl+O, 재생/일시정지 Space, 처음으로 Home, 프레임 이동 ←/→, 물리 모드 P, 카메라 맞추기 F, 동영상 저장 Ctrl+E, 제거 Delete.
+- **화면 테마:** 기본은 어두운 테마이고, `--light`로 밝은 테마를 씁니다.
+- **씬 뷰의 구조:**
+  - 3D는 viser 장면을 127.0.0.1의 빈 포트에 띄우고, Qt WebEngine(Chromium)으로 창 안에 보여 줍니다. viser 자체 제어판은 숨기고, 조작은 모두 Qt 패널에서 합니다.
+  - conda 환경에서는 Chromium 렌더러 샌드박스를 끕니다. 샌드박스 안의 렌더러가 conda의 Qt DLL을 찾지 못해 바로 죽기 때문입니다(0xC0000135). 씬 뷰는 로컬 씬 서버만 보여 주고, 다른 주소로 가는 링크는 기본 브라우저로 넘깁니다.
+  - 실행파일로 묶으면 DLL이 같은 폴더에 들어가므로 샌드박스를 켠 채로 돕니다.
+  - "보기 > 브라우저에서 씬 열기"로 같은 장면을 웹 브라우저에서도 볼 수 있습니다.
+  - 3D는 화면 배율에 맞춘 해상도로 고정해 그립니다(viser `fixedDpr`, 배율 100%면 1). viser는 원래 초당 약 38프레임보다 적게 그리면 해상도를 75%까지 낮추는데, 편집기는 재생 중 장면을 초당 30번 바꾸므로 늘 이 조건에 걸려 실행할 때마다 씬 뷰가 흐려지기도 했습니다. 고정해도 재생 프레임 수는 같았습니다(초당 약 40). 창을 배율이 다른 모니터로 옮기면 그 배율로 다시 불러옵니다.
+- **재생이 끊기지 않게 한 방법** (`khumanoid/app/robots.py`, `scene.py`):
+  - Qt 창은 내장 Chromium의 화면을 GUI 스레드에서 합성합니다. 그래서 파이썬이 한 프레임에 오래 붙잡고 있으면(GIL) 3D 화면도 같이 멈춥니다. viser의 `ViserUrdf`는 로봇마다 링크 프레임 약 40개를 하나씩 옮겨 로봇 1대에 프레임당 약 80개 메시지, 10 ms가 들었습니다(3대에 46 ms → 3D 30 fps 미만).
+  - 지금은 로봇의 단단한 부품(고정 관절로 붙은 링크를 합친 30개)마다 배치 메시 하나에 모든 로봇을 인스턴스로 넣고, 순운동학은 numpy로 모든 로봇을 한 번에 계산합니다. 사람 스켈레톤·지지다각형·CoM·ZMP도 모든 모션이 노드 4개를 함께 씁니다. 모션 수와 상관없이 프레임당 메시지가 약 35개입니다.
+  - 장면은 별도 스레드에서 30 Hz로 갱신하고, 시각·표시 설정이 그대로면(일시정지) 아무것도 보내지 않습니다. 모션을 추가·제거해도 메시를 다시 보내지 않고 인스턴스 수만 바꿉니다.
+  - 측정(모션 7개, RTX 3070): 장면 갱신 4–8 ms/프레임, 3D 화면 멈춤 60 fps, 재생 중 60 fps 이상(프레임 간격 중앙값 15 ms).
 
 ## 비교 뷰어 (여러 포맷 → 같은 G1)
 
@@ -462,17 +513,21 @@ khumanoid/          모션 로더, 공통 데이터 구조, QC (numpy만 사용 
   stability.py      균형: 전신 CoM, cart-table ZMP, 발 지지다각형, 부호 있는 여유, 정적 불균형
   diagnosis.py      물리 재생에서 넘어짐의 첫 원인 진단
   physics_runner.py Isaac 작업(물리 실행·동영상 녹화)을 백그라운드 프로세스로 하나씩 돌리고 결과 캐시 (뷰어, 캐시: data/cache/physics/)
+  app/scene.py      화면과 무관한 모션 장면 코어: 불러온 모션, 재생, 물리·동영상 작업, 분석 데이터, viser 3D 그리기
+  app/robots.py     모든 로봇·오버레이를 공유 배치 메시로 그리기 (numpy 순운동학, 프레임당 메시지 수 고정)
+  app/editor.py     RetLens, Qt 모션 편집기 (씬 뷰, 계층, 인스펙터, 씬 설정, 타임라인, 프로젝트, 분석, 콘솔)
+  cmu_labels.py     CMU 시도 번호 → 동작 설명 (data/raw/cmu_fbx/metadata.csv)
   compare.py        여러 포맷을 같은 로봇으로 불러오기 (리타게팅 캐시: data/cache/retarget/)
   io/cmu_frame_rates.json  CMU 시도별 실제 촬영 fps (cgspeed BVH 보정용)
   io/fbx.py, io/blender_fbx_script.py  FBX 읽기(헤드리스 Blender, 캐시: data/cache/fbx/), BVH -> FBX 변환
   io/smpl.py        AMASS SMPL/SMPL-X (관절 FK, BodyMeshRig: 몸 메시 스키닝)
-tools/              retarget.py, compare_viewer.py, compare_report.py, qc_report.py, isaac_replay.py (--physics),
+tools/              editor.py (데스크톱 편집기 RetLens), retarget.py, compare_viewer.py, compare_report.py, qc_report.py, isaac_replay.py (--physics),
                     physics_report.py, fetch_samples.py, make_samples.py, cmu_frame_rates.py,
                     cmu_motion_index.py (-> docs/cmu_motion_labels.md: CMU 동작 라벨·대표 시도)
 configs/qc.yaml     QC 임계값, 목표 시간
 configs/physics.yaml  Isaac 물리 재생: PD 게인, 골반 보조 힘, 넘어짐·판정 기준
 requirements.md     환경 재현 요구사항 (버전, 드라이버, 네트워크), environment.lock.txt: conda 잠금 파일
-scripts/            install_isaacsim.ps1, setup_env.ps1, install_gmr.ps1
+scripts/            install_isaacsim.ps1, setup_env.ps1, install_gmr.ps1, editor.bat (편집기 실행)
 docs/research/      사전 조사 자료
 tests/              pytest (python -m pytest tests; GMR이 없으면 리타게팅 E2E 테스트만 skip)
 data/  reports/     (git 제외) data/raw 공개 샘플, data/retargeted 로봇 npz, QC·시뮬 검사 결과
@@ -482,7 +537,11 @@ data/  reports/     (git 제외) data/raw 공개 샘플, data/retargeted 로봇 
 
 최종 결과물은 내려받아 실행하는 프로그램입니다. 아직 패키징은 하지 않았지만, 아래 원칙으로 만들고 있습니다.
 
-- **화면은 비교 뷰어가 바탕입니다.** 로컬 웹 서버 + 브라우저 UI(viser)라서 PyInstaller 같은 도구로 묶을 수 있습니다. 파일은 브라우저의 파일 선택 창("파일 열기")과 데이터 폴더 목록으로 고릅니다. 둘 다 경로 입력 없이 쓸 수 있고, 목록에 넣을 폴더는 `--library`로 바꿉니다(`khumanoid/compare.py`의 `library_files`).
+- **화면은 Qt 모션 편집기 RetLens입니다**(`khumanoid/app/editor.py`, 2026-10-19부터).
+  - 화면 요소(패널, 메뉴, 파일 대화상자, 라이선스 동의 창)는 모두 Qt이고, 3D 씬은 내장 Chromium(Qt WebEngine)이 보여 주는 로컬 viser 장면입니다.
+  - PyInstaller는 PySide6와 WebEngine(QtWebEngineProcess, 리소스)을 묶을 수 있지만 크기가 큽니다(WebEngine만 수백 MB).
+  - 기능은 UI와 무관한 코어(`khumanoid/app/scene.py`)에 있습니다. 브라우저 비교 뷰어도 같은 코어를 쓰고, 파일 목록은 `--library`로 바꿉니다(`khumanoid/compare.py`의 `library_files`).
+  - 창 배치와 라이선스 동의는 사용자별 설정(QSettings `RetLens`, Windows에서는 레지스트리)에 남습니다. 예전 이름(`K-Humanoid/MotionEditor`)으로 저장된 값은 처음 실행할 때 옮겨 옵니다.
 - **Isaac Sim은 묶지 않고 따로 설치한 것을 호출합니다.** 수십 GB이고, NVIDIA RTX GPU와 자체 EULA가 필요하기 때문입니다. 물리 계산은 별도 프로세스로 돌고(`khumanoid/physics_runner.py`), 그 위치는 설정으로 바꿀 수 있습니다. 묶인 실행파일 안에서는 자기 자신(`sys.executable`)을 Isaac 파이썬으로 쓰지 않습니다.
 - **EULA 동의는 사용자가 직접 합니다.** 지금은 `--isaac-accept-eula` 옵션이고, 프로그램에서는 설정 화면의 동의 절차로 바꿀 자리입니다.
 - **남은 일:**
