@@ -34,6 +34,7 @@
 | `reports/compare/` | 포맷 비교: `cmu_bvh_fbx_smplx.md`(같은 촬영의 BVH/FBX/SMPL-X), `lafan1_gmr_vs_unitree.md`(우리 GMR vs Unitree 공식 리타겟) | `-Stage reports` |
 | `reports/sim_check/` | Isaac 헤드리스 검사 JSON·스냅샷(CMU 6클립, 사람+로봇) | `-Stage isaac` |
 | `reports/physics/<원본 폴더>/`, `summary.md` | Isaac 물리 재생(하네스 x1) 결과 `<clip>_sim.npz/.json`과 요약 표(CMU 3클립 × 3소스) | `-Stage isaac` |
+| `reports/policy/{swing0,swing2,lafan1}/` | 균형 켬/끔 비교(MuJoCo): 제어기 없음 / GMT 추적 정책 결과 `<clip>_<pd\|gmt>_sim.npz/.json`, 두 조건을 나란히 놓은 MP4, `summary.md`(합친 표는 `reports/policy/summary.md`) | `-Stage policy` |
 | `reports/videos/` | `kinematic/`(기구학 재생), `physics/`(물리 재생), `internal_lafan1/`, `viewer/`(RetLens·뷰어에서 저장한 영상), `history/`(지난 비교 영상) | `-Stage isaac`, 프로그램 |
 
 ```powershell

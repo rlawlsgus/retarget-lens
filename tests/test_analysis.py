@@ -115,6 +115,92 @@ def test_swing_clearance_lifts_only_skimming_swing_feet():
     assert np.array_equal(out.dof_pos[:, others], drag.dof_pos[:, others])  # arms / waist untouched
 
 
+def _on_floor(fk, joints: list[str], dof: np.ndarray, x: np.ndarray | None = None) -> RobotMotion:
+    """G1 at these joint angles, pelvis upright at x (default 0) and lowered until the lowest sole point is on the floor."""
+    T = len(dof)
+    root = np.column_stack([np.zeros(T) if x is None else x, np.zeros(T), np.full(T, 0.793)])
+    probe = RobotMotion("probe", joints, root, np.tile([1.0, 0, 0, 0], (T, 1)), dof, 30.0)
+    root[:, 2] -= fk.run(probe)["sole"].min()
+    return RobotMotion("m", joints, root, np.tile([1.0, 0, 0, 0], (T, 1)), dof, 30.0)
+
+
+def test_foot_flat_turns_tilted_stance_soles_flat():
+    _need_retargeting()
+    from khumanoid.retarget import flatten_stance_feet
+
+    fk = analysis.FootKinematics("unitree_g1")
+    joints = g1_motion(seconds=1.0, fps=30.0).joint_names
+    lp, lr = joints.index("left_ankle_pitch_joint"), joints.index("left_ankle_roll_joint")
+    rp, rr = joints.index("right_ankle_pitch_joint"), joints.index("right_ankle_roll_joint")
+    ankles = [lp, lr, rp, rr]
+    others = [i for i in range(29) if i not in ankles]
+    T = 45
+
+    # standing still: left foot toe-up 12 deg and rolled 5 deg (on its heel edge),
+    # right foot toe-down 8 deg (heel-off) and rolled 4 deg
+    dof = np.zeros((T, 29))
+    dof[:, lp], dof[:, lr] = np.radians(-12.0), np.radians(5.0)  # negative ankle pitch = toe up
+    dof[:, rp], dof[:, rr] = np.radians(8.0), np.radians(4.0)
+    stand = _on_floor(fk, joints, dof)
+    out, info = flatten_stance_feet(stand)
+    assert info["stance_pct"] == {"left": 100.0, "right": 100.0}
+    assert info["stance_pitch_deg"]["left"]["before"] == pytest.approx(12.0, abs=0.5)
+    assert abs(info["stance_pitch_deg"]["left"]["after"]) < 0.2
+    assert np.abs(out.dof_pos[:, [lp, lr]]).max() < np.radians(0.2)  # upright leg: flat sole = ankle at zero
+    # toe down: roll levelled, pitch kept (flattening it would lift the toe off the floor)
+    assert info["stance_pitch_deg"]["right"]["before"] == pytest.approx(info["stance_pitch_deg"]["right"]["after"], abs=0.2)
+    assert np.allclose(out.dof_pos[:, rp], stand.dof_pos[:, rp], atol=np.radians(0.2))
+    assert np.abs(out.dof_pos[:, rr]).max() < np.radians(0.2)
+    assert np.array_equal(out.dof_pos[:, others], stand.dof_pos[:, others])
+    assert np.array_equal(out.root_pos, stand.root_pos) and np.array_equal(out.root_quat, stand.root_quat)
+    r0, r1 = fk.run(stand), fk.run(out)
+    assert np.all(r1["flat"][:, 0] - r1["sole"][:, 0] < 1e-3)  # every left sole point at one height
+    lift = r1["sole"][:, 0] - r0["sole"][:, 0]  # turned about the ankle: the heel comes up ~5 cm x sin(12 deg)
+    assert np.all((lift > 0.006) & (lift < 0.014)) and info["sole_lift_cm"]["max"] < 1.4
+    assert np.all(r1["sole"][:, 1] >= r0["sole"][:, 1] - 1e-6)  # never into the floor
+
+    # both feet tiptoe (35 deg toe-down): beyond max_tilt_deg, left alone
+    dof = np.zeros((T, 29))
+    dof[:, [lp, rp]] = np.radians(35.0)
+    tiptoe = _on_floor(fk, joints, dof)
+    same, info = flatten_stance_feet(tiptoe)
+    assert info["frames_changed"] == 0 and info["too_tilted_frames"] == 2 * T
+    assert np.array_equal(same.dof_pos, tiptoe.dof_pos)
+
+    # legs spread 20 deg (soles rolled 20 deg): the ankle roll stops at its limit (15 deg)
+    dof = np.zeros((T, 29))
+    dof[:, joints.index("left_hip_roll_joint")], dof[:, joints.index("right_hip_roll_joint")] = np.radians([20.0, -20.0])
+    spread = _on_floor(fk, joints, dof)
+    out, info = flatten_stance_feet(spread)
+    from khumanoid.retarget import robot_joint_ranges, robot_model
+
+    lo, hi = robot_joint_ranges(robot_model("unitree_g1"))
+    assert np.all(out.dof_pos >= lo - 1e-9) and np.all(out.dof_pos <= hi + 1e-9)
+    assert info["joint_limit_frames"] == T and np.allclose(np.abs(out.dof_pos[:, [lr, rr]]), hi[lr])
+    assert info["stance_tilt_deg"]["after"]["max"] == pytest.approx(20.0 - np.degrees(hi[lr]), abs=0.5)
+
+
+def test_foot_flat_leaves_moving_feet_alone():
+    _need_retargeting()
+    from khumanoid.retarget import flatten_stance_feet
+
+    fk = analysis.FootKinematics("unitree_g1")
+    joints = g1_motion(seconds=1.0, fps=30.0).joint_names
+    ankles = [joints.index(f"{s}_ankle_{j}_joint") for s in ("left", "right") for j in ("pitch", "roll")]
+    # both feet toe-up 10 deg: still for 0.5 s, then sliding at 1 m/s
+    T = 45
+    dof = np.zeros((T, 29))
+    dof[:, [ankles[0], ankles[2]]] = np.radians(-10.0)
+    m = _on_floor(fk, joints, dof, x=np.concatenate([np.zeros(15), np.linspace(0, 1.0, 31)[1:]]))
+    out, info = flatten_stance_feet(m)
+    assert info["stance_pct"] == {"left": pytest.approx(100 * 15 / T, abs=0.1), "right": pytest.approx(100 * 15 / T, abs=0.1)}
+    assert np.array_equal(out.dof_pos[15:], m.dof_pos[15:])  # moving: untouched
+    assert np.abs(out.dof_pos[:11, ankles]).max() < np.radians(0.2)  # standing: flat
+    # fading out over the last 0.15 s of the stance, no jump into the slide
+    pitch = np.degrees(out.dof_pos[:, ankles[0]])
+    assert np.all(np.diff(pitch[10:16]) < -1.0) and np.abs(np.diff(pitch)).max() <= 2.0 + 1e-6
+
+
 FBX_02_01 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "cmu_fbx", "02_01.fbx")
 
 

@@ -11,6 +11,7 @@ An empty value means "find it". Each external tool is looked up in this order:
                                                            (the dev env, never a packaged build), C:\\isaacsim
     Blender     blender          BLENDER                   C:\\blender\\*\\blender.exe, PATH
     SMPL-X      smpl_model_dir   SMPL_MODEL_DIR            paths.smpl_model_dir()
+    GMT         -                KHUMANOID_GMT_DIR         ..\\GMT next to the repository (scripts\\install_gmt.ps1)
 
 Standard library only (Isaac Sim's Python imports khumanoid too).
 """
@@ -33,9 +34,16 @@ ISAAC_DIRS = [r"C:\isaacsim"] if os.name == "nt" else [os.path.expanduser("~/isa
 ISAAC_LAUNCHER = "python.bat" if os.name == "nt" else "python.sh"
 BLENDER_GLOB = r"C:\blender\*\blender.exe"
 SMPLX_GENDERS = ("NEUTRAL", "MALE", "FEMALE")
+GMT_ENV = "KHUMANOID_GMT_DIR"
+GMT_MODEL = os.path.join("assets", "robots", "g1", "g1.xml")  # GMT's 23-DoF G1 (both MuJoCo controllers)
+GMT_POLICY = os.path.join("assets", "pretrained_checkpoints", "pretrained.pt")  # the tracking policy
+# the same G1 model staged into the program's resources (tools/stage_resources.py; meshes from assets/unitree_g1):
+# the installed program has no GMT folder, but its "없음 (MuJoCo)" balance mode needs only this model
+BUNDLED_G1_MODEL = ("assets", "gmt_g1", "g1.xml")
 URLS = {"isaac": "https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html",
         "blender": "https://www.blender.org/download/lts/4-5/",
-        "smpl": "https://smpl-x.is.tue.mpg.de/"}
+        "smpl": "https://smpl-x.is.tue.mpg.de/",
+        "gmt": "https://github.com/zixuan417/humanoid-general-motion-tracking"}
 
 
 @dataclass
@@ -171,6 +179,23 @@ def find_smpl(s: Settings | None = None) -> Found:
     return Found(None, problem=f"SMPL-X 모델이 없습니다 ({paths.smpl_model_dir()}\\smplx\\SMPLX_*.npz)")
 
 
+# ------------------------------------------------------------------------------ GMT
+def gmt_dir() -> str:
+    """Where GMT (General Motion Tracking) is looked for: $KHUMANOID_GMT_DIR, else ..\\GMT next to
+    the repository (scripts\\install_gmt.ps1 puts it there)."""
+    return os.environ.get(GMT_ENV) or os.path.join(os.path.dirname(paths.REPO_ROOT), "GMT")
+
+
+def find_gmt() -> Found:
+    """GMT's G1 MuJoCo model (physics mode's 균형 제어 in MuJoCo) and its tracking policy."""
+    folder = gmt_dir()
+    source = f"환경변수 {GMT_ENV}" if os.environ.get(GMT_ENV) else "자동 (저장소 옆)"
+    if not os.path.isfile(os.path.join(folder, GMT_MODEL)):
+        return Found(None, source, problem=f"GMT를 찾지 못했습니다 ({folder}에 {GMT_MODEL} 없음)")
+    policy = os.path.isfile(os.path.join(folder, GMT_POLICY))
+    return Found(folder, source, "G1 MuJoCo 모델, 추적 정책" if policy else "G1 MuJoCo 모델 (추적 정책 pretrained.pt 없음)")
+
+
 # ------------------------------------------------------------------------------ robot USD
 USD_EXT = (".usd", ".usda", ".usdc", ".usdz")
 
@@ -262,6 +287,18 @@ def check_all(s: Settings | None = None) -> list[Check]:
                      " · ".join(x for x in (usd.detail, usd.source) if x) if usd.path is not None else usd.problem,
                      "물리 모드, 동영상 저장", "" if usd.path is not None else
                      "USD 파일을 고르거나 칸을 비워 NVIDIA 에셋 서버의 G1을 쓰세요"))
+    if not paths.FROZEN:  # the installed program has no PyTorch: its menu says so instead of a check that cannot pass
+        gmt = find_gmt()
+        libs = [m for m in ("mujoco", "torch") if importlib.util.find_spec(m) is None]
+        policy = gmt.path is not None and os.path.isfile(os.path.join(gmt.path, GMT_POLICY))
+        ok = policy and not libs
+        detail = (f"{', '.join(libs)} 없음" if libs else " · ".join(x for x in (gmt.detail, gmt.source) if x)) \
+            if gmt.path else gmt.problem
+        out.append(Check("gmt", "균형 제어 (GMT)", ok, False, gmt.path or "", detail,
+                         "물리 모드 균형 제어: " + ("추적 정책 (GMT)" if gmt.path and "mujoco" not in libs else
+                                               "없음 (MuJoCo), 추적 정책 (GMT)"),
+                         "" if ok else f"scripts\\install_gmt.ps1을 실행하세요 (다른 곳에 두었으면 그 폴더를 환경변수 "
+                                       f"{GMT_ENV}에 넣습니다)", URLS["gmt"]))
     vd = video_dir(s)
     out.append(Check("video", "동영상 저장 폴더", _writable(vd), False, vd, "", "동영상 저장",
                      "쓸 수 있는 폴더를 지정하세요"))

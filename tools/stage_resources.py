@@ -13,7 +13,9 @@ _MEIPASS). To try an installed layout from the repository without packaging:
 Contents (see docs/packaging.md):
     configs/            physics.yaml, qc.yaml
     assets/unitree_g1/  G1 URDF (display), MJCF (retargeting), meshes, LICENSE (BSD-3, Unitree)
-    data/               cmu_metadata.csv (CMU motion descriptions)
+    assets/gmt_g1/      g1.xml: GMT's 23-DoF G1 MuJoCo model on those meshes (physics mode "없음 (MuJoCo)"),
+                        when GMT is installed (scripts\\install_gmt.ps1); its tracking policy is not staged
+    data/            cmu_metadata.csv (CMU motion descriptions)
     docs/               the documents (도움말 > 사용 안내 opens retlens.md), docs/research/
     ai/retlens/         SKILL.md, the guide for AI agents (retlens-cli, the local HTTP API)
     isaac/              khumanoid/ and tools/isaac_replay.py as plain files for Isaac Sim's Python
@@ -23,7 +25,9 @@ Licence-gated data (SMPL-X models, AMASS, LAFAN1) is never staged.
 """
 
 import argparse
+import filecmp
 import os
+import re
 import shutil
 import sys
 
@@ -36,6 +40,7 @@ ROBOT = "unitree_g1"
 ROBOT_FILES = ("g1_custom_collision_29dof.urdf", "g1_mocap_29dof.xml", "g1_mocap_29dof_with_hands.xml", "LICENSE",
                "README.md")
 SAMPLES = ("data/raw/cmu_bvh", "data/raw/cmu_c3d")  # CMU only: free to redistribute (not to sell)
+BUNDLED_MODEL = ("assets", "gmt_g1", "g1.xml")  # = khumanoid.settings.BUNDLED_G1_MODEL
 
 
 def _copy(src: str, dst: str, done: list) -> None:
@@ -52,7 +57,40 @@ def _copy_tree(src: str, dst: str, done: list, keep=lambda name: True) -> None:
                 _copy(os.path.join(d, f), os.path.join(dst, os.path.relpath(os.path.join(d, f), src)), done)
 
 
-def stage(out: str, samples: bool = False, assets_from: str | None = None) -> list[str]:
+def _stage_g1_mujoco(out: str, gmt_from: str | None, done: list) -> bool:
+    """GMT's 23-DoF G1 MuJoCo model (Apache-2.0, from Unitree's BSD-3 description) for the "없음 (MuJoCo)"
+    balance mode, pointed at the G1 meshes staged above. Its meshes are byte-identical to GMR's; when a
+    mesh is missing or differs the model is left out (the mode then says why). The tracking policy is
+    not staged: the installed program has no PyTorch, and GMT gives the model for research use only."""
+    from khumanoid import settings
+
+    root = gmt_from or settings.gmt_dir()
+    xml = os.path.join(root, settings.GMT_MODEL)
+    if not os.path.isfile(xml):
+        print(f"note: GMT not found ({xml}): the installed program's MuJoCo balance mode stays off")
+        return False
+    with open(xml, encoding="utf-8") as f:
+        text = f.read()
+    meshes = os.path.join(out, "assets", ROBOT, "meshes")
+    for name in sorted(set(re.findall(r'file="([^"]+)"', text))):
+        a, b = os.path.join(os.path.dirname(xml), "meshes", name), os.path.join(meshes, name)
+        if not (os.path.isfile(b) and filecmp.cmp(a, b, shallow=False)):
+            print(f"note: GMT's mesh {name} is not among the staged G1 meshes: MuJoCo balance mode left out")
+            return False
+    text, n = re.subn(r'meshdir="meshes"', f'meshdir="../{ROBOT}/meshes"', text)
+    if n != 1:
+        print("note: unexpected meshdir in GMT's g1.xml: MuJoCo balance mode left out")
+        return False
+    dst = os.path.join(out, *BUNDLED_MODEL)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    done.append(dst)
+    _copy(os.path.join(root, "LICENSE"), os.path.join(out, "licenses", "GMT-LICENSE.txt"), done)
+    return True
+
+
+def stage(out: str, samples: bool = False, assets_from: str | None = None, gmt_from: str | None = None) -> list[str]:
     """Copy the resources into `out` (made fresh); returns the files written."""
     out = os.path.abspath(out)
     if os.path.isdir(out):
@@ -86,6 +124,7 @@ def stage(out: str, samples: bool = False, assets_from: str | None = None) -> li
     lic = os.path.join(out, "licenses")
     _copy(os.path.join(ROOT, "khumanoid", "gmr", "LICENSE"), os.path.join(lic, "GMR-LICENSE.txt"), done)
     _copy(os.path.join(src, "LICENSE"), os.path.join(lic, "Unitree-G1-description-LICENSE.txt"), done)
+    _stage_g1_mujoco(out, gmt_from, done)
     if samples:
         for rel in SAMPLES:
             d = os.path.join(ROOT, *rel.split("/"))
@@ -114,8 +153,9 @@ def main() -> int:
     ap.add_argument("out", help="folder to (re)create")
     ap.add_argument("--samples", action="store_true", help="also copy the CMU sample motions (BVH, C3D)")
     ap.add_argument("--assets", default=None, help="GMR assets folder (default: ..\\GMR\\assets)")
+    ap.add_argument("--gmt", default=None, help="GMT folder for its G1 MuJoCo model (default: ..\\GMT or KHUMANOID_GMT_DIR)")
     args = ap.parse_args()
-    files = stage(args.out, args.samples, args.assets)
+    files = stage(args.out, args.samples, args.assets, args.gmt)
     size = sum(os.path.getsize(f) for f in files)
     print(f"staged {len(files)} files, {size / 1e6:.1f} MB -> {os.path.abspath(args.out)}")
     missing = check(os.path.abspath(args.out))

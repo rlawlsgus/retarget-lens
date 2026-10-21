@@ -8,6 +8,7 @@ JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"
     python tools/retlens_cli.py compare A B [--tol 3] [--no-heading] [--align]   # 겹쳐 비교 numbers
     python tools/retlens_cli.py align REF FILE [FILE ...]   # 기준에 시간 자동 정렬
     python tools/retlens_cli.py retarget FILE --out OUT.npz # save the robot motion (+ .json)
+      (commands that open motions take --smooth HZ, --foot-flat and --swing-clearance CM for human ones)
     python tools/retlens_cli.py c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
     python tools/retlens_cli.py physics FILE [--assist 1]   # Isaac PhysX check (needs the EULA accepted)
     python tools/retlens_cli.py video FILE --out X.mp4 [--physics]
@@ -34,10 +35,13 @@ def _log(msg) -> None:
     print(f"[retlens-cli] {msg}", file=sys.stderr, flush=True)
 
 
-def _scene():
+def _scene(args):
     from khumanoid.app import api_core
 
-    return api_core.headless_scene(log=_log)
+    if not 0.0 <= args.swing_clearance <= 10.0:
+        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    return api_core.headless_scene(log=_log, smooth=args.smooth, foot_flat=args.foot_flat,
+                                   swing_clearance_cm=args.swing_clearance)
 
 
 def _open(scene, files: list[str]):
@@ -94,14 +98,14 @@ def run(args) -> dict:
         from khumanoid.compare import load_item
 
         item = load_item(args.file, smooth=args.smooth, swing_clearance=args.swing_clearance / 100.0,
-                         smpl_model_dir=_smpl(), log=_log)
+                         foot_flat=args.foot_flat, smpl_model_dir=_smpl(), log=_log)
         item.robot.save_npz(args.out)
         with open(os.path.splitext(args.out)[0] + ".json", "w", encoding="utf-8") as f:
             json.dump(api_core.jsonable(item.info), f, ensure_ascii=False, indent=1)
         return {"out": os.path.abspath(args.out), "frames": item.robot.num_frames, "fps": item.robot.fps,
                 "kind": item.kind}
 
-    scene = _scene()
+    scene = _scene(args)
     try:
         if c == "inspect":
             return {"motions": [api_core.item_info(scene, it) for it in _open(scene, args.files)]}
@@ -143,7 +147,7 @@ def run(args) -> dict:
             return {"finished": done, "state": job.state, "video": result, "message": job.message or None}
         raise ValueError(f"unknown command {c}")
     finally:
-        scene.runner.shutdown()
+        scene.shutdown()
         scene.server.stop()
 
 
@@ -151,6 +155,15 @@ def _smpl():
     from khumanoid import paths, settings
 
     return settings.find_smpl().path or paths.smpl_model_dir()
+
+
+def _retarget_options(p) -> None:
+    """How human motions are retargeted (as RetLens's 리타게팅 menu; robot motions load as they are)."""
+    p.add_argument("--smooth", type=float, default=6.0, metavar="HZ", help="smoothing (0 = off; default 6)")
+    p.add_argument("--foot-flat", action="store_true",
+                   help="디딤발 평평 보정: soles of feet standing still parallel to the floor (heel-standing retargets)")
+    p.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
+                   help="스윙 발 보정: swing feet at least CM off the floor (0 = off; 2 recommended)")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -163,28 +176,32 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=200)
     p = sub.add_parser("inspect", help="load motions: QC, metrics, C3D QC")
     p.add_argument("files", nargs="+")
+    _retarget_options(p)
     p = sub.add_parser("metrics", help="the analysis table")
     p.add_argument("files", nargs="+")
     p.add_argument("--ref", default=None, help="reference motion (index or label; default the first)")
+    _retarget_options(p)
     p = sub.add_parser("compare", help="overlay comparison of B on A's pelvis")
     p.add_argument("a")
     p.add_argument("b")
     p.add_argument("--tol", type=float, default=3.0, help="tolerance (cm)")
     p.add_argument("--no-heading", action="store_true", help="match the pelvis position only, not its heading")
     p.add_argument("--align", action="store_true", help="time-align B to A first")
+    _retarget_options(p)
     p = sub.add_parser("align", help="time offsets that match every motion to REF")
     p.add_argument("ref")
     p.add_argument("files", nargs="+")
+    _retarget_options(p)
     p = sub.add_parser("retarget", help="retarget one human motion and save the robot motion")
     p.add_argument("file")
     p.add_argument("--out", required=True)
-    p.add_argument("--smooth", type=float, default=6.0)
-    p.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM")
+    _retarget_options(p)
     p = sub.add_parser("c3d-qc", help="raw marker QC of C3D files")
     p.add_argument("files", nargs="+")
     for name in ("physics", "video"):
         p = sub.add_parser(name, help="Isaac Sim " + ("physics check" if name == "physics" else "recording"))
         p.add_argument("file")
+        _retarget_options(p)
         p.add_argument("--timeout", type=float, default=1200.0)
         p.add_argument("--isaac-accept-eula", action="store_true",
                        help="only when the user accepted the NVIDIA Omniverse EULA (never on their behalf)")

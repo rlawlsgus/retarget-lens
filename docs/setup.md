@@ -114,6 +114,17 @@ Expand-Archive blender-4.5.14-windows-x64.zip -DestinationPath C:\blender
 - RetLens "환경 설정" → `$BLENDER` → `C:\blender\*\blender.exe` → PATH 순서로 찾습니다(`khumanoid/settings.py`). 다른 곳에 풀었으면 환경 설정에서 blender.exe를 고르거나 `BLENDER=<blender.exe 경로>`를 설정하세요.
 - 클립마다 Blender를 헤드리스로 띄워(약 2초) 관절 궤적을 뽑고 `data/cache/fbx/`에 캐시합니다. BVH·SMPL-X만 쓰면 Blender는 필요 없습니다.
 - 처음에는 PyPI `ufbx` 0.0.5(파이썬 바인딩)를 시험했지만, 노드 부모를 읽을 때 접근 위반으로 죽거나 틀린 값을 돌려줘 쓰지 않습니다(바인딩 이슈 #12와 같은 증상).
+
+### GMT 추적 정책: 균형 켬/끔 비교용 (선택, `..\GMT`)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_gmt.ps1
+```
+
+- [GMT](https://github.com/zixuan417/humanoid-general-motion-tracking)(General Motion Tracking, Apache-2.0)의 사전학습 G1 추적 정책·G1 모델·예제 동작을 고정 커밋(`2a590de`)에서 받습니다. 약 29 MB이고, 파일마다 git blob SHA-1을 확인합니다.
+- README에 "제공 모델은 연구용"이라고 적혀 있습니다. 설치판에는 넣지 않습니다.
+- 받은 폴더는 env에 연결하지 않습니다. `tools/policy_replay.py`가 `..\GMT`(또는 `KHUMANOID_GMT_DIR`)에서 읽고, 정책은 env의 torch(CPU)로 돌립니다.
+
 ## 3. Python 환경 `k-humanoid`
 
 정의는 [environment.yml](../environment.yml)이고, 개발 PC에 실제로 설치된 버전은 아래와 같습니다. 같은 패키지 빌드까지 맞추려면 4절의 잠금 파일을 쓰세요.
@@ -206,7 +217,7 @@ pip 패키지(mink, smplx)는 잠금 파일에 들어가지 않아 따로 설치
 
 ```powershell
 conda activate k-humanoid
-python -m pytest tests                     # 2026-10-19: 68 passed (G1 에셋, AMASS·SMPL-X 파일, Blender·FBX 샘플이 없으면 해당 테스트만 skip)
+python -m pytest tests                     # 2026-10-21: 72 passed (G1 에셋, AMASS·SMPL-X 파일, Blender·FBX 샘플이 없으면 해당 테스트만 skip)
 python -c "import mink, mujoco; from khumanoid import gmr; print(mujoco.__version__, gmr.GMR_COMMIT[:7])"   # 3.11.0 bb1bbe4
 python tools\retarget.py data\raw\cmu_bvh\02_01.bvh --smooth 6 --out-dir $env:TEMP\khumanoid_check
 #   -> 86 frames @ 30 fps, residual feet 약 0.66 cm

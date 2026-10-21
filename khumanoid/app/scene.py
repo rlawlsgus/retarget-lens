@@ -24,7 +24,7 @@ from typing import Callable
 
 import numpy as np
 
-from .. import analysis, paths, settings
+from .. import analysis, paths, policy_runner, settings
 from ..compare import Item, compute_metrics, load_item
 from ..diagnosis import CAUSE_KO
 from ..io import urdf_joint_limits
@@ -35,7 +35,22 @@ from .robots import REGIONS, OverlayBatch, RobotBatch, align_on_pelvis, set_prop
 ROOT = paths.REPO_ROOT
 DEFAULT_URDF = paths.robot_urdf()  # dev: ..\GMR\assets\unitree_g1\...; installed: shipped with the program
 PHYSICS_CACHE = paths.cache_dir("physics")
+POLICY_CACHE = paths.cache_dir("policy")
 VIDEO_DIR = paths.video_dir()
+# 균형 제어 in physics mode: Isaac PhysX with the pelvis harness (its scale: MotionScene.assist), or
+# MuJoCo with no controller / with GMT's tracking policy (khumanoid/policy_runner.py)
+BALANCE = {"isaac": "보조 힘 (Isaac)", "pd": "없음 (MuJoCo)", "gmt": "추적 정책 (GMT)"}
+BALANCE_TAG = {"pd": "MuJoCo 제어 없음", "gmt": "GMT"}  # in the robots' labels
+# 리타게팅 보정 (MotionScene.set_retarget) as the front ends offer it
+SWING_CLEARANCE_CM = 2.0  # the recommended swing clearance (docs/pipeline.md)
+RETARGET_NOTE = "다음에 여는 사람 모션부터 적용됩니다. 이미 연 모션은 그대로라, 같은 파일을 다시 열면 보정 전후를 나란히 봅니다"
+RETARGET_TIPS = {
+    "foot_flat": "서 있는 발의 발바닥을 바닥과 평평하게 맞춥니다(발목 pitch·roll만, 움직이는 발은 그대로). CMU 143번처럼 "
+                 "발끝이 들린 채 뒤꿈치로만 서는 리타겟용이고, 뒤꿈치가 0.5–2 cm 뜰 수 있습니다",
+    "swing": f"바닥을 스치는 스윙 발을 바닥에서 {SWING_CLEARANCE_CM:g} cm 이상 띄웁니다(권장 설정). 물리에서 발끝이 걸려 "
+             "넘어지는 것을 줄입니다",
+}
+FALL_RULE_KO = {"tilt": "기울어짐", "low": "골반 낮음", "drop": "원본보다 낮음"}  # policy_replay's fall rules
 PALETTE = [(230, 90, 50), (50, 125, 215), (60, 165, 90), (150, 90, 190), (215, 165, 40), (110, 110, 110),
            (0, 160, 170), (200, 70, 140)]
 GRAPH_FIXED = ("골반 높이 (m)", "골반 수평속도 (m/s)")
@@ -47,19 +62,22 @@ METRIC_ROWS = [  # (label, metrics key, format)
     ("CoM 지지 밖 (%)", "com_out_pct", "{:.1f}"), ("ZMP 지지 밖 (%)", "zmp_out_pct", "{:.1f}"),
     ("정적 불균형 (%)", "static_unbalanced_pct", "{:.1f}"), ("QC", "qc", "{}"),
     ("물리: 보조 힘 (체중 %)", "phys_harness_pct", "{:.1f}"), ("물리: 넘어짐", "phys_falls", "{}"),
+    ("물리: 몸 위치 오차 (cm)", "phys_body_error_cm", "{:.1f}"),
     ("물리: 토크 한계 초과 (%)", "phys_saturated_pct", "{:.1f}"), ("물리 판정", "phys_ok", "{}"),
 ]
 METRIC_NOTES = (
     "RMSE: 기준과 겹치는 구간의 관절별 RMSE 중앙값(시간 오프셋 반영). 발 미끄러짐: 발바닥 전체가 붙은 채 0.3 m/s 이상으로 "
     "0.1 s 이상 움직인 프레임 비율. 바닥 관통: 발 최저점 -2 cm 아래 프레임 비율. 스윙 발 바닥 근접: 가장 느린 발바닥 점까지 "
     "0.5 m/s 넘게 움직이는 발이 그때의 바닥(디딤발 높이를 따라감) 1 cm 안을 지나는 비율(물리에서 발끝이 걸림). 물리 행: "
-    "Isaac PhysX 결과(물리 모드, 또는 isaac_replay.py --physics 결과 파일)만 - 골반 보조 힘 평균(체중 대비), 넘어짐 수, "
-    "관절 토크 한계를 넘은 프레임 비율. 물리 모드에서는 다른 행도 시뮬레이션된 동작으로 잽니다.")
+    "시뮬레이션 결과(물리 모드, 또는 isaac_replay.py --physics / policy_replay.py 결과 파일)만 - 골반 보조 힘 평균(체중 대비, "
+    "MuJoCo는 0), 넘어짐 수, 몸 위치 오차(MuJoCo만), 관절 토크 한계를 넘은 비율. 물리 모드에서는 다른 행도 시뮬레이션된 "
+    "동작으로 잽니다.")
 # Every row of metric_table, by topic, with what it measures (the editor shows these on hover).
 METRIC_HELP = [
     ("기본", [
         ("재생 방식", "기구학 = 리타게팅 결과를 그대로 재생합니다. 물리 x1 = Isaac PhysX로 시뮬레이션한 결과이고, "
-                   "x 뒤 숫자는 골반 보조 힘 배율입니다(x0 = 보조 없음)."),
+                   "x 뒤 숫자는 골반 보조 힘 배율입니다(x0 = 보조 없음). MuJoCo · 없음 / GMT = MuJoCo에서 제어기 없이(개루프 PD) "
+                   "또는 GMT 추적 정책으로 보조 힘 없이 시뮬레이션한 결과입니다."),
         ("길이 (s)", "모션 길이."),
     ]),
     ("매끄러움 (클수록 떨림)", [
@@ -85,11 +103,13 @@ METRIC_HELP = [
         ("기준 대비 전체 RMSE (°)", "같은 방식으로 모든 관절의 RMSE 중앙값."),
         ("QC", "검증 결과: PASS / WARN / FAIL (docs/pipeline.md의 \"검증(QC) 기준\")."),
     ]),
-    ("물리 (Isaac PhysX 결과에만)", [
-        ("물리: 보조 힘 (체중 %)", "골반을 받쳐 준 보조 힘의 평균, 체중 대비."),
-        ("물리: 넘어짐", "시뮬레이션에서 넘어진 횟수."),
-        ("물리: 토크 한계 초과 (%)", "관절 토크가 모터 한계를 넘은 프레임 비율."),
-        ("물리 판정", "통과, 또는 걸린 기준들(넘어짐, 보조 힘 과다, 토크 한계 초과 등). 칸에는 첫 항목만 나옵니다."),
+    ("물리 (시뮬레이션 결과에만)", [
+        ("물리: 보조 힘 (체중 %)", "골반을 받쳐 준 보조 힘의 평균, 체중 대비. MuJoCo(균형 제어 없음·GMT)는 보조 힘이 없어 0입니다."),
+        ("물리: 넘어짐", "시뮬레이션에서 넘어진 횟수(클립 안). 넘어지면 그 시각의 원본 자세로 다시 시작해 셉니다."),
+        ("물리: 몸 위치 오차 (cm)", "MuJoCo 결과만: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치가 원본과 다른 정도의 평균. "
+                              "추적 정책은 관절을 바꿔서라도 몸을 원본 자리에 두려 하므로, 관절 RMSE보다 이 값이 따라간 정도를 잘 보여 줍니다."),
+        ("물리: 토크 한계 초과 (%)", "관절 토크가 모터 한계를 넘은 비율(Isaac은 프레임, MuJoCo는 1 ms 스텝)."),
+        ("물리 판정", "통과, 또는 걸린 기준들(넘어짐, 보조 힘 과다, 토크 한계 초과 등; MuJoCo는 넘어짐만). 칸에는 첫 항목만 나옵니다."),
     ]),
 ]
 METRIC_HELP_FOOTER = "물리 모드에서는 물리 행 말고 다른 행도 시뮬레이션된 동작으로 잽니다."
@@ -175,6 +195,7 @@ class SceneOptions:
     robot: str = "unitree_g1"
     urdf: str = DEFAULT_URDF
     smooth: float = 6.0
+    foot_flat: bool = False
     swing_clearance_cm: float = 0.0
     fps: float = 30.0
     csv_fps: float = 30.0
@@ -184,6 +205,7 @@ class SceneOptions:
     isaac_accept_eula: bool = False
     video_dir: str = VIDEO_DIR
     library: list | None = None
+    balance: str = "isaac"  # 균형 제어 in physics mode (BALANCE)
 
 
 def add_scene_arguments(ap) -> None:
@@ -192,6 +214,9 @@ def add_scene_arguments(ap) -> None:
     ap.add_argument("--robot", default="unitree_g1", help="GMR robot for retargeting (default unitree_g1)")
     ap.add_argument("--urdf", default=DEFAULT_URDF, help="robot URDF for display")
     ap.add_argument("--smooth", type=float, default=6.0, help="smoothing for retargeted inputs (Hz, 0 = off)")
+    ap.add_argument("--foot-flat", action="store_true",
+                    help="retargeted inputs: turn the soles of feet standing still parallel to the floor "
+                         "(for retargets that stand on their heels, CMU subject 143)")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
                     help="lift swing feet of retargeted inputs to at least CM off the floor (0 = off; 2 recommended)")
     ap.add_argument("--fps", type=float, default=30.0, help="retarget output frame rate")
@@ -206,6 +231,9 @@ def add_scene_arguments(ap) -> None:
                     help="folder to list in the motion picker (repeatable; default: data/raw, data/samples, "
                          "data/retargeted, data/uploads, reports and the 환경 설정 folders)")
     ap.add_argument("--physics", action="store_true", help="start in physics mode")
+    ap.add_argument("--balance", choices=tuple(BALANCE), default="isaac",
+                    help="physics mode's balance control: isaac = Isaac PhysX with the pelvis harness (default), "
+                         "pd = MuJoCo with no controller, gmt = MuJoCo with GMT's tracking policy")
     ap.add_argument("--video-dir", default=None, help="where \"동영상 저장\" writes its MP4s (default: 환경 설정, "
                                                       "else reports/videos/viewer)")
     ap.add_argument("--physics-config", default=PHYSICS_CONFIG, help="PhysX settings for physics mode (yaml)")
@@ -217,10 +245,11 @@ def scene_options(args) -> SceneOptions:
     """Options from the command line; what it leaves out comes from 환경 설정 (khumanoid.settings)."""
     s = settings.load()
     smpl = args.smpl_model_dir or settings.find_smpl(s).path or paths.smpl_model_dir()
-    return SceneOptions(robot=args.robot, urdf=args.urdf, smooth=args.smooth, swing_clearance_cm=args.swing_clearance,
-                        fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
+    return SceneOptions(robot=args.robot, urdf=args.urdf, smooth=args.smooth, foot_flat=getattr(args, "foot_flat", False),
+                        swing_clearance_cm=args.swing_clearance, fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
                         physics_config=args.physics_config, isaac_accept_eula=args.isaac_accept_eula,
-                        video_dir=args.video_dir or settings.video_dir(s), library=args.library)
+                        video_dir=args.video_dir or settings.video_dir(s), library=args.library,
+                        balance=getattr(args, "balance", "isaac"))
 
 
 @dataclass
@@ -286,7 +315,8 @@ class MotionScene:
         self.playing = False
         self.physics_on = False
         self.assist = 1.0
-        self.phys_error = ""
+        self.balance = self.opts.balance if self.opts.balance in BALANCE else "isaac"
+        self._phys_errors: dict = {}  # per phys_key: why its runs cannot start
         self._version = 0  # bumped by every event; with the time and settings it decides redraws
         self._drawn_key, self._drawn_at = None, 0.0
         self._listeners: list[Callable[[str, object], None]] = []
@@ -298,6 +328,7 @@ class MotionScene:
         self.limits = urdf_joint_limits(self.opts.urdf)
         self.runner = PhysicsRunner(PHYSICS_CACHE, physics_config=self.opts.physics_config,
                                     accept_eula=self.opts.isaac_accept_eula, log=self.log)
+        self.policy = policy_runner.PolicyRunner(POLICY_CACHE, physics_config=self.opts.physics_config, log=self.log)
         self.robots = RobotBatch(server, urdf)  # every robot's meshes, posed together each tick
         self.overlays = OverlayBatch(server)  # skeletons, support polygons, CoM / ZMP of all motions
         self.compare = CompareSettings()
@@ -329,7 +360,7 @@ class MotionScene:
         o = self.opts
         item = load_item(path, robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps,
                          smpl_model_dir=o.smpl_model_dir, swing_clearance=o.swing_clearance_cm / 100.0,
-                         log=self.log)
+                         foot_flat=o.foot_flat, log=self.log)
         compute_metrics(item, self.fk, self.limits)
         with self.lock:
             used = {it.color for it in self.items}
@@ -357,7 +388,7 @@ class MotionScene:
                 if job is not None and job.active and not any(
                         job in [*it.handles.get("phys_jobs", {}).values(), it.handles.get("video_job")]
                         for it in self.items if it is not item):
-                    self.runner.cancel(job)
+                    self._cancel(job)
             for k, h in reversed(list(item.handles.items())):  # children (robot meshes) before their parent frame
                 if k.startswith("ui_"):  # front-end widgets: the front end removes them
                     continue
@@ -586,9 +617,30 @@ class MotionScene:
         self.opts.video_dir = settings.video_dir(s)
         self.emit("status")
 
+    def retarget_settings(self) -> dict:
+        """How human motions opened from now on are retargeted (each motion keeps its own, Item.retarget)."""
+        o = self.opts
+        return {"smooth_hz": o.smooth, "foot_flat": o.foot_flat, "swing_clearance_cm": o.swing_clearance_cm}
+
+    def set_retarget(self, foot_flat: bool | None = None, swing_clearance_cm: float | None = None) -> dict:
+        """리타게팅 보정 for the human motions opened from now on: 디딤발 평평 (foot_flat) and
+        스윙 발 보정 (swing_clearance_cm, 0 = off). Open motions keep how they were made, so opening
+        the same file again shows the two side by side."""
+        if foot_flat is not None:
+            self.opts.foot_flat = bool(foot_flat)
+        if swing_clearance_cm is not None:
+            if not 0.0 <= float(swing_clearance_cm) <= 10.0:
+                raise ValueError("swing_clearance_cm must be 0 (off) to 10")
+            self.opts.swing_clearance_cm = float(swing_clearance_cm)
+        r = self.retarget_settings()
+        self.log(f"retarget settings for motions opened next: foot-flat {'on' if r['foot_flat'] else 'off'}, "
+                 f"swing clearance {r['swing_clearance_cm']:g} cm")
+        self.emit("status")
+        return r
+
     # ---------------------------------------------------------------- playback
     def time_range(self) -> tuple[float, float]:
-        end = max([it.offset + it.robot.duration for it in self.items] or [1.0])
+        end = max([it.offset + self.shown(it).robot.duration for it in self.items] or [1.0])  # MuJoCo: + the hold
         start = min([it.offset for it in self.items] or [0.0])
         return min(0.0, start), max(end, 0.1)
 
@@ -620,10 +672,10 @@ class MotionScene:
                 else:
                     self.t, self.playing = hi, False
                     self.emit("time")
-        key = (self.t, self.physics_on, self.assist, self._version, astuple(self.view), self.compare.key(),
+        key = (self.t, self.physics_on, self.phys_key, self._version, astuple(self.view), self.compare.key(),
                tuple((id(it), it.visible, it.show_human, it.offset) for it in self.items))
         now = time.perf_counter()
-        if key == self._drawn_key and not (self.runner.busy() and now - self._drawn_at > 0.5):
+        if key == self._drawn_key and not (self.jobs_busy() and now - self._drawn_at > 0.5):
             return  # labels still show job progress twice a second
         self._drawn_key, self._drawn_at = key, now
         # one atomic group per frame: the client applies the frame at once, and viser wakes its
@@ -719,15 +771,18 @@ class MotionScene:
         if self.is_physics_result(item):
             note = self.fall_note(item, local)
             text += " · 물리 결과 파일" + (f" · {note}" if note else "")
+        elif self.is_policy_result(item):
+            note = self.fall_note(item, local)
+            text += " · MuJoCo 재생 결과" + (f" · {note}" if note else "")
         elif self.physics_on:
             if src is item:  # not computed yet: still the joint angles
-                job = h.get("phys_jobs", {}).get(self.assist)
+                job = h.get("phys_jobs", {}).get(self.phys_key)
                 text += (" · 물리 대기" if job is not None and job.state == "queued" else
                          f" · 물리 계산 {100 * job.progress:.0f}%" if job is not None and job.state == "running" else
                          " · 물리 실패 (기구학 표시)")
             else:
                 note = self.fall_note(src, local)
-                text += f" · 물리 · {note}" if note else " · 물리"
+                text += self._result_tag(src) + (f" · {note}" if note else "")
         if role is not None:
             text += " · 비교 기준 (반투명)" if role == "A" else " · 비교 대상 (벗어난 부위만 색칠)"
         if h.get("label_text") != text:  # one message less per robot per frame
@@ -795,7 +850,16 @@ class MotionScene:
     # ---------------------------------------------------------------- physics mode
     @staticmethod
     def is_physics_result(item: Item) -> bool:
+        """An Isaac PhysX result file (tools/isaac_replay.py --physics)."""
         return item.kind.startswith("Isaac PhysX")
+
+    @staticmethod
+    def is_policy_result(item: Item) -> bool:
+        """A MuJoCo balance on / off result (tools/policy_replay.py): already simulated too."""
+        return "policy_replay" in item.info
+
+    def is_sim_result(self, item: Item) -> bool:
+        return self.is_physics_result(item) or self.is_policy_result(item)
 
     def set_physics(self, on: bool, why: str = "button") -> None:
         self.log(f"physics mode {'on' if on else 'off'} ({why})")
@@ -806,30 +870,67 @@ class MotionScene:
         self.assist = float(assist)
         self._physics_changed()
 
+    def set_balance(self, mode: str) -> None:
+        """균형 제어 (BALANCE): Isaac with the harness, or MuJoCo with no controller / GMT. Each
+        motion keeps the results of every mode, so switching back is instant."""
+        if mode not in BALANCE:
+            raise ValueError(f"balance must be one of {tuple(BALANCE)}")
+        self.log(f"balance control: {BALANCE[mode]}")
+        self.balance = mode
+        self._physics_changed()
+
+    @property
+    def phys_key(self):
+        """Which result physics mode shows: the harness scale (Isaac) or the MuJoCo controller."""
+        return self.assist if self.balance == "isaac" else self.balance
+
+    @staticmethod
+    def key_label(key) -> str:
+        return f"보조 힘 x{key:g} (Isaac)" if not isinstance(key, str) else BALANCE[key]
+
+    def mode_label(self) -> str:
+        """'보조 힘 x1 (Isaac)', '없음 (MuJoCo)', '추적 정책 (GMT)'."""
+        return self.key_label(self.phys_key)
+
+    @property
+    def phys_error(self) -> str:
+        """Why the current mode's runs cannot start ('' when they can)."""
+        return self._phys_errors.get(self.phys_key, "")
+
+    def balance_problem(self, mode: str) -> str:
+        """'' when this 균형 제어 can run here, else why not (Isaac: checked when a run starts)."""
+        return "" if mode == "isaac" else self.policy.problem(mode)
+
     def _physics_changed(self) -> None:
         for it in list(self.items):
             self._request_physics(it)
         self.emit("status")
 
     def _request_physics(self, item: Item) -> None:
-        """Start (or find) the physics run of this motion for the current harness setting."""
-        if not self.physics_on or self.is_physics_result(item):
+        """Start (or find) the physics run of this motion for the current mode (harness setting or
+        MuJoCo controller)."""
+        if not self.physics_on or self.is_sim_result(item):
             return
-        assist = self.assist
+        key = self.phys_key
         jobs = item.handles.setdefault("phys_jobs", {})
-        if assist in item.handles.setdefault("phys", {}) or (assist in jobs and jobs[assist].state not in
-                                                               ("failed", "cancelled")):
+        if key in item.handles.setdefault("phys", {}) or (key in jobs and jobs[key].state not in
+                                                            ("failed", "cancelled")):
             return
+        done = lambda j, it=item, k=key: self._physics_done(it, j, k)  # noqa: E731
         try:
-            jobs[assist] = self.runner.request(item.robot, assist, on_done=lambda j, it=item: self._physics_done(it, j))
-            self.phys_error = ""
-        except Exception as e:  # Isaac Sim not found
-            self.phys_error = f"{type(e).__name__}: {e}"
-            self.log(f"physics unavailable: {self.phys_error}")
+            if self.balance == "isaac":
+                jobs[key] = self.runner.request(item.robot, key, on_done=done)
+            else:
+                jobs[key] = self.policy.request(item.robot, key, on_done=done, info={
+                    "label": item.label, "kind": item.kind, "source": item.source, **item.retarget})
+            self._phys_errors.pop(key, None)
+        except Exception as e:  # Isaac Sim / GMT not found
+            self._phys_errors[key] = f"{type(e).__name__}: {e}" if self.balance == "isaac" else str(e)
+            self.log(f"physics unavailable ({self.key_label(key)}): {self._phys_errors[key]}")
         self.emit("status")
 
-    def _physics_done(self, item: Item, job: PhysicsJob) -> None:
-        """Worker thread: load the simulated motion as the item's physics view."""
+    def _physics_done(self, item: Item, job, key) -> None:
+        """Worker thread: load the simulated motion as the item's physics view for this mode."""
         if job.state == "done":
             try:
                 phys = load_item(job.result, log=None)
@@ -841,37 +942,95 @@ class MotionScene:
                     if item not in self.items:
                         return
                     phys.handles["map"] = self._joint_map(phys.robot)
-                    item.handles.setdefault("phys", {})[job.assist] = phys
+                    item.handles.setdefault("phys", {})[key] = phys
                 self.emit("item", item)
         self.emit("status")
 
+    def _cancel(self, job) -> None:
+        (self.policy if job.kind == "policy" else self.runner).cancel(job)
+
     def cancel_jobs(self) -> None:
-        """Stop every queued or running Isaac job (physics runs and videos)."""
+        """Stop every queued or running job (Isaac physics runs and videos, MuJoCo runs)."""
         for it in list(self.items):
             for job in [*it.handles.get("phys_jobs", {}).values(), it.handles.get("video_job")]:
                 if job is not None and job.active:
-                    self.runner.cancel(job)
+                    self._cancel(job)
         self.emit("status")
+
+    def jobs_busy(self) -> bool:
+        return self.runner.busy() or self.policy.busy()
+
+    def shutdown(self) -> None:
+        """Stop the job workers and any running Isaac process (call on exit)."""
+        self.policy.shutdown()
+        self.runner.shutdown()
 
     def shown(self, item: Item) -> Item:
         """What is drawn and measured for this motion: its physics result in physics mode
         (once computed), else the motion itself."""
         if self.physics_on:
-            phys = item.handles.get("phys", {}).get(self.assist)
+            phys = item.handles.get("phys", {}).get(self.phys_key)
             if phys is not None:
                 return phys
         return item
+
+    def result_text(self, phys: Item) -> str:
+        """'넘어짐 0 · 몸 위치 오차 4.5 cm · ...' of a simulated motion."""
+        m = phys.metrics
+        pol = phys.info.get("policy_replay")
+        if pol:
+            hold = f" (+{pol['hold_falls']} 끝난 뒤)" if pol.get("hold_falls") else ""
+            err = f"{m['phys_body_error_cm']:.1f}" if m.get("phys_body_error_cm") is not None else "-"
+            return (f"넘어짐 {m.get('phys_falls', '-')}{hold} · 몸 위치 오차 {err} cm · "
+                    f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
+        return (f"넘어짐 {m.get('phys_falls', '-')} · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중 · "
+                f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
+
+    def _result_tag(self, phys: Item) -> str:
+        """The label's part for a computed physics result."""
+        pol = phys.info.get("policy_replay")
+        if not pol:
+            return " · 물리"
+        err = phys.metrics.get("phys_body_error_cm")
+        return (f" · {BALANCE_TAG.get(pol.get('controller'), 'MuJoCo')} · 넘어짐 {pol.get('falls', '-')}회"
+                + (f" · 몸 오차 {err:.1f} cm" if err is not None else ""))
+
+    def results_overview(self, item: Item) -> list[tuple[str, str]]:
+        """(mode, result) for every physics mode computed for this motion so far, Isaac first."""
+        phys = item.handles.get("phys", {})
+        keys = sorted(phys, key=lambda k: (isinstance(k, str), list(BALANCE).index(k) if isinstance(k, str) else -k))
+        return [(self.key_label(k), self.result_text(phys[k])) for k in keys]
+
+    def physics_status(self) -> str:
+        """Physics mode at a glance (status bars): the mode, and the falls / body error of the
+        motions computed in it."""
+        if not self.physics_on:
+            return "물리 모드: 꺼짐"
+        text = f"물리 모드: {self.mode_label()}"
+        done = [p for it in list(self.items) if not self.is_sim_result(it)
+                and (p := it.handles.get("phys", {}).get(self.phys_key)) is not None]
+        if done:
+            falls = sum(p.metrics.get("phys_falls") or 0 for p in done)
+            text += f" · 넘어짐 {falls}회"
+            errs = [p.metrics["phys_body_error_cm"] for p in done if p.metrics.get("phys_body_error_cm") is not None]
+            if errs:
+                text += f" · 몸 위치 오차 {np.mean(errs):.1f} cm"
+            if len(done) > 1:
+                text += f" (모션 {len(done)}개 합·평균)"
+        return text
 
     def job_text(self, item: Item) -> str:
         """One-line physics state of a motion."""
         if self.is_physics_result(item):
             return "이미 물리 결과입니다"
-        phys = item.handles.get("phys", {}).get(self.assist)
+        if self.is_policy_result(item):
+            m = item.info["policy_replay"]
+            return (f"MuJoCo 재생 결과 ({item.info.get('controller_label') or m.get('controller')}) · 넘어짐 "
+                    f"{m.get('falls', '-')} · 몸 위치 오차 {m.get('body_error_cm', '-')} cm")
+        phys = item.handles.get("phys", {}).get(self.phys_key)
         if phys is not None:
-            m = phys.metrics
-            return (f"완료 · 넘어짐 {m.get('phys_falls', '-')} · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중 · "
-                    f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
-        job = item.handles.get("phys_jobs", {}).get(self.assist)
+            return f"완료 · {self.result_text(phys)}"
+        job = item.handles.get("phys_jobs", {}).get(self.phys_key)
         if job is None:
             return f"실행할 수 없음: {self.phys_error}" if self.phys_error else "아직 계산 안 함"
         if job.state == "running":
@@ -883,14 +1042,23 @@ class MotionScene:
         return f"{job.stage}: {job.message}" if job.message and job.message != job.stage else job.stage
 
     def jobs_summary(self) -> str:
-        """'물리 계산 1개 · 동영상 2개' for the jobs queued or running, '' when idle."""
-        phys = sum(1 for it in list(self.items) for j in it.handles.get("phys_jobs", {}).values() if j.active)
+        """'물리 계산 1개 · MuJoCo 계산 1개 · 동영상 2개' for the jobs queued or running, '' when idle."""
+        jobs = [j for it in list(self.items) for j in it.handles.get("phys_jobs", {}).values() if j.active]
+        phys = sum(1 for j in jobs if j.kind != "policy")
+        mujoco = len(jobs) - phys
         vids = sum(1 for it in list(self.items) if (j := it.handles.get("video_job")) is not None and j.active)
-        parts = ([f"물리 계산 {phys}개"] if phys else []) + ([f"동영상 {vids}개"] if vids else [])
+        parts = ([f"물리 계산 {phys}개"] if phys else []) + ([f"MuJoCo 계산 {mujoco}개"] if mujoco else []) \
+            + ([f"동영상 {vids}개"] if vids else [])
         return " · ".join(parts)
 
     def fall_note(self, phys: Item, local: float) -> str:
-        """'넘어짐 2.07s · 발끝 걸림 1.47s부터' from the first cause's onset until shortly after the fall."""
+        """'넘어짐 2.07s · 발끝 걸림 1.47s부터' from the first cause's onset until shortly after the fall
+        (MuJoCo results: '넘어짐 2.07s · 기울어짐', the rule that called it a fall)."""
+        if "policy_replay" in phys.info:
+            for t, rule in self.falls_of(phys):
+                if t <= local <= t + 0.5:
+                    return f"넘어짐 {t:.2f}s · {rule}"
+            return ""
         for d in (phys.info.get("physics", {}).get("fall_diagnosis") or []):
             t, onset = d.get("fall_time_s", 0.0), d.get("primary_onset_s")
             start = onset if onset is not None else t
@@ -904,29 +1072,44 @@ class MotionScene:
 
     def falls(self, item: Item) -> list[tuple[float, str]]:
         """(time, first cause) of each fall in what is shown for this motion."""
-        src = self.shown(item)
+        return self.falls_of(self.shown(item))
+
+    @staticmethod
+    def falls_of(src: Item) -> list[tuple[float, str]]:
+        pol = src.info.get("policy_replay")
+        if pol:  # MuJoCo: the fall rule, and the falls while holding the last pose after the clip
+            rules = pol.get("fall_causes") or []
+            return [(t, FALL_RULE_KO.get(r, r)) for t, r in zip(pol.get("fall_times_s") or [], rules)] \
+                + [(t, "클립이 끝난 뒤") for t in pol.get("hold_fall_times_s") or []]
         p = src.info.get("physics", {})
         diag = {round(d.get("fall_time_s", 0.0), 3): d.get("primary_cause") for d in p.get("fall_diagnosis") or []}
         return [(t, CAUSE_KO.get(diag.get(round(t, 3)), "")) for t in p.get("fall_times_s") or []]
 
     # ---------------------------------------------------------------- video
     def save_video(self, item: Item) -> PhysicsJob:
-        """Queue an Isaac recording of this motion (its physics result in physics mode);
-        raises when Isaac Sim is not found."""
-        physics = self.physics_on and not self.is_physics_result(item)
-        mode = f"physics_x{self.assist:g}" if physics else "kinematic"
+        """Queue an Isaac recording of this motion (its physics result in physics mode; with a
+        MuJoCo 균형 제어, Isaac replays the MuJoCo result as it is); raises when Isaac Sim is not
+        found, or when the MuJoCo result is not there yet."""
+        physics = self.physics_on and not self.is_sim_result(item)
+        robot, mode, what = item.robot, "kinematic", "kinematic"
+        if physics and self.balance != "isaac":
+            shown = self.shown(item)
+            if shown is item:
+                raise RuntimeError(f"{BALANCE[self.balance]} 결과가 아직 없습니다. 계산이 끝나면 다시 저장하세요")
+            robot, mode, what, physics = shown.robot, f"mujoco_{self.balance}", f"MuJoCo {self.balance}", False
+        elif physics:
+            mode = what = f"physics_x{self.assist:g}"
         stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.label).strip("_") or "motion"
         path = os.path.join(self.opts.video_dir, f"{stem}_{mode}.mp4")
         human = item.source if item.human is not None else None
         if item.info.get("solved_motion"):  # C3D: Isaac draws a human in its file's own frame, so use the solved skeleton
             human = item.info["solved_motion"]
-        motion = replace(item.robot, name=stem)  # the video caption shows this name, not the cache file's
+        motion = replace(robot, name=stem)  # the video caption shows this name, not the cache file's
         job = self.runner.request_video(motion, path, human=human, physics=physics, assist=self.assist,
                                         smpl_model_dir=self.opts.smpl_model_dir,
                                         on_done=lambda j, it=item: self._video_done(it, j))
         item.handles["video_job"] = job
-        self.log(f"video {'queued' if job.active else 'exists'}: {item.label} "
-                 f"({'physics x' + format(self.assist, 'g') if physics else 'kinematic'})")
+        self.log(f"video {'queued' if job.active else 'exists'}: {item.label} ({what})")
         self.emit("item", item)
         self.emit("status")
         return job
@@ -960,6 +1143,15 @@ class MotionScene:
         res = item.info.get("ik_position_residual")
         if res:
             rows.append(("IK 잔차(평균)", ", ".join(f"{k} {v['mean_cm']} cm" for k, v in res.items())))
+        ff = item.info.get("foot_flat")
+        if ff:  # retargeted with 디딤발 평평 보정 (khumanoid.retarget.flatten_stance_feet)
+            side = {"left": "왼", "right": "오"}
+            pitch = ", ".join(f"{side.get(s, s)} {p['before']:g}° → {p['after']:g}°"
+                              for s, p in ff.get("stance_pitch_deg", {}).items() if p.get("before") is not None)
+            n = ff.get("frames_changed", 0)
+            rows.append(("디딤발 평평", "켬 · 바뀐 프레임 없음" if not n else
+                         f"{n}프레임 고침" + (f" · 디딤 중 발 pitch {pitch}" if pitch else "")
+                         + f" · 뒤꿈치 뜸 평균 {ff['sole_lift_cm']['mean']:g} / 최대 {ff['sole_lift_cm']['max']:g} cm"))
         c3d = item.info.get("c3d")
         if c3d:  # raw markers drawn on the robot of the same take's solved skeleton
             extra = (f" (파일에는 Vicon 모델 계산값까지 점 {c3d['points']}개)" if c3d["points"] != c3d["markers"] else "")
@@ -975,13 +1167,18 @@ class MotionScene:
             rows.append(("로봇 동작", f"{solved} 리타겟 · 마커를 그 좌표로 {c3d['yaw_deg']:.0f}° 돌려 "
                                     f"맞춤 (골반 잔차 {c3d['residual_cm']:.1f} cm)"))
         if m.get("phys_ok"):
-            rows.append(("물리 결과", f"{m['phys_ok']} · 보조 힘 {m['phys_harness_pct']:.0f}% 체중 · 넘어짐 "
-                                    f"{m['phys_falls']} · 토크 한계 초과 {m['phys_saturated_pct']:.1f}%"))
+            rows.append(("물리 결과", f"{m['phys_ok']} · {self.result_text(item)}"))
         if self.is_physics_result(item):
             ref = item.info.get("reference_motion")
             rows.append(("참고", "이미 Isaac 물리 결과인 파일이라 물리 모드를 켜고 꺼도 그대로이고, 로봇 관절각만 있어 사람 "
                                  "스켈레톤이 없습니다. 사람과 나란히 보려면 원본 사람 모션을 추가하고 물리 모드를 켜세요."
                                  + (f" 원래 로봇 동작: {rel(ref)}" if ref else "")))
+        if self.is_policy_result(item):
+            p = item.info["policy_replay"]
+            rows.append(("참고", f"MuJoCo에서 시뮬레이션한 동작입니다"
+                                 f"({item.info.get('controller_label') or p.get('controller')}, 보조 힘 없음, 넘어짐 "
+                                 f"{p.get('falls', '-')}). 물리 모드를 켜도 Isaac으로 다시 계산하지 않습니다. 원본: "
+                                 f"{rel(item.info['source']) if item.info.get('source') else '-'}"))
         return rows
 
     # ---------------------------------------------------------------- analysis
@@ -1030,6 +1227,8 @@ class MotionScene:
                     li = [i for i, n in enumerate(joints) if any(k in n for k in analysis.LEG_KEYS)]
                     legs, whole = f(float(np.median(rmse[li])), "{:.1f}"), f(float(np.median(rmse)), "{:.1f}")
             mode = (f"물리 x{shown.info['physics'].get('harness_scale', 1):g}" if self.is_physics_result(shown)
+                    else f"MuJoCo · {'GMT' if shown.info['policy_replay'].get('controller') == 'gmt' else '없음'}"
+                    if self.is_policy_result(shown)
                     else "기구학")
             vals = [mode] + [f(m.get(k), fmt) for _, k, fmt in METRIC_ROWS[:11]] + [legs, whole] \
                 + [f(m.get(k), fmt) for _, k, fmt in METRIC_ROWS[11:]]

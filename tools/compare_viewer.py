@@ -21,10 +21,16 @@ per-joint RMSE, smoothness, planted-foot slip, floor penetration, QC).
 The robot model is GMR's G1 URDF (meshes from ..\\GMR\\assets\\unitree_g1).
 
 Physics mode (button on the playback tab, or --physics): every robot motion is shown as
-Isaac Sim PhysX simulated it (gravity, floor contact, joint torque limits) instead of
-its joint angles. Missing results are computed in the background, one clip at a time,
-by tools/isaac_replay.py --physics (khumanoid/physics_runner.py) and cached in
-data/cache/physics/. Isaac Sim's EULA must be accepted for that: --isaac-accept-eula.
+simulated (gravity, floor contact, joint torque limits) instead of its joint angles. The
+"균형 제어" dropdown (or --balance) picks the simulation: Isaac Sim PhysX with the pelvis
+harness (tools/isaac_replay.py --physics via khumanoid/physics_runner.py, cache
+data/cache/physics/; Isaac Sim's EULA must be accepted: --isaac-accept-eula), or MuJoCo
+with no controller / the GMT tracking policy (khumanoid/policy_runner.py, cache
+data/cache/policy/). Missing results are computed in the background, one clip at a time.
+
+리타게팅 보정 (motion tab, or --foot-flat / --swing-clearance): 디딤발 평평 보정 and 스윙 발 보정
+for the human motions added next; motions already shown keep theirs, so adding the same file
+again shows before and after side by side.
 """
 
 from __future__ import annotations
@@ -41,8 +47,9 @@ sys.path.insert(0, ROOT)
 import plotly.graph_objects as go  # noqa: E402
 import viser  # noqa: E402
 
-from khumanoid.app.scene import (METRIC_NOTES, MotionScene, add_scene_arguments, hexcolor,  # noqa: E402
-                                 load_robot_urdf, scene_options)
+from khumanoid.app.scene import (BALANCE, METRIC_NOTES, RETARGET_NOTE, RETARGET_TIPS,  # noqa: E402
+                                 SWING_CLEARANCE_CM, MotionScene, add_scene_arguments, hexcolor, load_robot_urdf,
+                                 scene_options)
 from khumanoid import paths, settings  # noqa: E402
 from khumanoid.compare import MOTION_EXT, Item, library_files, save_upload  # noqa: E402
 
@@ -74,20 +81,28 @@ class Viewer:
         gui.configure_theme(control_width="large")
         tabs = gui.add_tab_group()
         with tabs.add_tab("재생", icon=None):
-            with gui.add_folder("물리 모드 (Isaac PhysX)"):
+            with gui.add_folder("물리 모드"):
                 self.phys_btn = gui.add_button(
                     "물리 모드 켜기",
-                    hint="켜면 각 로봇 동작을 관절각대로 그리지 않고, Isaac Sim PhysX(중력·바닥 접촉·관절 토크 한계)가 "
-                         "시뮬레이션한 결과로 바꿔 그립니다. 결과가 없는 클립은 Isaac을 백그라운드로 돌려 만듭니다"
-                         "(짧은 클립 약 1분, data/cache/physics에 저장)")
+                    hint="켜면 각 로봇 동작을 관절각대로 그리지 않고, 아래 '균형 제어'로 고른 물리 시뮬레이션 결과로 바꿔 "
+                         "그립니다(중력·바닥 접촉·관절 토크 한계). 결과가 없는 클립은 백그라운드로 돌려 만듭니다"
+                         "(Isaac은 짧은 클립 약 1분, MuJoCo는 몇 초)")
                 self.phys_btn.on_click(lambda e: sc.set_physics(
                     not sc.physics_on, f"button, client {getattr(e.client, 'client_id', '?')}"))
+                self.balance_names = {self._balance_name(k): k for k in BALANCE}
+                self.phys_balance = gui.add_dropdown(
+                    "균형 제어", tuple(self.balance_names), initial_value=self._balance_name(sc.balance),
+                    hint="보조 힘 (Isaac): 골반 가상 하네스로 버팀. 없음 (MuJoCo): 균형 제어 없이 관절각만 따라감(대개 1–2초 "
+                         "안에 넘어짐). 추적 정책 (GMT): 실제 로봇처럼 균형을 잡는 공개 G1 추적 정책. 고르면 물리 모드가 켜집니다")
+                self.phys_balance.on_update(lambda _: self._on_balance())
+                self.phys_balance_note = gui.add_markdown("")  # why a picked mode cannot run here
                 self.phys_assist = gui.add_dropdown(
                     "골반 보조 힘", tuple(ASSIST_OPTIONS), initial_value="켬 (기본)",
                     hint="균형 제어기 대신 골반을 원래 위치·자세로 당기는 가상 하네스입니다. 끄면 균형 피드백이 없어 "
                          "걷기도 대부분 1–2초 안에 넘어집니다")
                 self.phys_assist.on_update(lambda _: sc.set_assist(ASSIST_OPTIONS.get(self.phys_assist.value, 1.0)))
-                gui.add_button("Isaac 작업 취소", hint="대기 중이거나 돌고 있는 물리 계산과 동영상 녹화를 멈춥니다").on_click(
+                self.phys_assist.disabled = sc.balance != "isaac"
+                gui.add_button("작업 취소", hint="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화를 멈춥니다").on_click(
                     lambda _: sc.cancel_jobs())
                 self.phys_status = gui.add_markdown("")
             self.play_btn = gui.add_button("재생")
@@ -147,6 +162,14 @@ class Viewer:
                 self.add_path = gui.add_text("파일 경로", "", hint="BVH / FBX / AMASS SMPL-X npz / 로봇 npz·csv·pkl "
                                                                   "(Isaac 물리 결과 *_sim.npz 포함)")
                 gui.add_button("경로로 추가").on_click(lambda _: self._add_from_gui())
+            with gui.add_folder("리타게팅 보정", expand_by_default=False):
+                self.foot_flat = gui.add_checkbox("디딤발 평평 보정", sc.opts.foot_flat,
+                                                  hint=f"{RETARGET_TIPS['foot_flat']}. {RETARGET_NOTE}")
+                self.foot_flat.on_update(lambda _: self._on_retarget())
+                self._swing_cm = sc.opts.swing_clearance_cm or SWING_CLEARANCE_CM  # the command line's height, if given
+                self.swing = gui.add_checkbox(f"스윙 발 보정 ({self._swing_cm:g} cm)", sc.opts.swing_clearance_cm > 0,
+                                              hint=f"{RETARGET_TIPS['swing']}. {RETARGET_NOTE}")
+                self.swing.on_update(lambda _: self._on_retarget())
             self.status = gui.add_markdown("")
             self.motion_folder = gui.add_folder("목록")
         self._library: dict[str, list[str]] = {}
@@ -188,6 +211,7 @@ class Viewer:
         elif event == "status":
             self._update_status(force=True)
             self.refresh_analysis()
+            self._sync_retarget()
         elif event == "time":
             self.play_btn.label = "일시정지" if self.scene.playing else "재생"
 
@@ -294,11 +318,60 @@ class Viewer:
         rows = dict(self.scene.item_facts(item))
         lines = [f"<span style='color:{hexcolor(item.color)}'>■</span> **{item.kind}**",
                  f"{rows['길이']} · QC **{rows['QC']}**"]
-        for k in ("IK 잔차(평균)", "물리 결과", "참고"):
+        for k in ("IK 잔차(평균)", "디딤발 평평", "물리 결과", "참고"):
             if k in rows:
                 lines.append(f"{k}: {rows[k]}")
         lines.append(f"`{rows['파일']}`")
         return "  \n".join(lines)
+
+    def _balance_name(self, mode: str) -> str:
+        """The dropdown entry: the mode's name, marked when it cannot run here (picking it shows why
+        under the dropdown)."""
+        return BALANCE[mode] + (" - 쓸 수 없음" if self.scene.balance_problem(mode) else "")
+
+    def _on_balance(self) -> None:
+        if getattr(self, "_reverting", False):
+            return
+        sc = self.scene
+        mode = self.balance_names.get(self.phys_balance.value, "isaac")
+        why = sc.balance_problem(mode)
+        if why:
+            self.phys_balance_note.content = f"**{BALANCE[mode]}**를 쓸 수 없습니다: {why}"
+            self._reverting = True
+            try:
+                self.phys_balance.value = self._balance_name(sc.balance)  # back to the mode in use
+            finally:
+                self._reverting = False
+            return
+        self.phys_balance_note.content = ""
+        sc.set_balance(mode)
+        self.phys_assist.disabled = mode != "isaac"
+        if not sc.physics_on:
+            sc.set_physics(True, f"balance {mode}")
+
+    def _on_retarget(self) -> None:
+        """리타게팅 보정 checkboxes: the scene's settings for the human motions opened next."""
+        if getattr(self, "_syncing", False):
+            return
+        r = self.scene.set_retarget(foot_flat=bool(self.foot_flat.value),
+                                    swing_clearance_cm=self._swing_cm if self.swing.value else 0.0)
+        on = [name for name, yes in (("디딤발 평평", r["foot_flat"]),
+                                     (f"스윙 발 {r['swing_clearance_cm']:g} cm", r["swing_clearance_cm"] > 0)) if yes]
+        self.status.content = f"리타게팅 보정: **{', '.join(on) or '끔'}**. {RETARGET_NOTE}"
+
+    def _sync_retarget(self) -> None:
+        """The checkboxes show the scene's settings (the editor window or the API can change them)."""
+        o = self.scene.opts
+        if o.swing_clearance_cm > 0 and o.swing_clearance_cm != self._swing_cm:
+            self._swing_cm = o.swing_clearance_cm
+            self.swing.label = f"스윙 발 보정 ({self._swing_cm:g} cm)"
+        self._syncing = True
+        try:
+            for box, on in ((self.foot_flat, o.foot_flat), (self.swing, o.swing_clearance_cm > 0)):
+                if bool(box.value) != on:
+                    box.value = on
+        finally:
+            self._syncing = False
 
     def save_video(self, item: Item) -> None:
         try:
@@ -306,9 +379,9 @@ class Viewer:
         except Exception as e:  # Isaac Sim not found
             item.handles["ui_video_md"].content = f"동영상: **실행할 수 없음** ({type(e).__name__}: {e})"
             return
-        physics = self.scene.physics_on and not self.scene.is_physics_result(item)
+        physics = self.scene.physics_on and not self.scene.is_sim_result(item)
         self.status.content = (f"동영상 {'대기열에 추가' if job.active else '이미 있음'}: {item.label} "
-                               f"({'물리 x' + format(self.scene.assist, 'g') if physics else '기구학'})")
+                               f"({self.scene.mode_label() if physics else '기구학'})")
 
     def _download_video(self, item: Item, client) -> None:
         path = self.scene.video_file(item)
@@ -329,10 +402,10 @@ class Viewer:
         except Exception:
             pass
         jobs = sc.jobs_summary()
-        head = (f"**켜짐** · 골반 보조 힘 x{sc.assist:g}" if sc.physics_on else "**꺼짐** · 관절각대로 그리는 기구학 재생") \
-            + (f" · Isaac 작업 {jobs} 대기·진행 중" if jobs else "")
+        head = (f"**켜짐** · {sc.mode_label()}" if sc.physics_on else "**꺼짐** · 관절각대로 그리는 기구학 재생") \
+            + (f" · 작업 {jobs} 대기·진행 중" if jobs else "")
         lines = [head]
-        items = [it for it in list(sc.items) if not sc.is_physics_result(it)]
+        items = [it for it in list(sc.items) if not sc.is_sim_result(it)]
         if sc.physics_on:
             lines += [f"<span style='color:{hexcolor(it.color)}'>■</span> {it.label}: {sc.job_text(it)}" for it in items]
             if sc.phys_error and not items:
@@ -441,7 +514,7 @@ class Viewer:
             self._setting_slider = True
             self.time_slider.value = round(sc.t, 4)
             self._setting_slider = False
-        if sc.physics_on or sc.runner.busy():
+        if sc.physics_on or sc.jobs_busy():
             self._update_status()
         now = time.perf_counter()
         if self._plot_dirty and (not sc.playing or now - self._last_plot > 0.25):
@@ -461,7 +534,7 @@ def main() -> int:
     server = viser.ViserServer(host=args.host, port=args.port, label="K-Humanoid motion compare")
     scene = MotionScene(server, urdf, scene_options(args), log=log)
     viewer = Viewer(server, scene, args.library)
-    atexit.register(scene.runner.shutdown)  # no Isaac process outlives the viewer
+    atexit.register(scene.shutdown)  # no Isaac process outlives the viewer
     server.on_client_connect(lambda c: log(f"client {c.client_id} connected"))
     server.on_client_disconnect(lambda c: log(f"client {c.client_id} disconnected"))
     if args.body_mesh:
@@ -488,7 +561,7 @@ def main() -> int:
             last = now
             time.sleep(max(0.0, 1 / 30 - (time.perf_counter() - now)))
     except KeyboardInterrupt:
-        scene.runner.shutdown()
+        scene.shutdown()
         return 0
 
 

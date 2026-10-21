@@ -67,8 +67,14 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="write the markdown here (default: print only)")
     args = ap.parse_args()
     files = sorted({f for d in args.folders for f in glob.glob(os.path.join(d, "**", "*_sim.json"), recursive=True)})
+
+    def isaac(f: str) -> bool:  # tools/policy_replay.py writes *_sim.json too (MuJoCo, no "physics" block)
+        with open(f, encoding="utf-8") as fh:
+            return "physics" in json.load(fh)
+
+    files = [f for f in files if isaac(f)]
     if not files:
-        print("no *_sim.json found")
+        print("no Isaac *_sim.json found")
         return 1
     root = os.path.commonpath([os.path.abspath(d) for d in args.folders])
     lines = [

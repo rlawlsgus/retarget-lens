@@ -45,10 +45,11 @@ def jsonable(v):
     return v
 
 
-def headless_scene(log=None, mesh_cell: float = 0.004) -> MotionScene:
+def headless_scene(log=None, mesh_cell: float = 0.004, **opts) -> MotionScene:
     """A MotionScene without a window (the command line): its viser server only listens on
     127.0.0.1 and nothing connects; motions, metrics, comparisons and Isaac jobs work as in
-    the window. Paths and tools come from 환경 설정."""
+    the window. Paths and tools come from 환경 설정; opts are more SceneOptions (smooth,
+    foot_flat, swing_clearance_cm)."""
     import socket
 
     import viser
@@ -59,7 +60,8 @@ def headless_scene(log=None, mesh_cell: float = 0.004) -> MotionScene:
         port = sock.getsockname()[1]
     server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
     s = settings.load()
-    opts = SceneOptions(smpl_model_dir=settings.find_smpl(s).path or paths.smpl_model_dir(), video_dir=settings.video_dir(s))
+    opts = SceneOptions(smpl_model_dir=settings.find_smpl(s).path or paths.smpl_model_dir(), video_dir=settings.video_dir(s),
+                        **opts)
     return MotionScene(server, load_robot_urdf(paths.robot_urdf(), mesh_cell, log=log), opts, log=log)
 
 
@@ -86,7 +88,12 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
         "frames": r.num_frames, "fps": r.fps, "duration_s": r.duration, "offset_s": item.offset,
         "visible": item.visible, "color": list(item.color), "qc": m.get("qc"), "qc_notes": m.get("qc_notes") or "",
         "ik_position_residual": item.info.get("ik_position_residual"),
+        "retarget": item.retarget or None,  # human inputs: smooth_hz, foot_flat, swing_clearance_cm
     }
+    if item.info.get("foot_flat"):
+        ff = item.info["foot_flat"]
+        out["foot_flat"] = {k: ff.get(k) for k in ("frames_changed", "stance_pitch_deg", "sole_lift_cm",
+                                                   "ankle_change_deg")}
     if item.info.get("c3d"):
         out["c3d"] = item.info["c3d"]
         out["solved_motion"] = item.info.get("solved_motion")
@@ -94,7 +101,8 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
         out["metrics"] = {k: v for k, v in m.items() if not k.startswith("_") and k not in ("qc", "qc_notes")}
     if scene.physics_on or item.handles.get("phys"):
         shown = scene.shown(item)
-        out["physics"] = {"state": scene.job_text(item), "assist": scene.assist,
+        out["physics"] = {"state": scene.job_text(item), "balance": scene.balance, "mode": scene.mode_label(),
+                          "assist": scene.assist,
                           "result_ready": shown is not item,
                           "falls": [{"time_s": t, "cause": c} for t, c in scene.falls(item)]}
         if shown is not item:
@@ -110,10 +118,11 @@ def status(scene: MotionScene) -> dict:
     return jsonable({
         "app": "RetLens", "api_version": API_VERSION, "layout": paths.LAYOUT,
         "time_s": scene.t, "playing": scene.playing, "speed": scene.view.speed, "time_range_s": [lo, hi],
-        "physics": {"on": scene.physics_on, "assist": scene.assist, "jobs": scene.jobs_summary() or None,
-                    "error": scene.phys_error or None},
+        "physics": {"on": scene.physics_on, "balance": scene.balance, "mode": scene.mode_label(),
+                    "assist": scene.assist, "jobs": scene.jobs_summary() or None, "error": scene.phys_error or None},
         "compare": {"on": pair is not None, "a": c.ref.label if pair else None, "b": c.item.label if pair else None,
                     "heading": c.heading, "tol_cm": c.tol_cm},
+        "retarget": scene.retarget_settings(),  # for the human motions opened next
         "motions": [item_info(scene, it, metrics=False) for it in list(scene.items)],
     })
 
@@ -197,11 +206,11 @@ def eula_accepted() -> bool:
 
 
 def wait_jobs(scene: MotionScene, timeout_s: float = 900.0, poll_s: float = 1.0) -> bool:
-    """Block until the Isaac jobs are done (True) or the timeout passes (False)."""
+    """Block until the Isaac and MuJoCo jobs are done (True) or the timeout passes (False)."""
     end = time.time() + timeout_s
     time.sleep(0.2)
     while time.time() < end:
-        if not scene.runner.busy():
+        if not scene.jobs_busy():
             return True
         time.sleep(poll_s)
     return False

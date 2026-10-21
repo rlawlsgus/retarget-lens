@@ -41,14 +41,28 @@ def test_cli_info_and_errors(tmp_path):
 
 @needs_sample
 def test_cli_inspect_metrics_compare(tmp_path):
-    code, out = _cli("inspect", SAMPLE, tmp_path=tmp_path)
+    code, out = _cli("inspect", SAMPLE, "--foot-flat", tmp_path=tmp_path)  # robot motions ignore 리타게팅 보정
     m = out["motions"][0]
     assert code == 0 and m["qc"] in ("PASS", "WARN", "FAIL") and m["frames"] > 0 and "acc_mean" in m["metrics"]
+    assert m["retarget"] is None
     code, out = _cli("compare", SAMPLE, SAMPLE, "--tol", "2", tmp_path=tmp_path)
     assert code == 0 and out["frames"] > 0 and out["tol_cm"] == 2.0
     assert out["regions"][0]["region"].startswith("전체") and all(r["max_cm"] < 1e-6 for r in out["regions"])
     code, out = _cli("metrics", SAMPLE, SAMPLE, tmp_path=tmp_path)
     assert code == 0 and "기준 대비 다리 RMSE (°)" in out["rows"] and len(out["motions"]) == 2
+
+
+def test_cli_retarget_options():
+    """Every command that opens motions takes the 리타게팅 보정 options (as the window's menu)."""
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import retlens_cli
+
+    for cmd in (["inspect", "a.bvh"], ["metrics", "a.bvh"], ["compare", "a.bvh", "b.bvh"], ["align", "a.bvh", "b.bvh"],
+                ["retarget", "a.bvh", "--out", "a.npz"], ["physics", "a.bvh"], ["video", "a.bvh"]):
+        a = retlens_cli.parser().parse_args([*cmd, "--foot-flat", "--swing-clearance", "2"])
+        assert a.foot_flat is True and a.swing_clearance == 2.0 and a.smooth == 6.0, cmd
+    with pytest.raises(ValueError):  # refused before any scene starts
+        retlens_cli._scene(retlens_cli.parser().parse_args(["inspect", "a.bvh", "--swing-clearance", "50"]))
 
 
 def _call(url, token=None, body=None, headers=None):
@@ -80,9 +94,15 @@ def test_http_api(tmp_path, monkeypatch):
         assert _call(f"{u}/api/status", "wrong")[0] == 401
         assert _call(f"{u}/api/status", t, headers={"Origin": "http://evil.example"})[0] == 403  # a web page
         code, st = _call(f"{u}/api/status", t)
-        assert code == 200 and st["ok"] and st["motions"] == []
+        assert code == 200 and st["ok"] and st["motions"] == [] and st["retarget"]["foot_flat"] is False
+        code, out = _call(f"{u}/api/retarget", t, {"foot_flat": True})  # 리타게팅 보정 for motions opened next
+        assert code == 200 and out["retarget"]["foot_flat"] is True and out["retarget"]["swing_clearance_cm"] == 0.0
+        assert _call(f"{u}/api/status", t)[1]["retarget"]["foot_flat"] is True
+        assert _call(f"{u}/api/retarget", t, {"swing_clearance_cm": 50})[0] == 400
+        assert _call(f"{u}/api/retarget", t, {"foot_flat": False})[1]["retarget"]["foot_flat"] is False
         code, out = _call(f"{u}/api/open", t, {"paths": [SAMPLE, SAMPLE]})
         assert code == 200 and len(out["opened"]) == 2
+        assert out["opened"][0]["retarget"] is None  # a robot motion: loaded as it is
         a, b = (m["id"] for m in out["opened"])
         assert a != b  # labels stay unique
         assert _call(f"{u}/api/open", t, {"paths": [str(tmp_path / "x.bvh")]})[0] == 404
@@ -107,6 +127,57 @@ def test_http_api(tmp_path, monkeypatch):
         srv.stop()
         scene.runner.shutdown()
         scene.server.stop()
+
+
+def test_second_window_gets_its_own_port():
+    """A second RetLens must not share the first one's API port (Windows SO_REUSEADDR allowed it, and
+    then its requests reached the first window, which rejected its token)."""
+    from khumanoid.app.api_server import ApiServer
+
+    first = ApiServer(None, port=0, write_discovery=False)
+    second = ApiServer(None, port=first.port, write_discovery=False)
+    try:
+        assert second.port != first.port
+    finally:
+        first.httpd.server_close()
+        second.httpd.server_close()
+
+
+def test_discovery_file_goes_back_to_the_other_window(tmp_path, monkeypatch):
+    """The window opened last owns api.json; closing it points the file back at the earlier window
+    (still running) instead of deleting it."""
+    monkeypatch.setenv("KHUMANOID_USER_DIR", str(tmp_path / "user"))
+    from khumanoid.app.api_server import ApiServer, discovery, discovery_path
+
+    os.makedirs(os.path.dirname(discovery_path()))
+    earlier = {"url": "http://127.0.0.1:8765", "port": 8765, "token": "earlier", "pid": os.getppid()}  # a live process
+    with open(discovery_path(), "w", encoding="utf-8") as f:
+        json.dump(earlier, f)
+    srv = ApiServer(None, port=0).start()
+    assert discovery()["token"] == srv.token
+    srv.stop()
+    assert discovery() == earlier
+    srv = ApiServer(None, port=0).start()  # alone this time (its predecessor's file is back, but say it closed)
+    srv._previous = None
+    srv.stop()
+    assert discovery() is None and not os.path.exists(discovery_path())
+
+
+def test_physics_off_always_works():
+    """Turning physics off must not depend on whether the current 균형 제어 can run here."""
+    from types import SimpleNamespace
+
+    from khumanoid.app.api_server import ApiBackend, ApiError
+
+    calls = []
+    scene = SimpleNamespace(balance="gmt", assist=1.0, items=[], balance_problem=lambda m: "no PyTorch",
+                            set_physics=lambda on, why: calls.append(on), mode_label=lambda: "추적 정책 (GMT)",
+                            job_text=lambda it: "")
+    api = ApiBackend.__new__(ApiBackend)
+    api.scene = scene
+    assert api.physics({"on": False})["physics"] is False and calls == [False]
+    with pytest.raises(ApiError):
+        api.physics({"on": True})
 
 
 def test_skill_covers_every_metric():

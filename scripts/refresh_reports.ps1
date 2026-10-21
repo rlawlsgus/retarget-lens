@@ -3,7 +3,7 @@
   Rebuild data\retargeted and reports\ with the current pipeline (docs\data.md lists what each holds).
 
 .DESCRIPTION
-  Stages (default: all three, in this order):
+  Stages (default: all four, in this order):
     retarget  data\raw -> data\retargeted\<source>\ with the recommended settings
               (--smooth 6 --swing-clearance 2). A few minutes.
     reports   reports\qc\ (QC + valid hours, C3D marker QC) and reports\compare\ (formats side by side).
@@ -11,6 +11,9 @@
     isaac     reports\sim_check\, reports\physics\ (+ summary.md) and reports\videos\ with Isaac Sim's
               own python.bat. About 30 minutes. Needs the NVIDIA Omniverse EULA accepted: pass
               -IsaacAcceptEula only if you (the user) have accepted it.
+    policy    reports\policy\: balance on / off in MuJoCo - the CMU clips (swing 0 and 2 cm) and LAFAN1
+              with no controller and with the GMT tracking policy (tools\policy_replay.py). Needs
+              scripts\install_gmt.ps1 (skipped with a warning without it). About 10 minutes.
 
   Run inside the k-humanoid env (conda activate k-humanoid). Licence-gated inputs (AMASS, LAFAN1,
   Unitree csv, the SMPL-X model) are used when present; their outputs stay internal (docs\data.md).
@@ -21,7 +24,7 @@
   powershell -ExecutionPolicy Bypass -File scripts\refresh_reports.ps1 -Stage isaac -IsaacAcceptEula
 #>
 param(
-    [string[]] $Stage = @("retarget", "reports", "isaac"),
+    [string[]] $Stage = @("retarget", "reports", "isaac", "policy"),
     [string] $Python = "python",
     [string] $IsaacPython = "C:\isaacsim\python.bat",
     [string] $SmplModelDir = "models",
@@ -31,7 +34,7 @@ param(
 $ErrorActionPreference = "Stop"
 # "powershell -File ... -Stage retarget,reports" passes one string "retarget,reports": split it here
 $Stage = @($Stage | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-foreach ($s in $Stage) { if ($s -notin @("retarget", "reports", "isaac")) { throw "unknown stage '$s' (retarget, reports, isaac)" } }
+foreach ($s in $Stage) { if ($s -notin @("retarget", "reports", "isaac", "policy")) { throw "unknown stage '$s' (retarget, reports, isaac, policy)" } }
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
@@ -146,5 +149,25 @@ if ($Stage -contains "isaac") {
     }
     $folders = @("cmu_bvh", "cmu_fbx", "amass_cmu_smplx") | ForEach-Object { "reports\physics\$_" } | Where-Object { Test-Path $_ }
     Run $Python (@("tools\physics_report.py") + $folders + @("--out", "reports\physics\summary.md"))
+}
+
+if ($Stage -contains "policy") {
+    $gmt = if ($env:KHUMANOID_GMT_DIR) { $env:KHUMANOID_GMT_DIR } else { Join-Path (Split-Path -Parent $Root) "GMT" }
+    if (-not (Test-Path (Join-Path $gmt "assets\pretrained_checkpoints\pretrained.pt"))) {
+        Write-Warning "GMT not found in $gmt (scripts\install_gmt.ps1): policy stage skipped"
+    } else {
+        Write-Host "== policy: balance on / off in MuJoCo (no controller vs the GMT tracking policy)"
+        $cmu = @("data\raw\cmu_bvh", "data\raw\cmu_fbx")
+        if ($HaveAmass) { $cmu += $AmassSubject.Keys | Sort-Object | ForEach-Object { AmassFile $_ } }
+        foreach ($s in @("0", "2")) {
+            Run $Python (@("tools\policy_replay.py") + $cmu + @("--swing-clearance", $s, "--video", "--out-dir", "reports\policy\swing$s"))
+        }
+        if ($HaveLafan) {
+            $lafan = @("data\raw\lafan1_bvh")
+            if ($HaveUnitree) { $lafan += "data\raw\unitree_lafan1_g1" }
+            Run $Python (@("tools\policy_replay.py") + $lafan + @("--swing-clearance", "2", "--out-dir", "reports\policy\lafan1"))
+        }
+        Run $Python @("tools\policy_replay.py", "--summary", "reports\policy")
+    }
 }
 Write-Host "done"

@@ -5,6 +5,8 @@
     GET  /api/checks                    환경 점검
     GET  /api/library?query=walk        motion files in the motion folders
     POST /api/open      {"paths": [..]}                      load (retarget when needed), shown in the window
+    POST /api/retarget  {"foot_flat"?, "swing_clearance_cm"?}   리타게팅 보정 for the human motions opened
+                                                             next (open ones keep theirs: reopen to compare)
     POST /api/remove    {"id": ..}
     GET  /api/motion?id=..              one motion: QC, metrics, C3D QC, physics state
     POST /api/item      {"id", "visible"?, "offset_s"?, "show_human"?}
@@ -12,9 +14,10 @@
     GET  /api/metrics?ref=..            the 분석 table (RMSE against ref)
     POST /api/align     {"ref"}         기준에 시간 자동 정렬
     POST /api/compare   {"a", "b", "heading"?, "tol_cm"?} / {"on": false}   겹쳐 비교 (+ its numbers)
-    POST /api/physics   {"on", "assist"?}                    물리 모드 (needs the EULA accepted in the window)
+    POST /api/physics   {"on", "assist"?, "balance"?}       물리 모드; balance isaac (needs the EULA accepted in
+                                                             the window) | pd | gmt (MuJoCo: no controller / GMT)
     POST /api/video     {"id"}          동영상 저장 (queued; see /api/jobs)
-    GET  /api/jobs                      Isaac jobs
+    GET  /api/jobs                      physics (Isaac, MuJoCo) and video jobs
     POST /api/camera    {"fit": true}   카메라 맞추기
     POST /api/screenshot {"path"?}      a PNG of the window (default in the user's logs folder)
 
@@ -30,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +42,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .. import paths
 from . import api_core
+from .scene import BALANCE
 
 DEFAULT_PORT = 8765
 
@@ -53,15 +58,20 @@ def discovery() -> dict | None:
             d = json.load(f)
     except (OSError, ValueError):
         return None
-    pid = d.get("pid")
-    if pid and os.name == "nt":  # a file left by a crashed run
-        import ctypes
+    return d if _alive(d.get("pid")) else None  # else a file left by a crashed run
 
-        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return None
-        ctypes.windll.kernel32.CloseHandle(h)
-    return d
+
+def _alive(pid) -> bool:
+    """Whether the process that wrote a discovery file still runs (assumed so off Windows)."""
+    if not pid or os.name != "nt":
+        return True
+    import ctypes
+
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    ctypes.windll.kernel32.CloseHandle(h)
+    return True
 
 
 class ApiError(Exception):
@@ -83,7 +93,8 @@ class ApiBackend:
             (g, "/api/help"): self.help, (g, "/api/status"): lambda q: api_core.status(self.scene),
             (g, "/api/checks"): lambda q: api_core.checks(),
             (g, "/api/library"): lambda q: api_core.library(q.get("query"), int(q.get("limit", 200))),
-            (p, "/api/open"): self.open, (p, "/api/remove"): self.remove, (g, "/api/motion"): self.motion,
+            (p, "/api/open"): self.open, (p, "/api/retarget"): self.retarget, (p, "/api/remove"): self.remove,
+            (g, "/api/motion"): self.motion,
             (p, "/api/item"): self.item, (p, "/api/playback"): self.playback, (g, "/api/metrics"): self.metrics,
             (p, "/api/align"): self.align, (p, "/api/compare"): self.compare, (p, "/api/physics"): self.physics,
             (p, "/api/video"): self.video, (g, "/api/jobs"): self.jobs, (p, "/api/camera"): self.camera,
@@ -118,6 +129,15 @@ class ApiBackend:
                 self.window.bridge.added.emit(item)  # the window selects it, fits the camera
             out.append(api_core.item_info(self.scene, item))
         return {"opened": out}
+
+    def retarget(self, q: dict) -> dict:
+        try:
+            swing = None if q.get("swing_clearance_cm") is None else float(q["swing_clearance_cm"])
+            r = self.scene.set_retarget(foot_flat=None if "foot_flat" not in q else bool(q["foot_flat"]),
+                                        swing_clearance_cm=swing)
+        except (TypeError, ValueError) as e:
+            raise ApiError(str(e)) from None
+        return {"retarget": r, "note": "applies to the human motions opened next; open ones keep theirs"}
 
     def remove(self, q: dict) -> dict:
         item = self._item(q.get("id"))
@@ -178,12 +198,21 @@ class ApiBackend:
 
     def physics(self, q: dict) -> dict:
         on = bool(q.get("on", True))
-        if on:
+        balance = q.get("balance", self.scene.balance)
+        if balance not in BALANCE:
+            raise ApiError(f"balance must be one of {', '.join(BALANCE)}")
+        why = self.scene.balance_problem(balance) if on or "balance" in q else ""  # turning off always works
+        if why:
+            raise ApiError(f"{BALANCE[balance]}: {why}", 409)
+        if on and balance == "isaac":
             self._eula()
         if "assist" in q:
             self.scene.set_assist(float(q["assist"]))
+        if balance != self.scene.balance:
+            self.scene.set_balance(balance)
         self.scene.set_physics(on, "api")
-        return {"physics": on, "assist": self.scene.assist,
+        return {"physics": on, "balance": self.scene.balance, "mode": self.scene.mode_label(),
+                "assist": self.scene.assist,
                 "motions": {it.label: self.scene.job_text(it) for it in list(self.scene.items)}}
 
     def video(self, q: dict) -> dict:
@@ -198,14 +227,15 @@ class ApiBackend:
     def jobs(self, q: dict) -> dict:
         out = []
         for it in list(self.scene.items):
-            for assist, job in it.handles.get("phys_jobs", {}).items():
-                out.append({"id": it.label, "kind": "physics", "assist": assist, "state": job.state, "stage": job.stage,
+            for key, job in it.handles.get("phys_jobs", {}).items():  # key: the harness scale, or the MuJoCo controller
+                mode = {"kind": "mujoco", "balance": key} if job.kind == "policy" else {"kind": "physics", "assist": key}
+                out.append({"id": it.label, **mode, "state": job.state, "stage": job.stage,
                             "progress": job.progress, "result": job.result, "message": job.message or None})
             job = it.handles.get("video_job")
             if job is not None:
                 out.append({"id": it.label, "kind": "video", "state": job.state, "stage": job.stage,
                             "progress": job.progress, "result": job.result, "message": job.message or None})
-        return {"busy": self.scene.runner.busy(), "jobs": out}
+        return {"busy": self.scene.jobs_busy(), "jobs": out}
 
     # ---------------------------------------------------------------- view
     def camera(self, q: dict) -> dict:
@@ -287,6 +317,18 @@ class _Handler(BaseHTTPRequestHandler):
         self._handle("POST")
 
 
+class _ExclusiveServer(ThreadingHTTPServer):
+    """One server per port. HTTPServer sets SO_REUSEADDR, which on Windows lets a second RetLens bind
+    the same port too: its requests then reach the first window, which rejects the second's token."""
+
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class ApiServer:
     """Serves ApiBackend on 127.0.0.1 (port; another free one when taken) in a daemon thread
     and writes the discovery file."""
@@ -294,9 +336,9 @@ class ApiServer:
     def __init__(self, backend: ApiBackend, port: int = DEFAULT_PORT, write_discovery: bool = True):
         self.backend, self.token = backend, secrets.token_urlsafe(24)
         try:
-            self.httpd = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
-        except OSError:
-            self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+            self.httpd = _ExclusiveServer(("127.0.0.1", port), _Handler)
+        except OSError:  # taken (another RetLens window, or another program)
+            self.httpd = _ExclusiveServer(("127.0.0.1", 0), _Handler)
         self.httpd.daemon_threads = True
         self.httpd.api = self
         self.port = self.httpd.server_address[1]
@@ -306,7 +348,11 @@ class ApiServer:
 
     def start(self) -> "ApiServer":
         self._thread.start()
+        self._previous = None
         if self._write:
+            # another RetLens window may own the file: this one takes over, and hands it back on stop()
+            prev = discovery()
+            self._previous = prev if prev is not None and prev.get("pid") != os.getpid() else None
             os.makedirs(os.path.dirname(discovery_path()), exist_ok=True)
             with open(discovery_path(), "w", encoding="utf-8") as f:
                 json.dump({"url": self.url, "port": self.port, "token": self.token, "pid": os.getpid(),
@@ -319,7 +365,12 @@ class ApiServer:
         if self._write:
             d = discovery()
             if d is not None and d.get("token") == self.token:
+                prev = getattr(self, "_previous", None)
                 try:
-                    os.remove(discovery_path())
+                    if prev is not None and _alive(prev.get("pid")):  # the earlier window still runs: point at it again
+                        with open(discovery_path(), "w", encoding="utf-8") as f:
+                            json.dump(prev, f)
+                    else:
+                        os.remove(discovery_path())
                 except OSError:
                     pass

@@ -95,7 +95,7 @@ def documents_dir() -> str:
 
 
 def cache_dir(kind: str) -> str:
-    """retarget | fbx | physics. Not under data/retargeted in the repository: QC reports scan that."""
+    """retarget | fbx | physics | policy. Not under data/retargeted in the repository: QC reports scan that."""
     return os.path.join(user_dir(), "cache", kind)
 
 
@@ -183,6 +183,7 @@ def describe() -> list[tuple[str, str]]:
     """(name, path) of every location, for the about box / logs / tests."""
     return [("배치", LAYOUT), ("프로그램 파일", resource_dir()), ("사용자 데이터", user_dir()),
             ("문서", documents_dir()), ("리타겟 캐시", cache_dir("retarget")), ("물리 캐시", cache_dir("physics")),
+            ("MuJoCo 캐시", cache_dir("policy")),
             ("FBX 캐시", cache_dir("fbx")), ("동영상", video_dir()), ("로봇 모델", robot_urdf()),
             ("SMPL-X 모델", smpl_model_dir()), ("Isaac 실행 폴더", isaac_root()),
             ("모션 폴더", "; ".join(library_roots()))]

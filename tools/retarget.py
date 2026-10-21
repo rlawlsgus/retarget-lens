@@ -4,6 +4,7 @@
     python tools/retarget.py data/raw/cmu_bvh                       # every .bvh / .npz in the folder
     python tools/retarget.py data/raw/cmu_bvh --smooth 6            # + 6 Hz zero-phase low-pass (recommended)
     python tools/retarget.py data/raw/cmu_bvh --smooth 6 --swing-clearance 2     # + swing feet >= 2 cm off the floor
+    python tools/retarget.py data/raw/cmu_bvh/143_11.bvh --smooth 6 --foot-flat --swing-clearance 2  # + flat stance soles
     python tools/retarget.py data/raw/lafan1_bvh --out-dir data/retargeted/lafan1_bvh
     python tools/retarget.py clip_stageii.npz --smpl-model-dir models   # AMASS SMPL-X
     python tools/retarget.py data/raw/cmu_fbx --smooth 6           # FBX (needs Blender, see docs/setup.md)
@@ -26,7 +27,8 @@ Writes per clip:
   <clip>_<robot>.npz   RobotMotion.save_npz: fps, joint_names, root_pos,
                        root_quat_wxyz, dof_pos (MJCF joint order)
   <clip>_<robot>.json  provenance: source, licence note, GMR commit, derived IK
-                       config, scales, IK position residuals
+                       config, scales, IK position residuals, what smoothing /
+                       foot-flat / swing clearance changed
   <clip>_<robot>.pkl   with --pkl: GMR's own layout (root_rot xyzw) for TWIST/GMT
 Licences follow the source clip: outputs of CC BY-NC-ND sources (LAFAN1) are
 derivatives and stay internal (see data/raw/*/SOURCE.md).
@@ -82,6 +84,9 @@ def main() -> int:
     ap.add_argument("--smpl-model-dir", default=None, help="SMPL-X model folder (holds smplx/)")
     ap.add_argument("--smooth", type=float, default=0.0, metavar="HZ",
                     help="zero-phase low-pass of the result at HZ (recommended 6; default off)")
+    ap.add_argument("--foot-flat", action="store_true",
+                    help="turn the soles of feet standing still parallel to the floor (ankle pitch / roll only), "
+                         "after smoothing; for retargets that stand on their heels (CMU subject 143). Default off")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
                     help="lift swing feet to at least CM above the floor, after smoothing (recommended 2; default off)")
     ap.add_argument("--velocity-limit", action="store_true",
@@ -107,7 +112,7 @@ def main() -> int:
             motion, info = retarget_file(path, robot=args.robot, fmt=args.format, fps=args.fps or None,
                                          up_axis=args.up_axis, ref=ref, smpl_model_dir=args.smpl_model_dir,
                                          velocity_limit=args.velocity_limit, smooth_hz=args.smooth,
-                                         swing_clearance=args.swing_clearance / 100.0)
+                                         swing_clearance=args.swing_clearance / 100.0, foot_flat=args.foot_flat)
         except Exception as e:  # keep going over a folder; report at the end
             failed += 1
             print(f"[FAIL] {path}: {type(e).__name__}: {e}")
@@ -122,6 +127,12 @@ def main() -> int:
             save_gmr_pkl(motion, base + ".pkl")
         r = info["ik_position_residual"]
         smooth = f", smoothed {args.smooth:g} Hz" if info["smoothing"] else ""
+        if info.get("foot_flat"):
+            ff = info["foot_flat"]
+            pitch = " / ".join(f"{s} {p['before']} -> {p['after']}" for s, p in ff["stance_pitch_deg"].items()
+                               if p["before"] is not None)
+            smooth += (f", stance soles flattened in {ff['frames_changed']} frames"
+                       + (f" (pitch {pitch} deg, heel lift max {ff['sole_lift_cm']['max']} cm)" if pitch else ""))
         if info.get("swing_clearance"):
             sc = info["swing_clearance"]
             smooth += (f", moving feet lifted in {sc['frames_changed']} frames (shortfall max {sc['shortfall_cm']['max']}"

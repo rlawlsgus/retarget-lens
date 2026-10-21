@@ -80,7 +80,7 @@ def save_upload(name: str, content: bytes, folder: str = UPLOADS) -> str:
     raise RuntimeError(f"too many uploads named {name}")
 
 
-@dataclass
+@dataclass(eq=False)  # one loaded motion: compared by identity (field equality would compare its arrays)
 class Item:
     label: str
     source: str
@@ -95,6 +95,7 @@ class Item:
     metrics: dict = field(default_factory=dict)
     balance: object = None  # khumanoid.stability.BalanceTrack (CoM / ZMP / support), set by compute_metrics
     handles: dict = field(default_factory=dict)  # viewer state
+    retarget: dict = field(default_factory=dict)  # human inputs: the settings it was retargeted with
 
 
 def human_format(path: str) -> str | None:
@@ -117,13 +118,16 @@ def human_format(path: str) -> str | None:
     raise ValueError(f"unsupported file type: {path}")
 
 
-def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance: float = 0.0) -> str:
+def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance: float = 0.0,
+               foot_flat: bool = False) -> str:
     from .retarget import ROBOT_TAGS
 
     st = os.stat(path)
     key = [os.path.abspath(path), st.st_size, int(st.st_mtime), robot, smooth, fps, PIPELINE_VERSION]
     if swing_clearance:  # appended only when on, so earlier cache entries stay valid
         key.append(["swing_clearance", swing_clearance])
+    if foot_flat:
+        key.append(["foot_flat", True])
     key = json.dumps(key)
     h = hashlib.sha1(key.encode()).hexdigest()[:10]
     stem = os.path.splitext(os.path.basename(path))[0]
@@ -132,16 +136,17 @@ def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance
 
 def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: float = 30.0,
               csv_fps: float = 30.0, smpl_model_dir: str | None = None, swing_clearance: float = 0.0,
-              log=print) -> Item:
+              foot_flat: bool = False, log=print) -> Item:
     """Robot motion as is, or human motion retargeted (cached) plus its skeleton.
-    swing_clearance (m) > 0 lifts skimming swing feet after retargeting."""
+    foot_flat turns the soles of feet standing still parallel to the floor and swing_clearance
+    (m) > 0 lifts skimming swing feet, after retargeting (khumanoid.retarget.retarget_file)."""
     log = log or (lambda *_: None)
     path = os.path.abspath(path)
     name = os.path.splitext(os.path.basename(path))[0]
     folder = os.path.basename(os.path.dirname(path))
     if path.lower().endswith(MARKER_EXT):
         return _load_marker_item(path, log=log, robot=robot, smooth=smooth, fps=fps, csv_fps=csv_fps,
-                                 smpl_model_dir=smpl_model_dir, swing_clearance=swing_clearance)
+                                 smpl_model_dir=smpl_model_dir, swing_clearance=swing_clearance, foot_flat=foot_flat)
     fmt = human_format(path)
     if fmt is None:
         m = load_motion(path, fps=csv_fps)
@@ -154,11 +159,13 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
                 info = json.load(f)
         if "physics" in info:  # tools/isaac_replay.py --physics result
             kind = f"Isaac PhysX sim, harness x{info['physics'].get('harness_scale', 1):g}"
+        elif "policy_replay" in info:  # tools/policy_replay.py result (balance on / off in MuJoCo)
+            kind = f"MuJoCo 재생 · {info.get('controller_label') or info['policy_replay'].get('controller', '')}"
         return Item(label=f"{folder}/{name}", source=path, kind=kind, robot=m, info=info)
 
     from .retarget import retarget_file
 
-    cached = cache_path(path, robot, smooth, fps, swing_clearance)
+    cached = cache_path(path, robot, smooth, fps, swing_clearance, foot_flat)
     if os.path.isfile(cached) and os.path.isfile(cached[:-4] + ".json"):
         m = load_motion(cached)
         with open(cached[:-4] + ".json", encoding="utf-8") as f:
@@ -166,7 +173,7 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
         log(f"{name}: retarget from cache {paths.rel(cached)}")
     else:
         log(f"{name}: retargeting ({fmt}) ...")
-        m, info = retarget_file(path, robot=robot, fmt=fmt, fps=fps, smooth_hz=smooth,
+        m, info = retarget_file(path, robot=robot, fmt=fmt, fps=fps, smooth_hz=smooth, foot_flat=foot_flat,
                                 swing_clearance=swing_clearance, smpl_model_dir=smpl_model_dir, log=None)
         os.makedirs(CACHE, exist_ok=True)
         m.save_npz(cached)
@@ -181,10 +188,13 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
         human = load_bvh(path)
     label_fmt = {"tpose": "BVH", "fbx": "FBX", "lafan1": "BVH LAFAN1", "nokov": "BVH Nokov", "smplx": "SMPL-X"}[fmt]
     smooth_txt = f", smooth {smooth:g} Hz" if smooth else ""
+    if foot_flat:
+        smooth_txt += ", foot-flat"
     if swing_clearance:
         smooth_txt += f", swing >= {100 * swing_clearance:g} cm"
     return Item(label=f"{folder}/{name}", source=path, kind=f"{label_fmt} -> GMR{smooth_txt}", robot=m,
-                human=human, info=info)
+                human=human, info=info, retarget={"smooth_hz": smooth, "foot_flat": bool(foot_flat),
+                                                  "swing_clearance_cm": round(100 * swing_clearance, 3)})
 
 
 def find_take(path: str, files: list[str] | None = None) -> str | None:
@@ -227,7 +237,7 @@ def _load_marker_item(path: str, log, **opts) -> Item:
     markers, fit = align_to_skeleton(marker_skeleton(raw), base.human)
     info = {**base.info, "c3d": {**marker_qc(raw), **fit}, "solved_motion": match}  # absolute path
     return Item(label=f"{os.path.basename(os.path.dirname(path))}/{name}", source=path,
-                kind=f"C3D 마커 + {base.kind}", robot=base.robot, human=markers, info=info)
+                kind=f"C3D 마커 + {base.kind}", robot=base.robot, human=markers, info=info, retarget=base.retarget)
 
 
 def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> None:
@@ -250,6 +260,13 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         out["phys_falls"] = phys.get("falls")
         out["phys_saturated_pct"] = float("nan") if saturated is None else 100 * saturated
         out["phys_ok"] = "통과" if phys.get("consistent") else "; ".join(map(_issue_ko, phys.get("issues", []))) or "?"
+    pol = item.info.get("policy_replay")
+    if pol:  # MuJoCo, no harness (tools/policy_replay.py, RetLens's 균형 제어)
+        out["phys_harness_pct"] = 0.0
+        out["phys_falls"] = pol.get("falls")
+        out["phys_saturated_pct"] = 100 * pol.get("torque_saturated_ratio", float("nan"))
+        out["phys_body_error_cm"] = pol.get("body_error_cm")
+        out["phys_ok"] = "통과" if not pol.get("falls") else f"넘어짐 {pol['falls']}회"
     item.metrics = out
 
 

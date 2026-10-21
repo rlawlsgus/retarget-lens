@@ -34,6 +34,7 @@ RetLens\                            릴리즈 zip을 푼 폴더 (어디에 두�
   _internal\                        Python, Qt/WebEngine, numpy/scipy, MuJoCo, viser(client/build만),
                                     khumanoid (GMR에서 가져온 IK 풀이 포함)
     assets\unitree_g1\              G1 URDF·MJCF·메시 (BSD-3)
+    assets\gmt_g1\g1.xml            GMT의 23 DoF G1 MuJoCo 모델 (위 메시 사용, 물리 모드 "없음 (MuJoCo)")
     configs\  data\cmu_metadata.csv  docs\ (도움말)  ai\retlens\SKILL.md (AI 가이드)
     isaac\khumanoid\, isaac\tools\isaac_replay.py   Isaac 파이썬이 읽는 일반 소스
     licenses\                       제3자 라이선스 고지
@@ -65,13 +66,15 @@ powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1          # 
 | Python, numpy, scipy | PSF / BSD | 가능 |
 | PySide6, Qt | LGPL-3.0 | 가능. DLL을 바꿀 수 있게 두고(onedir) 라이선스를 고지 |
 | Qt WebEngine (Chromium) | BSD-3 / LGPL | 가능. 고지 필요 |
-| viser | Apache-2.0 | 가능 |
+| viser | MIT | 가능 |
 | GMR | MIT | 가능 (필요한 부분만 가져와도 됨) |
 | mujoco, mink | Apache-2.0 | 가능 |
 | qpsolvers | LGPL-3.0 | 가능. 파이썬 파일 그대로 두고 고지 |
 | daqp, trimesh, yourdfpy, ezc3d | MIT | 가능 |
 | torch / MKL | BSD-3 / Intel Simplified | 가능 (빼는 편이 나음) |
 | Unitree G1 URDF·메시 | BSD-3 | 가능 |
+| GMT G1 MuJoCo 모델 (`g1.xml`) | Apache-2.0 (GMT, Unitree BSD-3 설명 기반) | 가능. `licenses\GMT-LICENSE.txt` 동봉 |
+| **GMT 추적 정책 (`pretrained.pt`)** | Apache-2.0, README: "연구용" | **넣지 않음** (PyTorch도 빠짐) |
 | **smplx (코드)** | **MPI 비상업** | **넣지 말 것** (아래 "작업 기록" 4번) |
 | **SMPL-X 모델 파일** | **MPI 비상업, 재배포 금지** | **불가.** 사용자가 받아 폴더를 지정 |
 | **AMASS·LAFAN1 데이터** | 비상업 / CC BY-NC-ND | **불가** |

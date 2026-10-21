@@ -45,7 +45,8 @@ from .. import cmu_labels
 from .. import paths as app_paths  # "paths" is a common local name here
 from .. import settings
 from ..compare import MOTION_EXT, Item, library_files
-from .scene import GRAPH_FIXED, METRIC_DESC, METRIC_HELP, METRIC_HELP_FOOTER, MotionScene, rel
+from .scene import (BALANCE, GRAPH_FIXED, METRIC_DESC, METRIC_HELP, METRIC_HELP_FOOTER, RETARGET_NOTE, RETARGET_TIPS,
+                    SWING_CLEARANCE_CM, MotionScene, rel)
 
 APP_NAME = "RetLens"  # Retarget Lens
 APP_TAGLINE = "Retarget Lens · 모캡 리타게팅 검증 편집기"
@@ -58,6 +59,14 @@ HIDE_VISER_PANEL_JS = """
 })();
 """
 ASSIST_LABELS = {1.0: "켬 (기본)", 0.0: "끔 (보조 없음)"}
+BALANCE_TIPS = {
+    "isaac": "Isaac Sim PhysX에서 골반 보조 힘(가상 하네스)이 균형을 대신 잡습니다(지금까지의 물리 모드). "
+             "배율은 '물리 > 골반 보조 힘 (Isaac)'에서 바꿉니다",
+    "pd": "MuJoCo에서 리타겟 관절각을 높은 게인의 PD로 그대로 따라갑니다. 균형 제어도 보조 힘도 없어 걷기도 대부분 "
+          "1–2초 안에 넘어집니다(Isaac 보조 힘 끔과 같은 개루프 재생)",
+    "gmt": "MuJoCo에서 공개된 G1 범용 추적 정책 GMT가 기준 동작과 로봇 자신의 상태를 보고 관절 목표를 냅니다"
+           "(실제 로봇이 모캡을 따라 하는 방식). 보조 힘은 없습니다",
+}
 
 
 def webengine_sandbox_workaround() -> bool:
@@ -95,6 +104,27 @@ def app_settings() -> QSettings:
         for k in old.allKeys():
             s.setValue(k, old.value(k))
     return s
+
+
+# The repository's editor and the installed RetLens share one QSettings store. The Isaac EULA consent is
+# the user's either way; the window layout, the file dialog's folder and the first-run check are per layout,
+# so one program closing last no longer decides the other's layout.
+LAYOUT_KEYS = ("window/geometry", "window/state", "layout/has_compare", "dialog/dir", "setup/checked")
+
+
+def layout_key(key: str) -> str:
+    """The QSettings key for this layout: as is in the installed program, under dev/ from the repository."""
+    return key if app_paths.INSTALLED else f"dev/{key}"
+
+
+def split_layout_settings(s: QSettings) -> None:
+    """Once, from the repository: start the dev/ keys from the values both programs shared until now."""
+    if app_paths.INSTALLED or s.value("dev/split", False, type=bool):
+        return
+    for k in LAYOUT_KEYS:
+        if s.contains(k) and not s.contains(layout_key(k)):
+            s.setValue(layout_key(k), s.value(k))
+    s.setValue("dev/split", True)
 
 
 def free_port() -> int:
@@ -246,7 +276,7 @@ class HierarchyPanel(QTreeWidget):
             state = Qt.Checked if it.visible else Qt.Unchecked
             if row.checkState(0) != state:
                 row.setCheckState(0, state)
-            text = sc.job_text(it) if (sc.physics_on or it.handles.get("phys") or sc.is_physics_result(it)) else ""
+            text = sc.job_text(it) if (sc.physics_on or it.handles.get("phys") or sc.is_sim_result(it)) else ""
             row.setText(2, text.split(" · ")[0] if text else "")
             row.setToolTip(2, text)
         self._filling = False
@@ -366,7 +396,7 @@ class InspectorPanel(QScrollArea):
         row.addWidget(self.offset)
         lay.addLayout(row)
 
-        lay.addWidget(self._section("물리 (Isaac PhysX)"))
+        lay.addWidget(self._section("물리"))
         self.phys = QLabel()
         self.phys.setWordWrap(True)
         lay.addWidget(self.phys)
@@ -419,8 +449,15 @@ class InspectorPanel(QScrollArea):
         it, sc = self.item, self.win.scene
         if it is None or it not in sc.items:
             return
-        self.phys.setText(sc.job_text(it) if (sc.physics_on or it.handles.get("phys") or sc.is_physics_result(it))
-                          else "물리 모드가 꺼져 있습니다(툴바나 물리 메뉴에서 켭니다).")
+        if sc.is_sim_result(it):
+            text = sc.job_text(it)
+        else:  # this mode's state, then what the other modes gave (they are kept: switching back is instant)
+            text = (f"균형 제어: {sc.mode_label()}\n{sc.job_text(it)}" if sc.physics_on
+                    else "물리 모드가 꺼져 있습니다(툴바나 물리 메뉴에서 켭니다).")
+            others = [(m, r) for m, r in sc.results_overview(it) if not (sc.physics_on and m == sc.mode_label())]
+            if others:
+                text += "\n\n계산해 둔 다른 결과:\n" + "\n".join(f"· {m}: {r}" for m, r in others)
+        self.phys.setText(text)
         self.video.setText(sc.video_text(it) or "아직 저장한 동영상이 없습니다.")
         has = sc.video_file(it) is not None
         self.open_video.setEnabled(has)
@@ -602,10 +639,11 @@ class TimelineTracks(QWidget):
         items = self.win.scene.items
         if not 0 <= i < len(items):
             return ""
-        it = items[i]
-        for ft, cause in self.win.scene.falls(it):
+        it, sc = items[i], self.win.scene
+        why = "판정" if sc.is_policy_result(sc.shown(it)) else "1차 원인"  # MuJoCo: the fall rule, not a diagnosis
+        for ft, cause in sc.falls(it):
             if abs(self._x(it.offset + ft) - pos.x()) < 6:
-                return f"{it.label}: 넘어짐 {ft:.2f}s" + (f" · 1차 원인 {cause}" if cause else "")
+                return f"{it.label}: 넘어짐 {ft:.2f}s" + (f" · {why} {cause}" if cause else "")
         return ""
 
 
@@ -1451,19 +1489,22 @@ class SettingsDialog(QDialog):
         pf = QGridLayout(prog)
         pf.setColumnStretch(1, 1)
         self.prog_status: dict[str, QLabel] = {}
-        for r, (key, label) in enumerate((("robot", "로봇 모델"), ("gmr", "리타게팅 (GMR)"))):
+        have = {c.key for c in settings.check_all(s)}  # 균형 제어 (GMT): not in the installed program
+        rows = [(k, label) for k, label in (("robot", "로봇 모델"), ("gmr", "리타게팅 (GMR)"), ("gmt", "균형 제어 (GMT)"))
+                if k in have]
+        for r, (key, label) in enumerate(rows):
             pf.addWidget(QLabel(f"<b>{label}</b>"), r, 0)
             st = QLabel()
             st.setWordWrap(True)
             pf.addWidget(st, r, 1, 1, 2)
             self.prog_status[key] = st
-        pf.addWidget(QLabel("<b>사용자 데이터</b>"), 2, 0)
+        pf.addWidget(QLabel("<b>사용자 데이터</b>"), len(rows), 0)
         data = QLabel(f"{escape(app_paths.user_dir())} <span style='color:gray'>(캐시·업로드·로그, 설정 파일)</span>")
         data.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        pf.addWidget(data, 2, 1)
+        pf.addWidget(data, len(rows), 1)
         open_data = QPushButton("열기")
         open_data.clicked.connect(lambda: self.win.open_path(app_paths.user_dir()))
-        pf.addWidget(open_data, 2, 2)
+        pf.addWidget(open_data, len(rows), 2)
         lay.addWidget(prog)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -1584,16 +1625,17 @@ class EditorWindow(QMainWindow):
         self._build_actions()
         self._build_status()
         self._default_state = self.saveState()
-        geo, state = self.settings.value("window/geometry"), self.settings.value("window/state")
+        split_layout_settings(self.settings)
+        geo, state = self.settings.value(layout_key("window/geometry")), self.settings.value(layout_key("window/state"))
         if geo is not None:
             self.restoreGeometry(geo)
         else:
             self.resize(1600, 960)
         if state is not None:
             self.restoreState(state)
-            if not self.settings.value("layout/has_compare", False, type=bool):  # layout saved before the 비교 tab
+            if not self.settings.value(layout_key("layout/has_compare"), False, type=bool):  # saved before the 비교 tab
                 self.tabifyDockWidget(self.docks["analysis"], self.docks["compare"])
-        self.settings.setValue("layout/has_compare", True)
+        self.settings.setValue(layout_key("layout/has_compare"), True)
 
         # The scene is posed on its own thread at 30 Hz, so the window (and the embedded 3D view,
         # which Qt composites on this thread) never waits for it; the timer below only refreshes
@@ -1681,11 +1723,12 @@ class EditorWindow(QMainWindow):
         self.a_home = act("처음으로", lambda: sc.seek(0.0), "Home", QStyle.SP_MediaSkipBackward)
         self.a_prev = act("이전 프레임", lambda: sc.step(-1), "Left", QStyle.SP_MediaSeekBackward)
         self.a_next = act("다음 프레임", lambda: sc.step(1), "Right", QStyle.SP_MediaSeekForward)
-        self.a_physics = act("물리 모드 (Isaac PhysX)", self.set_physics, "P", QStyle.SP_ComputerIcon, checkable=True,
-                             tip="켜면 각 로봇을 Isaac Sim PhysX가 시뮬레이션한 결과로 바꿔 그립니다(결과가 없으면 "
-                                 "백그라운드에서 계산, 짧은 클립 약 1분)")
-        self.a_cancel = act("Isaac 작업 취소", sc.cancel_jobs, icon=QStyle.SP_BrowserStop,
-                            tip="대기 중이거나 돌고 있는 물리 계산과 동영상 녹화를 멈춥니다")
+        self.a_physics = act("물리 모드", self.set_physics, "P", QStyle.SP_ComputerIcon, checkable=True,
+                             tip="켜면 각 로봇을 시뮬레이션한 결과로 바꿔 그립니다. 균형 제어에 따라 Isaac Sim PhysX"
+                                 "(골반 보조 힘, 짧은 클립 약 1분) 또는 MuJoCo(제어기 없음 / GMT 추적 정책, 클립당 몇 초)로 "
+                                 "백그라운드에서 계산합니다")
+        self.a_cancel = act("작업 취소", sc.cancel_jobs, icon=QStyle.SP_BrowserStop,
+                            tip="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화를 멈춥니다")
         self.a_compare = act("겹쳐 비교", lambda on: self.start_compare(on=on), "O", QStyle.SP_FileDialogContentsView,
                              checkable=True, tip="대상(B)을 기준(A)의 골반 위치에 겹쳐 그리고, A에서 벗어난 B의 부위만 색칠합니다 "
                                                  "(A·B는 '비교' 탭이나 계층 패널 우클릭에서 고름)")
@@ -1699,6 +1742,13 @@ class EditorWindow(QMainWindow):
         self.a_settings = act("환경 설정...", lambda: self.open_settings(), "Ctrl+,", QStyle.SP_FileDialogDetailedView,
                               tip="Isaac Sim·Blender·SMPL-X 모델·모션 폴더·동영상 폴더 위치와 점검")
         self.a_about = act("정보", self._about)
+        self.a_foot_flat = act("디딤발 평평 보정", lambda on: self.set_retarget(foot_flat=on), checkable=True,
+                               tip=f"{RETARGET_TIPS['foot_flat']}. {RETARGET_NOTE}")
+        self._swing_cm = sc.opts.swing_clearance_cm or SWING_CLEARANCE_CM  # the command line's height, if given
+        self.a_swing = act(f"스윙 발 보정 ({self._swing_cm:g} cm)",
+                           lambda on: self.set_retarget(swing_clearance_cm=self._swing_cm if on else 0.0),
+                           checkable=True, tip=f"{RETARGET_TIPS['swing']}. {RETARGET_NOTE}")
+        self._sync_retarget()
 
         mb = self.menuBar()
         m = mb.addMenu("파일(&F)")
@@ -1717,9 +1767,40 @@ class EditorWindow(QMainWindow):
         m = mb.addMenu("재생(&P)")
         for a in (self.a_play, self.a_home, self.a_prev, self.a_next):
             m.addAction(a)
+        # 리타게팅 보정 of the human motions opened next (open ones keep theirs: reopen to compare)
+        m = mb.addMenu("리타게팅(&R)")
+        m.setToolTipsVisible(True)
+        m.addAction(self.a_foot_flat)
+        m.addAction(self.a_swing)
         m = mb.addMenu("물리(&S)")
         m.addAction(self.a_physics)
-        sub = m.addMenu("골반 보조 힘")
+        # 균형 제어: what keeps the simulated robot up. The installed program cannot run every mode
+        # (no PyTorch for GMT): those entries are greyed out with the reason as their tip
+        sub = m.addMenu("균형 제어")
+        sub.setToolTipsVisible(True)
+        grp = QActionGroup(self)
+        self.a_balance = {}
+        self.balance_box = QComboBox()
+        self.balance_box.setToolTip("물리 모드의 균형 제어 (물리 메뉴에도 있음). 고르면 물리 모드를 켭니다")
+        for key, label in BALANCE.items():
+            why = sc.balance_problem(key) if app_paths.FROZEN else ""
+            tip = f"쓸 수 없음: {why}" if why else BALANCE_TIPS[key]
+            a = QAction(label + (" - 쓸 수 없음" if why else ""), self, checkable=True)
+            a.setChecked(key == sc.balance)
+            a.setEnabled(not why)
+            a.setToolTip(tip)
+            a.setStatusTip(tip)
+            a.triggered.connect(lambda _=False, k=key: self.set_balance(k))
+            grp.addAction(a)
+            sub.addAction(a)
+            self.a_balance[key] = a
+            self.balance_box.addItem(label + (" - 쓸 수 없음" if why else ""), key)
+            self.balance_box.setItemData(self.balance_box.count() - 1, tip, Qt.ToolTipRole)
+            if why:
+                self.balance_box.model().item(self.balance_box.count() - 1).setEnabled(False)
+        self.balance_box.setCurrentIndex(self.balance_box.findData(sc.balance))
+        self.balance_box.activated.connect(lambda i: self.set_balance(self.balance_box.itemData(i)))
+        self.m_assist = m.addMenu("골반 보조 힘 (Isaac)")
         grp = QActionGroup(self)
         self.a_assist = {}
         for val, label in ASSIST_LABELS.items():
@@ -1727,7 +1808,7 @@ class EditorWindow(QMainWindow):
             a.setChecked(val == sc.assist)
             a.triggered.connect(lambda _=False, v=val: sc.set_assist(v))
             grp.addAction(a)
-            sub.addAction(a)
+            self.m_assist.addAction(a)
             self.a_assist[val] = a
         m.addAction(self.a_cancel)
         m = mb.addMenu("도움말(&H)")
@@ -1739,8 +1820,8 @@ class EditorWindow(QMainWindow):
         tb.setMovable(True)
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         for a in (self.a_open, None, self.a_home, self.a_prev, self.a_play, self.a_next, None, self.a_physics,
-                  self.a_cancel, None, self.a_compare, self.a_fit, self.a_video):
-            tb.addSeparator() if a is None else tb.addAction(a)
+                  self.balance_box, self.a_cancel, None, self.a_compare, self.a_fit, self.a_video):
+            tb.addSeparator() if a is None else tb.addWidget(a) if isinstance(a, QWidget) else tb.addAction(a)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
     def _build_status(self) -> None:
@@ -1779,8 +1860,8 @@ class EditorWindow(QMainWindow):
         for c in checks:
             if not c.ok:
                 self.scene.log(f"환경 점검: {c.name} 없음 - {c.detail} ({c.needed_for} 사용 불가)")
-        first = not self.settings.value("setup/checked", False, type=bool)
-        self.settings.setValue("setup/checked", True)
+        first = not self.settings.value(layout_key("setup/checked"), False, type=bool)
+        self.settings.setValue(layout_key("setup/checked"), True)
         if first and self.auto_setup and any(not c.ok for c in checks):
             self.open_settings()
 
@@ -1974,12 +2055,12 @@ class EditorWindow(QMainWindow):
 
     def open_dialog(self) -> None:
         pats = " ".join(f"*{e}" for e in MOTION_EXT)
-        start = self.settings.value("dialog/dir", "") or next(
+        start = self.settings.value(layout_key("dialog/dir"), "") or next(
             (d for d in app_paths.library_roots() if os.path.isdir(d)), app_paths.documents_dir())
         paths, _ = QFileDialog.getOpenFileNames(self, "모션 파일 열기", start,
                                                 f"모션 파일 ({pats});;모든 파일 (*)")
         if paths:
-            self.settings.setValue("dialog/dir", os.path.dirname(paths[0]))
+            self.settings.setValue(layout_key("dialog/dir"), os.path.dirname(paths[0]))
             self.add_paths(paths)
 
     def dragEnterEvent(self, e):
@@ -2017,19 +2098,60 @@ class EditorWindow(QMainWindow):
         return True
 
     def set_physics(self, on: bool) -> None:
-        if on and not (self.need("isaac", "물리 모드") and self._ensure_eula()):
+        if on and not self._balance_ready(self.scene.balance):
             self.a_physics.blockSignals(True)
             self.a_physics.setChecked(False)
             self.a_physics.blockSignals(False)
             return
         self.scene.set_physics(on, "editor")
 
+    def set_balance(self, mode: str) -> None:
+        """균형 제어 from the menu or the toolbar; turns physics mode on when it is off."""
+        sc = self.scene
+        if (mode != sc.balance or not sc.physics_on) and self._balance_ready(mode):
+            sc.set_balance(mode)
+            if not sc.physics_on:
+                sc.set_physics(True, "균형 제어")
+        self._refresh_status()  # the menu and the box show the scene's mode (also when refused)
+
+    def set_retarget(self, **kw) -> None:
+        """리타게팅 menu: the scene's settings for the human motions opened next."""
+        r = self.scene.set_retarget(**kw)
+        on = [name for name, yes in (("디딤발 평평", r["foot_flat"]),
+                                     (f"스윙 발 {r['swing_clearance_cm']:g} cm", r["swing_clearance_cm"] > 0)) if yes]
+        self.status(f"리타게팅 보정: {', '.join(on) or '끔'}. {RETARGET_NOTE}", 10000)
+
+    def _sync_retarget(self) -> None:
+        """The 리타게팅 menu shows the scene's settings (the API can change them too)."""
+        o = self.scene.opts
+        if o.swing_clearance_cm > 0 and o.swing_clearance_cm != self._swing_cm:
+            self._swing_cm = o.swing_clearance_cm
+            self.a_swing.setText(f"스윙 발 보정 ({self._swing_cm:g} cm)")
+        for a, on in ((self.a_foot_flat, o.foot_flat), (self.a_swing, o.swing_clearance_cm > 0)):
+            if a.isChecked() != on:
+                a.blockSignals(True)
+                a.setChecked(on)
+                a.blockSignals(False)
+
+    def _balance_ready(self, mode: str) -> bool:
+        """What the mode needs is there (Isaac: installed and its EULA accepted; MuJoCo: GMT);
+        otherwise say what is missing."""
+        if mode == "isaac":
+            return self.need("isaac", "물리 모드 (보조 힘, Isaac)") and self._ensure_eula()
+        why = self.scene.balance_problem(mode)
+        if not why:
+            return True
+        if not app_paths.FROZEN and not self.need("gmt", f"균형 제어 '{BALANCE[mode]}'"):
+            return False  # need() said what is missing and offered 환경 설정
+        QMessageBox.warning(self, "균형 제어", f"'{BALANCE[mode]}'을(를) 쓸 수 없습니다.\n\n{why}")
+        return False
+
     def save_video(self, item: Item | None) -> None:
         if item is None or not self.need("isaac", "동영상 저장") or not self._ensure_eula():
             return
         try:
             job = self.scene.save_video(item)
-        except Exception as e:  # Isaac Sim not found
+        except Exception as e:  # Isaac Sim not found, the MuJoCo result not there yet
             QMessageBox.warning(self, "동영상을 저장할 수 없습니다", f"{type(e).__name__}: {e}")
             return
         self.status(f"동영상 {'대기열에 추가' if job.active else '이미 있음'}: {item.label}", 6000)
@@ -2077,15 +2199,26 @@ class EditorWindow(QMainWindow):
 
     def _refresh_status(self) -> None:
         sc = self.scene
-        self.st_physics.setText(f"물리 모드: {'켜짐 (보조 힘 x' + format(sc.assist, 'g') + ')' if sc.physics_on else '꺼짐'}")
+        self.st_physics.setText(sc.physics_status())
+        self.st_physics.setToolTip("\n".join(f"{it.label}: {sc.job_text(it)}" for it in list(sc.items)
+                                             if not sc.is_sim_result(it)) if sc.physics_on else "")
         jobs = sc.jobs_summary()
-        self.st_jobs.setText(f"Isaac 작업: {jobs}" if jobs else "Isaac 작업 없음")
+        self.st_jobs.setText(f"작업: {jobs}" if jobs else "작업 없음")
         if self.a_physics.isChecked() != sc.physics_on:
             self.a_physics.blockSignals(True)
             self.a_physics.setChecked(sc.physics_on)
             self.a_physics.blockSignals(False)
         for val, a in self.a_assist.items():
             a.setChecked(val == sc.assist)
+        self.m_assist.setEnabled(sc.balance == "isaac")
+        for key, a in self.a_balance.items():
+            a.setChecked(key == sc.balance)
+        i = self.balance_box.findData(sc.balance)
+        if self.balance_box.currentIndex() != i:
+            self.balance_box.blockSignals(True)
+            self.balance_box.setCurrentIndex(i)
+            self.balance_box.blockSignals(False)
+        self._sync_retarget()
 
     def _refresh_all(self) -> None:
         self.hierarchy.rebuild()
@@ -2107,7 +2240,7 @@ class EditorWindow(QMainWindow):
             self.a_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if sc.playing else QStyle.SP_MediaPlay))
         self.analysis.update_view()  # follows the playhead; skipped when the 분석 tab is not on screen
         self.compare_panel.update_live()
-        if sc.runner.busy() and int(now * 2) != int(prev * 2):  # job progress, twice a second
+        if sc.jobs_busy() and int(now * 2) != int(prev * 2):  # job progress, twice a second
             self.hierarchy.refresh()
             self.inspector.refresh(metrics=False)
             self._refresh_status()
@@ -2123,17 +2256,18 @@ class EditorWindow(QMainWindow):
         from .. import __version__
 
         QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME} {__version__}</b><br>{APP_TAGLINE}<br>K-Humanoid 프로젝트<br><br>"
-                                          f"씬: viser ({self.url})<br>물리·녹화: NVIDIA Isaac Sim (PhysX)<br><br>"
+                                          f"씬: viser ({self.url})<br>물리·녹화: NVIDIA Isaac Sim (PhysX)<br>"
+                                          f"균형 제어 (MuJoCo): GMT 추적 정책 (Apache-2.0, 공개 모델은 연구용)<br><br>"
                                           f"<b>파일 위치</b><table>{where}</table>")
 
     def closeEvent(self, e):
-        self.settings.setValue("window/geometry", self.saveGeometry())
-        self.settings.setValue("window/state", self.saveState())
+        self.settings.setValue(layout_key("window/geometry"), self.saveGeometry())
+        self.settings.setValue(layout_key("window/state"), self.saveState())
         self.timer.stop()
         self._stop_api()
         self._ticking = False
         self._ticker.join(timeout=1.0)
-        self.scene.runner.shutdown()
+        self.scene.shutdown()
         super().closeEvent(e)
 
 
@@ -2222,6 +2356,6 @@ def run(argv=None) -> int:
 
         QTimer.singleShot(int(args.quit_after * 1000), finish)
     code = app.exec()
-    scene.runner.shutdown()
+    scene.shutdown()
     server.stop()
     return code

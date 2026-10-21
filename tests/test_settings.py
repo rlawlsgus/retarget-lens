@@ -80,9 +80,34 @@ def test_folders_and_check(user):
     assert settings.video_dir(s) == str(user / "a" / "b")
     assert settings._writable(str(user / "a" / "b")) and not os.path.exists(user / "a")  # checked, not created
     checks = {c.key: c for c in settings.check_all(s)}
-    assert set(checks) == {"robot", "gmr", "isaac", "blender", "smpl", "robot_usd", "video", "library"}
-    assert checks["robot"].required and not checks["isaac"].required
+    assert set(checks) == {"robot", "gmr", "isaac", "blender", "smpl", "robot_usd", "gmt", "video", "library"}
+    assert checks["robot"].required and not checks["isaac"].required and not checks["gmt"].required
     assert checks["video"].ok and checks["robot_usd"].ok  # empty robot USD: the asset library's G1
+
+
+def test_find_gmt(user, monkeypatch):
+    """균형 제어 (GMT): its folder from KHUMANOID_GMT_DIR (else ..\\GMT), checked for the model and the policy."""
+    import importlib.util
+
+    root = user / "GMT"
+    monkeypatch.setenv(settings.GMT_ENV, str(root))
+    assert settings.gmt_dir() == str(root)
+    f = settings.find_gmt()
+    assert f.path is None and str(root) in f.problem and f.source.startswith("환경변수")
+    c = next(c for c in settings.check_all() if c.key == "gmt")
+    assert not c.ok and "install_gmt.ps1" in c.hint and "없음 (MuJoCo)" in c.needed_for
+    _file(root / settings.GMT_MODEL)  # the model only: the open-loop replay can run, the policy cannot
+    f = settings.find_gmt()
+    assert f.path == str(root) and "추적 정책 pretrained.pt 없음" in f.detail
+    c = next(c for c in settings.check_all() if c.key == "gmt")
+    assert not c.ok and c.needed_for.endswith("추적 정책 (GMT)") and "없음 (MuJoCo)" not in c.needed_for
+    _file(root / settings.GMT_POLICY)
+    libs = all(importlib.util.find_spec(m) is not None for m in ("mujoco", "torch"))
+    assert next(c for c in settings.check_all() if c.key == "gmt").ok == libs
+    monkeypatch.delenv(settings.GMT_ENV)
+    assert settings.gmt_dir() == os.path.join(os.path.dirname(paths.REPO_ROOT), "GMT")  # next to the repository
+    monkeypatch.setattr(paths, "FROZEN", True)  # the installed program: no check (its menus say why instead)
+    assert "gmt" not in {c.key for c in settings.check_all()}
 
 
 def test_robot_usd_option(user):
