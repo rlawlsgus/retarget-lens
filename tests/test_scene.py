@@ -67,6 +67,7 @@ def test_add_play_measure_remove(scene):
     names, cols = scene.metric_table(a)
     assert len(names) == len(cols[0][1]) and cols[0][1][0] == "기구학" and cols[0][1][names.index("기준 대비 다리 RMSE (°)")] == "기준"
     assert dict(scene.item_facts(a))["QC"] in ("PASS", "WARN", "FAIL")
+    assert cols[0][1][names.index("리타게팅 점수")] == "-"  # a robot motion: no human to compare with
 
     scene.view.robot_translucent = True
     scene.view_changed("robot_translucent")
@@ -99,6 +100,10 @@ def test_retarget_settings_apply_to_motions_opened_next(scene, tmp_path, monkeyp
         assert flat.kind.endswith("smooth 6 Hz, foot-flat, swing >= 2 cm") and flat.label.endswith("(2)")
         assert len([f for f in os.listdir(tmp_path) if f.endswith(".npz")]) == 2  # one cache entry per setting
         assert "디딤발 평평" in dict(scene.item_facts(flat)) and "디딤발 평평" not in dict(scene.item_facts(plain))
+        names, cols = scene.metric_table(None)  # 리타게팅 점수: human inputs only
+        row = names.index("리타게팅 점수")
+        assert all(v[row] == it.metrics["retarget_grade"] != "-" for it, v in cols)
+        assert "리타게팅 점수" in dict(scene.item_facts(plain)) and "많이 어긋난 부위" in dict(scene.item_facts(plain))
         with pytest.raises(ValueError):
             scene.set_retarget(swing_clearance_cm=-1.0)
         assert scene.set_retarget(foot_flat=False)["swing_clearance_cm"] == 2.0  # each setting on its own

@@ -55,7 +55,11 @@ PALETTE = [(230, 90, 50), (50, 125, 215), (60, 165, 90), (150, 90, 190), (215, 1
            (0, 160, 170), (200, 70, 140)]
 GRAPH_FIXED = ("골반 높이 (m)", "골반 수평속도 (m/s)")
 METRIC_ROWS = [  # (label, metrics key, format)
-    ("길이 (s)", "duration", "{:.1f}"), ("관절 가속도 (rad/s²)", "acc_mean", "{:.1f}"),
+    ("길이 (s)", "duration", "{:.1f}"),
+    ("리타게팅 점수", "retarget_grade", "{}"), ("자세 재현 오차 (°)", "pose_err_deg", "{:.1f}"),
+    ("발 접촉 불일치 (%)", "contact_mismatch_pct", "{:.1f}"), ("관절 한계 걸림 (%)", "joint_limit_pct", "{:.1f}"),
+    ("자기 충돌 (%)", "self_collision_pct", "{:.1f}"),
+    ("관절 가속도 (rad/s²)", "acc_mean", "{:.1f}"),
     ("관절 저크 (rad/s³)", "jerk_mean", "{:.0f}"), ("최대 관절속도 (rad/s)", "vel_max", "{:.1f}"),
     ("발 미끄러짐 (%)", "planted_slip_pct", "{:.2f}"), ("바닥 관통 (%)", "penetration_pct", "{:.2f}"),
     ("발 최저점 (cm)", "sole_min_cm", "{:.1f}"), ("스윙 발 바닥 근접 (%)", "swing_low_pct", "{:.1f}"),
@@ -65,6 +69,8 @@ METRIC_ROWS = [  # (label, metrics key, format)
     ("물리: 몸 위치 오차 (cm)", "phys_body_error_cm", "{:.1f}"),
     ("물리: 토크 한계 초과 (%)", "phys_saturated_pct", "{:.1f}"), ("물리 판정", "phys_ok", "{}"),
 ]
+# properties of the retarget itself: the table keeps them in physics mode (from the kinematic motion)
+RETARGET_ROWS = {"retarget_grade", "pose_err_deg", "contact_mismatch_pct", "joint_limit_pct", "self_collision_pct"}
 METRIC_NOTES = (
     "RMSE: 기준과 겹치는 구간의 관절별 RMSE 중앙값(시간 오프셋 반영). 발 미끄러짐: 발바닥 전체가 붙은 채 0.3 m/s 이상으로 "
     "0.1 s 이상 움직인 프레임 비율. 바닥 관통: 발 최저점 -2 cm 아래 프레임 비율. 스윙 발 바닥 근접: 가장 느린 발바닥 점까지 "
@@ -79,6 +85,19 @@ METRIC_HELP = [
                    "x 뒤 숫자는 골반 보조 힘 배율입니다(x0 = 보조 없음). MuJoCo · 없음 / GMT = MuJoCo에서 제어기 없이(개루프 PD) "
                    "또는 GMT 추적 정책으로 보조 힘 없이 시뮬레이션한 결과입니다."),
         ("길이 (s)", "모션 길이."),
+    ]),
+    ("리타게팅 품질 (사람 모션을 리타게팅한 것만, 로봇끼리 같은 기준)", [
+        ("리타게팅 점수", "0–100 점과 등급(85 이상 좋음, 70 이상 보통, 그 밖은 나쁨). 아래 네 지표와 발 미끄러짐·정적 불균형·"
+                     "바닥 관통이 기준을 넘은 만큼 깎습니다. 무엇이 깎였는지는 인스펙터에 나옵니다(docs/pipeline.md "
+                     "\"리타게팅 품질\")."),
+        ("자세 재현 오차 (°)", "허벅지·정강이·위팔·아래팔(좌우)과 몸통(골반 → 양 어깨 가운데)이 사람과 다른 방향을 가리키는 "
+                          "각도의 평균. 로봇의 크기·비율과 상관없이, 팔다리가 사람과 같은 쪽을 향하는지만 봅니다."),
+        ("발 접촉 불일치 (%)", "사람과 로봇 중 한쪽 발만 바닥에 닿아 있는 프레임 비율(발마다). 닿음은 발목 높이·속도로 정하고, "
+                           "기준은 각자의 다리 길이 단위입니다."),
+        ("관절 한계 걸림 (%)", "어느 관절이든 가동 범위 끝(1° 안)에 붙어 있는 프레임 비율. 로봇 관절이 그 동작을 따라갈 만큼 "
+                           "돌지 못한다는 뜻입니다."),
+        ("자기 충돌 (%)", "로봇 몸끼리 3 cm 넘게 파고든 프레임 비율(모델의 충돌 형상 기준). 손이 엉덩이·몸통·다른 손을 "
+                        "뚫는 경우가 대부분입니다."),
     ]),
     ("매끄러움 (클수록 떨림)", [
         ("관절 가속도 (rad/s²)", "모든 관절 각가속도 크기의 평균."),
@@ -1143,6 +1162,20 @@ class MotionScene:
         res = item.info.get("ik_position_residual")
         if res:
             rows.append(("IK 잔차(평균)", ", ".join(f"{k} {v['mean_cm']} cm" for k, v in res.items())))
+        if m.get("retarget_grade"):  # khumanoid.retarget_quality
+            from ..retarget_quality import SCORE_LABELS
+
+            q = m.get("_quality") or {}
+            lost = ", ".join(f"{SCORE_LABELS.get(k, k)} -{v:g}" for k, v in q.get("score_lost", {}).items())
+            rows.append(("리타게팅 점수", m["retarget_grade"] + (f" · 감점: {lost}" if lost else " · 감점 없음")))
+            worst = sorted(q.get("segments_deg", {}).items(), key=lambda kv: -kv[1])[:3]
+            rows.append(("많이 어긋난 부위", ", ".join(f"{n} {v:g}°" for n, v in worst)))
+            if q.get("pinned_joints_pct"):
+                rows.append(("한계에 붙은 관절", ", ".join(f"{n.removesuffix('_joint')} {v:g}%"
+                                                     for n, v in q["pinned_joints_pct"].items())))
+            if q.get("collision_pairs_pct"):
+                rows.append(("자기 충돌 부위", ", ".join(f"{n.replace('_link', '')} {v:g}%"
+                                                   for n, v in q["collision_pairs_pct"].items())))
         ff = item.info.get("foot_flat")
         if ff:  # retargeted with 디딤발 평평 보정 (khumanoid.retarget.flatten_stance_feet)
             side = {"left": "왼", "right": "오"}
@@ -1214,8 +1247,9 @@ class MotionScene:
                 return "-"
             return fmt.format(v)
 
-        names = ["재생 방식"] + [r[0] for r in METRIC_ROWS[:11]] + ["기준 대비 다리 RMSE (°)", "기준 대비 전체 RMSE (°)"] \
-            + [r[0] for r in METRIC_ROWS[11:]]
+        qc = next(i for i, r in enumerate(METRIC_ROWS) if r[1] == "qc")  # the RMSE rows go before QC
+        names = ["재생 방식"] + [r[0] for r in METRIC_ROWS[:qc]] + ["기준 대비 다리 RMSE (°)", "기준 대비 전체 RMSE (°)"] \
+            + [r[0] for r in METRIC_ROWS[qc:]]
         cols = []
         for it in list(self.items):
             shown = self.shown(it)
@@ -1230,8 +1264,8 @@ class MotionScene:
                     else f"MuJoCo · {'GMT' if shown.info['policy_replay'].get('controller') == 'gmt' else '없음'}"
                     if self.is_policy_result(shown)
                     else "기구학")
-            vals = [mode] + [f(m.get(k), fmt) for _, k, fmt in METRIC_ROWS[:11]] + [legs, whole] \
-                + [f(m.get(k), fmt) for _, k, fmt in METRIC_ROWS[11:]]
+            vals = [f((it.metrics if k in RETARGET_ROWS else m).get(k), fmt) for _, k, fmt in METRIC_ROWS]
+            vals = [mode] + vals[:qc] + [legs, whole] + vals[qc:]
             cols.append((it, vals))
         return names, cols
 

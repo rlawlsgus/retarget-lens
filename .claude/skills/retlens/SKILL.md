@@ -27,7 +27,7 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 |---|---|---|
 | `info` | 버전, 파일 위치, 환경 점검 | `locations`, `checks[]`(key, ok, needed_for, hint), `isaac_eula_accepted` |
 | `library [--query Q] [--limit N]` | 모션 폴더의 파일 목록. Q는 파일 이름과 CMU 동작 설명에서 찾음(예: `143_11`, `walk`, `dance`) | `files[]`(path, folder, name, cmu_description) |
-| `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, metrics, c3d) |
+| `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, metrics, retarget_quality, c3d) |
 | `metrics FILE... [--ref N]` | 창의 "분석" 표와 같은 표. 기준(ref, 기본은 첫 파일) 대비 RMSE 포함 | `rows`, `motions[].values`, `row_help` |
 | `compare A B [--tol 3] [--no-heading] [--align]` | 겹쳐 비교: B를 A의 골반에 맞춰 부위별 차이(cm) | `regions[]`(region, mean_cm, max_cm, max_at_s, beyond_tol_pct), `worst_moments[]` |
 | `align REF FILE...` | 기준에 시간 자동 정렬(다리 관절각이 가장 잘 맞는 오프셋) | `offsets_s`, `notes` |
@@ -99,6 +99,11 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
   - 골반 보조 힘(`assist` 1 = 기본, 0 = 끔)은 균형 제어기를 대신합니다. 이 힘에 기대는 비율이 크면 그 동작은 로봇이 혼자 하기 어렵다는 뜻입니다.
   - 결과는 캐시되어 다시 요청하면 바로 나옵니다.
   - **균형 제어**(`balance`)를 `pd`/`gmt`로 바꾸면 Isaac 대신 MuJoCo로 계산합니다(클립당 몇 초, 라이선스 동의 불필요). `pd`는 제어기 없는 개루프 재생이라 거의 다 넘어지고, `gmt`는 실제 로봇처럼 추적 정책이 균형을 잡습니다. 같은 클립에서 `gmt`도 넘어지거나 `phys_body_error_cm`·토크 한계 초과가 크면 로봇이 따라 하기 어려운 동작입니다. `gmt`는 저장소 실행에서만 됩니다(설치판에는 PyTorch가 없음).
+- **리타게팅 품질:** 리타게팅이 잘 됐는지를 로봇에 상관없이 같은 기준으로 잽니다(`khumanoid/retarget_quality.py`). 사람 모션을 열면 계산됩니다.
+  - 무엇을 보나: 팔다리가 사람과 같은 쪽을 가리키는지(`pose_err_deg`), 발이 같은 때 바닥에 닿는지(`contact_mismatch_pct`), 로봇 관절이 범위 끝에 걸리는지(`joint_limit_pct`), 로봇 몸끼리 뚫고 지나가는지(`self_collision_pct`).
+  - 이 네 지표와 발·균형 지표로 `retarget_score`(0–100)를 냅니다. `inspect`·`/api/motion`의 `retarget_quality`에 부위별 각도, 한계에 붙은 관절, 충돌 부위, 감점 내역이 있습니다.
+  - 로봇 모션 파일(npz·csv)만 열면 비교할 사람 모션이 없어서 계산하지 않습니다.
+  - **로봇끼리 비교 (저장소 실행에서만, 설치판에는 없음):** `python tools\retarget_benchmark.py --robot A --robot B <클립 폴더>`가 같은 클립을 로봇마다 리타게팅해 `reports\retarget_quality\summary.md`에 로봇별 평균 점수·등급 수·지표 중앙값을 씁니다. 리타게팅 설정(`--foot-flat` 등)을 바꿔 돌리면 설정끼리도 비교할 수 있습니다.
 - **리타게팅 보정:** 리타게팅 뒤 발을 고치는 후처리 두 가지입니다. 둘 다 기본은 끔입니다.
   - **디딤발 평평**(`foot_flat`): 서 있는 발의 발바닥을 바닥과 평평하게 맞춥니다. 발목 pitch·roll만 바꾸고, 움직이는 발은 그대로 둡니다.
     - CMU 143번처럼 발끝이 들린 채 뒤꿈치로만 서는 리타겟을 고칠 때 씁니다. 이런 클립은 정적 불균형이 22–39%였고, 보정 후 0–8%가 됐습니다.
@@ -113,6 +118,11 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | 키 (`metrics`) | 표 이름 | 뜻 | 보는 법 |
 |---|---|---|---|
 | `duration` | 길이 (s) | 모션 길이 | |
+| `retarget_grade` (`retarget_score`) | 리타게팅 점수 | 0–100점과 등급(85 이상 좋음, 70 이상 보통, 그 밖 나쁨). 사람 모션을 리타게팅한 것만 | 아래 품질 지표와 발 미끄러짐·정적 불균형·바닥 관통이 기준을 넘은 만큼 깎음. 무엇이 깎였는지는 `retarget_quality.score_lost` |
+| `pose_err_deg` | 자세 재현 오차 (°) | 허벅지·정강이·위팔·아래팔(좌우)과 몸통(골반 → 양 어깨 가운데)이 사람과 다른 방향을 가리키는 각도 평균 | 로봇 크기·비율과 무관. 8° 이하 좋음, 25° 이상 나쁨. 부위별 값은 `retarget_quality.segments_deg` |
+| `contact_mismatch_pct` | 발 접촉 불일치 (%) | 사람과 로봇 중 한쪽 발만 바닥에 닿은 프레임(발마다) | `contact_lost_pct`(사람은 딛는데 로봇 발은 뜸)·`contact_extra_pct`(로봇 발만 붙어 있음)로 나뉨 |
+| `joint_limit_pct` | 관절 한계 걸림 (%) | 어느 관절이든 가동 범위 끝(1° 안)에 붙은 프레임 | 로봇 관절이 동작을 따라갈 만큼 못 돎. 어떤 관절인지는 `retarget_quality.pinned_joints_pct` |
+| `self_collision_pct` | 자기 충돌 (%) | 로봇 몸끼리 3 cm 넘게 파고든 프레임(충돌 형상 기준) | 대개 손이 엉덩이·몸통·다른 손을 뚫음. 부위는 `retarget_quality.collision_pairs_pct` |
 | `acc_mean` | 관절 가속도 (rad/s²) | 관절 각가속도 크기 평균 | 같은 동작끼리 비교. 클수록 떨림 |
 | `jerk_mean` | 관절 저크 (rad/s³) | 각가속도 변화율 평균 | 떨림에 가장 민감 |
 | `vel_max` | 최대 관절속도 (rad/s) | 가장 빠른 관절 속도 | 모터 한계(대략 20–30 rad/s) 근처면 의심 |
@@ -134,7 +144,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 
 ## 6. 자주 하는 작업
 
-1. **폴더의 클립들 품질 보기:** `library --query ...` → `inspect` 여러 개 → `qc`가 FAIL/WARN인 것과 `qc_notes`, 눈에 띄는 지표(발 미끄러짐, 관통, 스윙 발 바닥 근접, 정적 불균형)를 정리합니다.
+1. **폴더의 클립들 품질 보기:** `library --query ...` → `inspect` 여러 개 → `qc`가 FAIL/WARN인 것과 `qc_notes`, `retarget_score`가 낮은 것과 그 `retarget_quality.score_lost`, 눈에 띄는 지표(발 미끄러짐, 관통, 스윙 발 바닥 근접, 정적 불균형)를 정리합니다. 여러 클립·로봇을 한 표로 보려면 저장소의 `tools\retarget_benchmark.py`를 씁니다(설치판에서는 `inspect` 결과를 모아 표로 만듭니다).
 2. **같은 촬영의 두 소스 비교(예: CMU 02_01 BVH vs AMASS SMPL-X):**
    - `compare A B --align`으로 부위별 평균·최대와 `worst_moments`를 받습니다.
    - 창이 떠 있으면 `/api/open` → `/api/align` → `/api/compare` → `/api/playback {"time_s": <worst>}` → `/api/screenshot`으로 그 순간을 보여 줍니다.

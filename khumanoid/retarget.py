@@ -124,6 +124,22 @@ TPOSE_LIMBS = {"unitree_g1": _G1_TPOSE_LIMBS, "unitree_g1_with_hands": _G1_TPOSE
 # ...and the feet are levelled with the ankles: (ankle joints, foot body)
 _G1_TPOSE_FEET = [([f"{s}_ankle_pitch_joint", f"{s}_ankle_roll_joint"], f"{s}_ankle_roll_link") for s in ("left", "right")]
 TPOSE_FEET = {"unitree_g1": _G1_TPOSE_FEET, "unitree_g1_with_hands": _G1_TPOSE_FEET}
+# ...and each elbow is turned to bend in the human's plane: the shoulder's twist joint puts the
+# robot's bend axis on the human's. A straight arm in the reference pose shows no twist, so the
+# human axis comes from the clip's own bends (_human_bend_axes); left at 0, CMU BVH elbows bent
+# in a plane 38 deg off the human's and the hands went through the hips (retarget_quality found
+# it). Knees are left out: their axes already matched in the reference (CMU BVH, 0.2 deg), and
+# twisting the hips for SMPL-X pinned the ankle roll without bending the knees any truer.
+# (twist joint, bend joint, robot (upper, middle, lower) bodies, human (upper, middle, lower)).
+_G1_TPOSE_TWISTS = [
+    (f"{s}_shoulder_yaw_joint", f"{s}_elbow_joint", (f"{s}_shoulder_roll_link", f"{s}_elbow_link", f"{s}_wrist_roll_link"),
+     (f"{S}Arm", f"{S}ForeArm", f"{S}Hand"))
+    for s, S in (("left", "Left"), ("right", "Right"))
+]
+TPOSE_TWISTS = {"unitree_g1": _G1_TPOSE_TWISTS, "unitree_g1_with_hands": _G1_TPOSE_TWISTS}
+BEND_AXIS_MIN_DEG = 20.0  # frames bent at least this much show the bend axis
+BEND_AXIS_MIN_FRAMES = 10
+BEND_AXIS_CONSISTENCY = 0.7  # mean resultant length of the per-frame axes: lower = no steady hinge
 
 # Robot body that sits at the human joint centre, where the IK body's origin does
 # not (G1 hip_yaw_link is mid-thigh, shoulder_yaw_link mid-upper-arm). The
@@ -538,8 +554,59 @@ def _angle(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.arccos(np.clip(c, -1.0, 1.0)))
 
 
-def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray):
-    """Robot qpos (root at origin, identity) whose limbs point like the human's."""
+def _human_bend_axes(robot: str, clip: HumanClip) -> dict[str, tuple[np.ndarray | None, dict]]:
+    """Bend axis of each elbow / knee (TPOSE_TWISTS) in the reference pose, world coordinates.
+
+    For a hinge, upper x lower segment stays fixed in the upper segment's own frame, so the
+    clip's bent frames (>= BEND_AXIS_MIN_DEG) give it: their axes in that frame, averaged
+    weighted by sin(bend), then carried into the reference pose. {twist joint: (axis, info)};
+    axis None when the clip hardly bends the limb or the axis wanders (no steady hinge)."""
+    ref = clip.info["_ref_pose"]
+    out = {}
+    for twist, _, _, (a, b, c) in TPOSE_TWISTS.get(robot, []):
+        key = [n + "Mod" if n.endswith("Foot") else n for n in (a, b, c)]  # a leg's: clip frames carry <Side>FootMod
+        P = np.array([[fr[k][0] for k in key] for fr in clip.frames], dtype=np.float64)
+        Ra = quat_to_matrix(np.array([fr[a][1] for fr in clip.frames], dtype=np.float64))
+        u, f = P[:, 1] - P[:, 0], P[:, 2] - P[:, 1]
+        n = np.cross(u, f)
+        sin = np.linalg.norm(n, axis=1) / np.maximum(np.linalg.norm(u, axis=1) * np.linalg.norm(f, axis=1), 1e-12)
+        bend = np.degrees(np.arctan2(sin, np.einsum("ij,ij->i", u, f) / np.maximum(
+            np.linalg.norm(u, axis=1) * np.linalg.norm(f, axis=1), 1e-12)))
+        bent = np.isfinite(bend) & (bend >= BEND_AXIS_MIN_DEG)
+        info = {"bent_frames": int(bent.sum())}
+        if bent.sum() < BEND_AXIS_MIN_FRAMES:
+            out[twist] = (None, info)
+            continue
+        local = np.einsum("tji,tj->ti", Ra[bent], n[bent] / np.linalg.norm(n[bent], axis=1, keepdims=True))  # R^T n
+        mean = (local * sin[bent, None]).sum(0) / sin[bent].sum()
+        info["consistency"] = round(float(np.linalg.norm(mean)), 3)
+        if info["consistency"] < BEND_AXIS_CONSISTENCY:
+            out[twist] = (None, info)
+            continue
+        out[twist] = (ref[a][1] @ (mean / np.linalg.norm(mean)), info)
+    return out
+
+
+def _robot_bend_axis(model, data, q: np.ndarray, bend_joint: int, bodies: tuple[int, int, int]) -> np.ndarray:
+    """The robot limb's bend axis (upper x lower segment) with the bend joint flexed 1 rad from
+    q: towards the farther end of its range (elbows and knees bend much further than they
+    overextend), so the axis has the human's sense."""
+    import mujoco as mj
+
+    adr = model.jnt_qposadr[bend_joint]
+    lo, hi = model.jnt_range[bend_joint] if model.jnt_limited[bend_joint] else (-np.pi, np.pi)
+    q0 = q[adr]
+    q[adr] = np.clip(q0 + (1.0 if hi - q0 >= q0 - lo else -1.0), lo, hi)
+    data.qpos[:] = q
+    mj.mj_kinematics(model, data)
+    x0, x1, x2 = (data.xpos[b].copy() for b in bodies)
+    q[adr] = q0
+    return np.cross(x1 - x0, x2 - x1)
+
+
+def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray, bend_axes: dict | None = None):
+    """Robot qpos (root at origin, identity) whose limbs point like the human's and whose
+    elbows / knees bend about the human's axes (bend_axes: twist joint -> world axis)."""
     import mujoco as mj
 
     data = mj.MjData(model)
@@ -561,9 +628,31 @@ def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray):
         q[model.jnt_qposadr[j]] = best[1]
         chosen[joint] = {"rad": round(float(best[1]), 4), "residual_deg": round(float(np.degrees(best[0])), 1)}
 
+    # Twist each limb about itself so its bend axis matches the human's (the limb directions
+    # stay: the twist joint turns about the upper segment). Limbs the clip hardly bends keep 0.
+    twists = []
+    for twist, bend, rbodies, _ in TPOSE_TWISTS.get(robot, []):
+        axis = (bend_axes or {}).get(twist)
+        if axis is None:
+            continue
+        jt = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, twist)
+        jb = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, bend)
+        bodies = tuple(mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n) for n in rbodies)
+        target = face.T @ axis
+        lo, hi = model.jnt_range[jt] if model.jnt_limited[jt] else (-np.pi, np.pi)
+        best = (np.inf, 0.0)
+        for v in np.linspace(lo, hi, 721):
+            q[model.jnt_qposadr[jt]] = v
+            best = min(best, (_angle(_robot_bend_axis(model, data, q, jb, bodies), target), v))
+        q[model.jnt_qposadr[jt]] = best[1]
+        chosen[twist] = {"rad": round(float(best[1]), 4)}
+        twists.append((twist, jb, bodies, target))
+
     # Refine each limb with all its joints at once: one axis per joint cannot follow a
     # limb that also points forward (SMPL-X zero pose: arms forward and down, knees
-    # slightly bent). A small pull towards the 1-D solution keeps the free twist at 0.
+    # slightly bent). A small pull towards the 1-D solution keeps the free twist at 0,
+    # unless the limb's bend axis is known: then its twist joint joins in and the axis is
+    # matched too (on its own the twist cannot reach an axis tilted off the robot's limb).
     from scipy.optimize import minimize
 
     def body(name):
@@ -571,7 +660,10 @@ def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray):
 
     refined = {}
     for joints, segments in TPOSE_LIMBS.get(robot, []):
-        ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in joints]
+        hinge = next(((t, jb, bodies, target) for t, jb, bodies, target in twists
+                      if mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, jb) in joints), None)
+        names = list(joints) + ([hinge[0]] if hinge else [])
+        ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in names]
         adr = [model.jnt_qposadr[j] for j in ids]
         bounds = [tuple(model.jnt_range[j]) if model.jnt_limited[j] else (-np.pi, np.pi) for j in ids]
         segs = [(body(r0), body(r1), face.T @ (ref_pose[h1][0] - ref_pose[h0][0])) for (r0, r1), (h0, h1) in segments]
@@ -585,15 +677,20 @@ def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray):
             for b0, b1, target in segs:
                 v = data.xpos[b1] - data.xpos[b0]
                 c += 1.0 - np.dot(v, target) / max(np.linalg.norm(v) * np.linalg.norm(target), 1e-12)
+            if hinge:
+                n = _robot_bend_axis(model, data, q, hinge[1], hinge[2])
+                c += 1.0 - np.dot(n, hinge[3]) / max(np.linalg.norm(n) * np.linalg.norm(hinge[3]), 1e-12)
             return c + 0.02 * float(np.sum((x - x0) ** 2))
 
         res = minimize(cost, x0, method="L-BFGS-B", bounds=bounds)
         q[adr] = res.x
         cost(res.x)
+        data.qpos[:] = q  # the bend-axis term left data at the flexed pose
+        mj.mj_kinematics(model, data)
         for (r0, r1), (h0, h1) in segments:
             target = face.T @ (ref_pose[h1][0] - ref_pose[h0][0])
             refined[f"{r0}->{r1}"] = round(float(np.degrees(_angle(data.xpos[body(r1)] - data.xpos[body(r0)], target))), 1)
-        for n, v in zip(joints, res.x):
+        for n, v in zip(names, res.x):
             chosen[n] = {"rad": round(float(v), 4)}
 
     # The reference skeletons stand flat-footed (cgspeed T-pose frame, SMPL-X zero pose),
@@ -616,6 +713,8 @@ def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray):
         refined[f"{foot} tilt"] = round(float(np.degrees(np.arccos(np.clip(1.0 - tilt(res.x), -1, 1)))), 1)
         for n, v in zip(joints, res.x):
             chosen[n] = {"rad": round(float(v), 4)}
+    for twist, jb, bodies, target in twists:  # after the refinement moved the limbs a little
+        refined[f"{twist} bend axis"] = round(float(np.degrees(_angle(_robot_bend_axis(model, data, q, jb, bodies), target))), 1)
     if refined:
         chosen["segment_residual_deg"] = refined
     data.qpos[:] = q
@@ -643,7 +742,8 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
 
     Starts from GMR's LAFAN1 config of the robot (task list + weights) and replaces
     - rotation offsets: human frame at the reference T-pose -> robot body frame in
-      the robot posed the same way (limb directions matched joint by joint);
+      the robot posed the same way (limb directions matched joint by joint, each limb
+      twisted so its elbow / knee bends about the human's axis, from the clip's bends);
     - scale table: robot / human root-to-ankle distance for the legs and root,
       root-to-wrist distance for the torso and arms, in those poses;
     - ground: a constant shift so the scaled feet stand at the robot's ankle
@@ -659,7 +759,8 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
     model = robot_model(robot)
     ref = clip.info["_ref_pose"]
     face = _facing_frame(ref)
-    data, chosen = _robot_tpose(model, robot, ref, face)
+    bend_axes = _human_bend_axes(robot, clip)
+    data, chosen = _robot_tpose(model, robot, ref, face, {k: a for k, (a, _) in bend_axes.items() if a is not None})
 
     import mujoco as mj
 
@@ -714,6 +815,7 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
     info = {
         "base_config": os.path.basename(str(base_path)),
         "robot_tpose": chosen,
+        "bend_axes": {k: info for k, (_, info) in bend_axes.items()},  # human elbow / knee axes from the clip
         "scales": cfg["human_scale_table"],
         "ground_offset_m": round(ground, 4),
         "robot_ankle_height_m": round(ankle_h, 4),

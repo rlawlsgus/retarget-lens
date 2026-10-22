@@ -174,6 +174,62 @@ def test_smpl_joint_names_map_to_tpose_bodies():
     assert name["RightArm"] == "right_shoulder" and name["LeftForeArm"] == "left_elbow" and name["RightHand"] == "right_wrist"
 
 
+def test_bend_axes_come_from_the_clip():
+    """The human elbow axes the T-pose config twists the robot's arms to: found in the upper
+    arm's own frame however it turns, carried into the reference pose. An arm the clip hardly
+    bends, or bends about a wandering axis, gives none."""
+    from scipy.spatial.transform import Rotation
+
+    from khumanoid.retarget import TPOSE_BODIES, HumanClip, _human_bend_axes
+    from khumanoid.rotations import matrix_to_quat
+
+    T = 60
+    hinge = np.array([0.0, np.sin(0.6), np.cos(0.6)])  # across the upper arm (its x axis), in its frame
+    upper = Rotation.random(T, random_state=1).as_matrix()  # the upper arm turning about freely
+    wander = np.random.default_rng(2).uniform(0, 2 * np.pi, T)
+    ref_R = Rotation.from_euler("zx", [30, 80], degrees=True).as_matrix()
+
+    def clip(left_bend, right_axes):
+        frames = [{b: [np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])] for b in TPOSE_BODIES} for _ in range(T)]
+        for side, axes, bend in (("Left", np.tile(hinge, (T, 1)), left_bend), ("Right", right_axes, np.full(T, 60.0))):
+            for t in range(T):
+                pb = upper[t] @ [0.3, 0.0, 0.0]
+                fore = Rotation.from_rotvec(axes[t] * np.radians(bend[t])).as_matrix() @ [0.25, 0.0, 0.0]
+                frames[t][f"{side}Arm"] = [np.zeros(3), matrix_to_quat(upper[t])]
+                frames[t][f"{side}ForeArm"][0] = pb
+                frames[t][f"{side}Hand"][0] = pb + upper[t] @ fore
+        ref = {f"{s}Arm": (np.zeros(3), ref_R) for s in ("Left", "Right")}
+        return HumanClip(frames=frames, fps=30.0, fmt="tpose", info={"_ref_pose": ref})
+
+    found = _human_bend_axes("unitree_g1", clip(np.linspace(0, 110, T), np.stack([0 * wander, np.sin(wander),
+                                                                                    np.cos(wander)], 1)))
+    axis, info = found["left_shoulder_yaw_joint"]
+    assert np.degrees(np.arccos(np.clip(axis @ (ref_R @ hinge), -1, 1))) < 0.5 and info["consistency"] > 0.99
+    assert found["right_shoulder_yaw_joint"][0] is None and found["right_shoulder_yaw_joint"][1]["consistency"] < 0.7
+    straight = _human_bend_axes("unitree_g1", clip(np.linspace(0, 10, T), np.tile(hinge, (T, 1))))
+    assert straight["left_shoulder_yaw_joint"][0] is None and straight["left_shoulder_yaw_joint"][1]["bent_frames"] < 10
+    assert straight["right_shoulder_yaw_joint"][0] is not None
+
+
+CMU_02_03 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "cmu_bvh", "02_03.bvh")
+
+
+@pytest.mark.skipif(not os.path.isfile(CMU_02_03), reason="needs data/raw/cmu_bvh (tools/fetch_samples.py cmu)")
+def test_cmu_elbows_bend_like_the_human():
+    """CMU jog 02_03: with the twist set from the clip's own elbow bends, the robot's forearms
+    point where the human's do (they were 39 deg off: elbows bending in a plane turned 38 deg)."""
+    _need_retargeting()
+    from khumanoid import retarget_quality
+    from khumanoid.retarget import retarget_file, robot_model
+
+    m, info = retarget_file(CMU_02_03, fps=30.0, smooth_hz=6.0, log=None)
+    residual = info["robot_tpose"]["segment_residual_deg"]
+    assert residual["left_shoulder_yaw_joint bend axis"] < 2 and residual["right_shoulder_yaw_joint bend axis"] < 2
+    assert all(v["consistency"] > 0.9 for v in info["bend_axes"].values())
+    seg = retarget_quality.measure(load_bvh(CMU_02_03), m, "unitree_g1", robot_model("unitree_g1"))["_segments_deg"]
+    assert seg["왼 아래팔"] < 15 and seg["오른 아래팔"] < 15
+
+
 AMASS_02_01 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "amass_cmu_smplx", "CMU",
                            "02", "02_01_stageii.npz")
 SMPLX_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models")

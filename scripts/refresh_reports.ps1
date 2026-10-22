@@ -6,8 +6,9 @@
   Stages (default: all four, in this order):
     retarget  data\raw -> data\retargeted\<source>\ with the recommended settings
               (--smooth 6 --swing-clearance 2). A few minutes.
-    reports   reports\qc\ (QC + valid hours, C3D marker QC) and reports\compare\ (formats side by side).
-              No Isaac. A few minutes (the comparison retargets through data\cache\retarget).
+    reports   reports\qc\ (QC + valid hours, C3D marker QC), reports\compare\ (formats side by side) and
+              reports\retarget_quality\ (retargeting quality per robot). No Isaac. A few minutes (the
+              comparison and the quality runs retarget through data\cache\retarget).
     isaac     reports\sim_check\, reports\physics\ (+ summary.md) and reports\videos\ with Isaac Sim's
               own python.bat. About 30 minutes. Needs the NVIDIA Omniverse EULA accepted: pass
               -IsaacAcceptEula only if you (the user) have accepted it.
@@ -113,6 +114,13 @@ if ($Stage -contains "reports") {
         foreach ($c in $Lafan) { $groups += @("-g", "data\raw\lafan1_bvh\$c.bvh", "data\raw\unitree_lafan1_g1\$c.csv") }
         Run $Python (@("tools\compare_report.py", "--swing-clearance", "2") + $groups + @("--out", "reports\compare\lafan1_gmr_vs_unitree.md"))
     }
+
+    # retargeting quality per robot (only G1 so far): public CMU, and everything (internal)
+    Run $Python @("tools\retarget_benchmark.py", "data\raw\cmu_bvh", "data\raw\cmu_fbx", "--out", "reports\retarget_quality")
+    $all = @("data\raw\cmu_bvh", "data\raw\cmu_fbx")
+    if ($HaveAmass) { $all += $AmassSubject.Keys | Sort-Object | ForEach-Object { AmassFile $_ } }
+    if ($HaveLafan) { $all += "data\raw\lafan1_bvh" }
+    Run $Python (@("tools\retarget_benchmark.py") + $all + @("--smpl-model-dir", $SmplModelDir, "--out", "reports\retarget_quality\internal"))
 }
 
 if ($Stage -contains "isaac") {

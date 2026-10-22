@@ -90,6 +90,8 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
         "ik_position_residual": item.info.get("ik_position_residual"),
         "retarget": item.retarget or None,  # human inputs: smooth_hz, foot_flat, swing_clearance_cm
     }
+    if m.get("_quality"):  # khumanoid.retarget_quality: worst limbs, pinned joints, colliding parts, what cost points
+        out["retarget_quality"] = m["_quality"]
     if item.info.get("foot_flat"):
         ff = item.info["foot_flat"]
         out["foot_flat"] = {k: ff.get(k) for k in ("frames_changed", "stance_pitch_deg", "sole_lift_cm",

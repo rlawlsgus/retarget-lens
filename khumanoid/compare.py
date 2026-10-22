@@ -29,7 +29,7 @@ HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
 MARKER_EXT = (".c3d",)  # raw optical markers: shown on the same take's retargeted robot
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
-PIPELINE_VERSION = 3  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config
+PIPELINE_VERSION = 4  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist
 MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",) + MARKER_EXT
 # folders the viewer lists motions from (dev: data/raw, data/samples, data/retargeted,
 # data/uploads, reports; installed: see khumanoid.paths); uploads land in UPLOADS
@@ -252,6 +252,8 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         add_balance_flags(r, fm["_static_unbalanced"])
     out["qc"] = r.status
     out["qc_notes"] = "; ".join(r.notes)
+    if fk is not None and item.human is not None and item.retarget:  # retargeted here: how well (retarget_quality)
+        out.update(_retarget_quality(item, fk, out))
     phys = item.info.get("physics")
     if phys:  # from the Isaac run's json
         harness = (phys.get("harness_force_per_body_weight") or {}).get("mean")
@@ -268,6 +270,23 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         out["phys_body_error_cm"] = pol.get("body_error_cm")
         out["phys_ok"] = "통과" if not pol.get("falls") else f"넘어짐 {pol['falls']}회"
     item.metrics = out
+
+
+def _retarget_quality(item: Item, fk: analysis.FootKinematics, metrics: dict) -> dict:
+    """Quality numbers of a retarget against its human skeleton, the 리타게팅 점수 over them and
+    the foot / balance metrics, and the details (``_quality``) inspectors show."""
+    from . import retarget_quality as rq
+
+    try:
+        q = rq.measure(item.human, item.robot, item.info.get("robot", "unitree_g1"), fk.model)
+    except Exception as e:  # a skeleton without the limbs to match: no score, the rest still works
+        return {"_quality": {"error": f"{type(e).__name__}: {e}"}}
+    if not q:
+        return {}
+    s, lost = rq.score({**metrics, **q})
+    details = {k[1:]: v for k, v in q.items() if k.startswith("_")}
+    return {**{k: v for k, v in q.items() if not k.startswith("_")}, "retarget_score": round(s, 1),
+            "retarget_grade": f"{s:.0f} ({rq.grade(s)})", "_quality": {**details, "score_lost": dict(lost)}}
 
 
 def _issue_ko(text: str) -> str:
