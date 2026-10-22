@@ -122,8 +122,9 @@ powershell -ExecutionPolicy Bypass -File scripts\install_gmt.ps1
 ```
 
 - [GMT](https://github.com/zixuan417/humanoid-general-motion-tracking)(General Motion Tracking, Apache-2.0)의 사전학습 G1 추적 정책·G1 모델·예제 동작을 고정 커밋(`2a590de`)에서 받습니다. 약 29 MB이고, 파일마다 git blob SHA-1을 확인합니다.
-- README에 "제공 모델은 연구용"이라고 적혀 있습니다. 설치판에는 넣지 않습니다.
-- 받은 폴더는 env에 연결하지 않습니다. `tools/policy_replay.py`가 `..\GMT`(또는 `KHUMANOID_GMT_DIR`)에서 읽고, 정책은 env의 torch(CPU)로 돌립니다.
+- README에 "제공 모델은 연구용"이라고 적혀 있습니다. 설치판에는 넣지 않습니다. 설치판 사용자는 RetLens의 설치 도우미에서 라이선스에 동의하고 같은 커밋의 파일을 받습니다.
+- 받은 폴더는 env에 연결하지 않습니다. `tools/policy_replay.py`가 `..\GMT`(또는 `KHUMANOID_GMT_DIR`, 환경 설정 "GMT 폴더")에서 읽습니다.
+- 정책 신경망은 numpy로 돌립니다(`khumanoid/gmt_policy.py`, 2026-10-22). torch는 필요 없습니다. env의 torch는 numpy 결과를 TorchScript 원본과 비교하는 테스트(`tests/test_gmt_policy.py`)에만 씁니다.
 
 ## 3. Python 환경 `k-humanoid`
 
@@ -146,7 +147,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install_gmt.ps1
 | rich / natsort / imageio | 14.3.4 / 8.4.0 / 2.38.1 | conda-forge | GMR 의존성. rich는 viser 때문에 15 미만 |
 | viser | 1.1.1 | conda-forge | 비교 뷰어(`tools/compare_viewer.py`)의 브라우저 3D 화면과 GUI (MIT) |
 | yourdfpy / trimesh / plotly | 0.0.60 / 4.12.2 / 7.1.0 | conda-forge | 뷰어의 G1 URDF 로딩, 그래프 |
-| pytorch (CPU) | 2.10.0 (cpu_mkl) | conda-forge | 개발용만: `--format smplx-gmr` 비교, GMR 원본과의 동일성 테스트. 리타게팅과 설치판에는 필요 없음. 이 빌드 때문에 BLAS가 MKL(mkl 2026.1.0)로 바뀜 |
+| pytorch (CPU) | 2.10.0 (cpu_mkl) | conda-forge | 개발용만: `--format smplx-gmr` 비교, GMR 원본·GMT TorchScript와의 동일성 테스트. 리타게팅·GMT 정책·설치판에는 필요 없음. 이 빌드 때문에 BLAS가 MKL(mkl 2026.1.0)로 바뀜 |
 | mink | 1.3.0 | PyPI | GMR의 differential IK (Apache-2.0). conda-forge에 없음 |
 | smplx | 0.1.28 | PyPI | 개발용 `--format smplx-gmr` 비교 전용. 코드가 MPI 비상업 연구 라이선스라 설치판에 넣지 않음 |
 | pyside6 / qt6-webengine | 6.11.2 / 6.11.2 | conda-forge | RetLens 화면(Qt), 씬 뷰(내장 Chromium) |

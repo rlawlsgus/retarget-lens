@@ -47,8 +47,12 @@ class FakeSim:
 
 
 @pytest.fixture
-def gmt_root(tmp_path):
-    """A GMT folder with stand-in files: what problem() looks for."""
+def gmt_root(tmp_path, monkeypatch):
+    """A GMT folder with stand-in files: what problem() looks for (the stand-in policy passes the
+    policy-file check here; tests/test_gmt_policy.py checks that check)."""
+    from khumanoid import gmt_policy
+
+    monkeypatch.setattr(gmt_policy, "problem", lambda path: "" if os.path.isfile(path) else "missing")
     root = tmp_path / "GMT"
     for rel in (pr.gmt_paths(str(root))["model"], pr.gmt_paths(str(root))["policy"]):
         os.makedirs(os.path.dirname(rel), exist_ok=True)
@@ -165,7 +169,7 @@ def test_failure_keeps_the_worker(tmp_path, gmt_root):
 
 def test_problem(tmp_path, gmt_root, monkeypatch):
     pytest.importorskip("mujoco")
-    assert policy_runner.problem("pd", gmt_root) == ""
+    assert policy_runner.problem("pd", gmt_root) == "" and policy_runner.problem("gmt", gmt_root) == ""
     assert "install_gmt.ps1" in policy_runner.problem("pd", str(tmp_path / "nowhere"))
     assert "알 수 없는" in policy_runner.problem("lqr", gmt_root)
     os.remove(pr.gmt_paths(gmt_root)["policy"])
@@ -174,9 +178,10 @@ def test_problem(tmp_path, gmt_root, monkeypatch):
     with pytest.raises(RuntimeError, match="추적 정책"):
         runner.request(g1_motion(seconds=1.0), "gmt")
     runner.shutdown()
-    monkeypatch.setattr(paths, "FROZEN", True)  # the installed program: no PyTorch, no GMT next to it
-    assert "설치판" in policy_runner.problem("gmt", gmt_root)
-    assert "설치판" in policy_runner.problem("pd", str(tmp_path / "nowhere"))
+    # the installed program: the policy runs in numpy, so GMT works once its files are there; without
+    # them the reason points at the setup assistant
+    monkeypatch.setattr(paths, "INSTALLED", True)
+    assert "설치 도우미" in policy_runner.problem("gmt", gmt_root)
 
 
 def test_progress_raises_once_cancelled(tmp_path, gmt_root):
@@ -205,7 +210,6 @@ def test_progress_raises_once_cancelled(tmp_path, gmt_root):
 
 def test_runner_matches_policy_replay():
     """With GMT: the runner's MuJoCo run is policy_replay.run's (tools/policy_replay.py), number for number."""
-    pytest.importorskip("torch")
     pytest.importorskip("mujoco")
     try:
         files = pr.gmt_files()

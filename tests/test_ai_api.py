@@ -37,6 +37,9 @@ def test_cli_info_and_errors(tmp_path):
     assert code == 1 and "error" in out  # JSON even when it fails
     code, out = _cli("api", tmp_path=tmp_path)
     assert code == 1 and "not running" in out["error"]
+    code, out = _cli("setup", "--offline", tmp_path=tmp_path)  # 설치 도우미's check: one status per component
+    assert code == 0 and [c["key"] for c in out["components"]] == ["blender", "gmt", "isaac", "smpl"]
+    assert all(c["action"] in ("none", "configure", "install", "manual", "blocked") for c in out["components"])
 
 
 @needs_sample

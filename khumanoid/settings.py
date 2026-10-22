@@ -9,10 +9,12 @@ An empty value means "find it". Each external tool is looked up in this order:
     tool        setting          environment variable      usual places
     Isaac Sim   isaac_python     KHUMANOID_ISAAC_PYTHON    this Python when it can import isaacsim
                                                            (the dev env, never a packaged build), C:\\isaacsim
-    Blender     blender          BLENDER                   C:\\blender\\*\\blender.exe, PATH
+    Blender     blender          BLENDER                   C:\\blender\\*, <user data>\\tools\\blender-*,
+                                                           Program Files\\Blender Foundation\\*, PATH
     SMPL-X      smpl_model_dir   SMPL_MODEL_DIR            paths.smpl_model_dir()
-    GMT         -                KHUMANOID_GMT_DIR         ..\\GMT next to the repository (scripts\\install_gmt.ps1)
+    GMT         gmt_dir          KHUMANOID_GMT_DIR         <user data>\\gmt, ..\\GMT next to the repository
 
+The setup assistant (khumanoid/prereqs.py, 설치 도우미) installs into those usual places.
 Standard library only (Isaac Sim's Python imports khumanoid too).
 """
 
@@ -25,6 +27,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 from dataclasses import asdict, dataclass, field, fields
 
 from . import paths
@@ -33,6 +36,9 @@ ISAAC_ENV = "KHUMANOID_ISAAC_PYTHON"
 ISAAC_DIRS = [r"C:\isaacsim"] if os.name == "nt" else [os.path.expanduser("~/isaacsim")]
 ISAAC_LAUNCHER = "python.bat" if os.name == "nt" else "python.sh"
 BLENDER_GLOB = r"C:\blender\*\blender.exe"
+BLENDER_VERSION = "4.5"  # the FBX reader is tested with Blender 4.5 LTS
+TOOLS = "tools"  # <user data>\tools: programs the setup assistant unpacked (Blender)
+GMT_INSTALL = "gmt"  # <user data>\gmt: GMT files the setup assistant downloaded
 SMPLX_GENDERS = ("NEUTRAL", "MALE", "FEMALE")
 GMT_ENV = "KHUMANOID_GMT_DIR"
 GMT_MODEL = os.path.join("assets", "robots", "g1", "g1.xml")  # GMT's 23-DoF G1 (both MuJoCo controllers)
@@ -54,6 +60,7 @@ class Settings:
     video_dir: str = ""  # where 동영상 저장 writes
     library_dirs: list[str] = field(default_factory=list)  # motion folders besides the defaults
     robot_usd: str = ""  # robot USD for Isaac (local file or URL); empty = G1 from NVIDIA's asset library
+    gmt_dir: str = ""  # GMT folder (assets\pretrained_checkpoints\pretrained.pt); empty = the usual places
     api_enabled: bool = True  # the window's local HTTP API for AI agents (127.0.0.1 + token, khumanoid/app/api_server.py)
     api_port: int = 8765
 
@@ -117,6 +124,16 @@ def _isaac_version(launcher: str) -> str:
         return ""
 
 
+def isaac_dirs() -> list[str]:
+    """The usual install folders: C:\\isaacsim, then C:\\isaacsim-<version> (where the setup assistant
+    installs when C:\\isaacsim is taken), newest first; never an unfinished unpack (.partial)."""
+    out = []
+    for d in ISAAC_DIRS:
+        out.append(d)
+        out += sorted((p for p in glob.glob(d + "-*") if os.path.isdir(p) and not p.endswith((".partial", ".old"))), reverse=True)
+    return out
+
+
 def find_isaac(s: Settings | None = None) -> Found:
     s = s or load()
     for value, source in ((s.isaac_python, "설정"), (os.environ.get(ISAAC_ENV, ""), f"환경변수 {ISAAC_ENV}")):
@@ -128,7 +145,7 @@ def find_isaac(s: Settings | None = None) -> Found:
             return Found(None, source, problem=f"{source}의 {value}에 {ISAAC_LAUNCHER}가 없습니다")
     if not paths.FROZEN and importlib.util.find_spec("isaacsim") is not None:
         return Found(sys.executable, "자동 (이 파이썬 환경)", "isaacsim 패키지")
-    for d in ISAAC_DIRS:
+    for d in isaac_dirs():
         p = os.path.join(d, ISAAC_LAUNCHER)
         if os.path.isfile(p):
             v = _isaac_version(p)
@@ -138,8 +155,36 @@ def find_isaac(s: Settings | None = None) -> Found:
 
 # ------------------------------------------------------------------------------ Blender
 def _blender_version(exe: str) -> str:
-    m = re.search(r"blender-(\d+\.\d+(?:\.\d+)?)", exe.replace("\\", "/"), re.IGNORECASE)
+    """'Blender 4.5.14' from the folder name (portable zips: blender-4.5.14-windows-x64; the
+    installer: Blender Foundation\\Blender 4.5), '' when the path does not say."""
+    m = re.search(r"blender[- ](\d+\.\d+(?:\.\d+)?)", exe.replace("\\", "/"), re.IGNORECASE)
     return f"Blender {m.group(1)}" if m else ""
+
+
+def _version_key(exe: str) -> tuple:
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", _blender_version(exe))
+    return tuple(int(x or 0) for x in m.groups()) if m else (0, 0, 0)
+
+
+def blender_candidates() -> list[tuple[str, str]]:
+    """(blender.exe, where) in the usual places, newest version first within each place."""
+    pf = [os.environ.get(v) for v in ("ProgramFiles", "ProgramW6432")]
+    places = [(BLENDER_GLOB, r"자동 (C:\blender)"),
+              (os.path.join(paths.user_dir(), TOOLS, "blender-*", "blender.exe"), "자동 (설치 도우미)")]
+    places += [(os.path.join(p, "Blender Foundation", "*", "blender.exe"), "자동 (Program Files)") for p in pf if p]
+    out, seen = [], set()
+    for pattern, where in places:
+        for exe in sorted(glob.glob(pattern), key=_version_key, reverse=True):
+            folder = os.path.basename(os.path.dirname(exe)).lower()
+            if folder.endswith((".partial", ".old")):  # the setup assistant's unfinished unpack / replaced copy
+                continue
+            if os.path.isfile(exe) and os.path.normcase(exe) not in seen:
+                seen.add(os.path.normcase(exe))
+                out.append((exe, where))
+    path = shutil.which("blender")
+    if path and os.path.normcase(path) not in seen:
+        out.append((path, "자동 (PATH)"))
+    return out
 
 
 def find_blender(s: Settings | None = None) -> Found:
@@ -150,18 +195,26 @@ def find_blender(s: Settings | None = None) -> Found:
             if os.path.isfile(exe):
                 return Found(exe, source, _blender_version(exe))
             return Found(None, source, problem=f"{source}의 {value}에 blender.exe가 없습니다")
-    for exe in sorted(glob.glob(BLENDER_GLOB), reverse=True):
-        if os.path.isfile(exe):
-            return Found(exe, r"자동 (C:\blender)", _blender_version(exe))
-    exe = shutil.which("blender")
-    if exe:
-        return Found(exe, "자동 (PATH)", _blender_version(exe))
-    return Found(None, problem=r"Blender를 찾지 못했습니다 (C:\blender\*\blender.exe, PATH에 없음)")
+    found = blender_candidates()  # a 4.5 first, wherever it is (PATH included)
+    best = next((c for c in found if _blender_version(c[0]).startswith(f"Blender {BLENDER_VERSION}")), None)
+    # then one whose path does not tell its version (a PATH shim, Steam's ...\common\Blender) - it may be a
+    # 4.5 - before one whose path says it is another version
+    best = best or next((c for c in found if not _blender_version(c[0])), None)
+    if best or found:
+        exe, where = best or found[0]
+        return Found(exe, where, _blender_version(exe))
+    return Found(None, problem=r"Blender를 찾지 못했습니다 (C:\blender, 설치 도우미 폴더, Program Files, PATH에 없음)")
 
 
 # ------------------------------------------------------------------------------ SMPL-X
 def _smpl_files(folder: str) -> list[str]:
     return [g for g in SMPLX_GENDERS if os.path.isfile(os.path.join(folder, "smplx", f"SMPLX_{g}.npz"))]
+
+
+def smpl_root(value: str) -> str:
+    """The model folder (the one holding smplx\\) for a path that may name the smplx folder itself."""
+    p = os.path.normpath(value)
+    return os.path.dirname(p) if os.path.basename(p).lower() == "smplx" else value
 
 
 def find_smpl(s: Settings | None = None) -> Found:
@@ -170,7 +223,7 @@ def find_smpl(s: Settings | None = None) -> Found:
                           (paths.smpl_model_dir(), "기본 위치")):
         if not value:
             continue
-        folder = os.path.dirname(value) if os.path.basename(os.path.normpath(value)).lower() == "smplx" else value
+        folder = smpl_root(value)
         have = _smpl_files(folder)
         if have:
             return Found(folder, source, "SMPLX " + ", ".join(have))
@@ -180,20 +233,74 @@ def find_smpl(s: Settings | None = None) -> Found:
 
 
 # ------------------------------------------------------------------------------ GMT
-def gmt_dir() -> str:
-    """Where GMT (General Motion Tracking) is looked for: $KHUMANOID_GMT_DIR, else ..\\GMT next to
-    the repository (scripts\\install_gmt.ps1 puts it there)."""
-    return os.environ.get(GMT_ENV) or os.path.join(os.path.dirname(paths.REPO_ROOT), "GMT")
+def _gmt_place(s: Settings | None = None) -> tuple[str, str]:
+    """(folder, how it was chosen): the setting, $KHUMANOID_GMT_DIR, <user data>\\gmt when the setup
+    assistant put the policy there, else ..\\GMT next to the repository (scripts\\install_gmt.ps1)."""
+    s = s or load()
+    if s.gmt_dir:
+        return s.gmt_dir, "설정"
+    if os.environ.get(GMT_ENV):
+        return os.environ[GMT_ENV], f"환경변수 {GMT_ENV}"
+    own = os.path.join(paths.user_dir(), GMT_INSTALL)
+    if os.path.isfile(os.path.join(own, GMT_POLICY)) and os.path.isfile(gmt_model(own)):
+        return own, "자동 (설치 도우미)"
+    return gmt_sibling(), "자동 (저장소 옆)"
 
 
-def find_gmt() -> Found:
-    """GMT's G1 MuJoCo model (physics mode's 균형 제어 in MuJoCo) and its tracking policy."""
-    folder = gmt_dir()
-    source = f"환경변수 {GMT_ENV}" if os.environ.get(GMT_ENV) else "자동 (저장소 옆)"
-    if not os.path.isfile(os.path.join(folder, GMT_MODEL)):
-        return Found(None, source, problem=f"GMT를 찾지 못했습니다 ({folder}에 {GMT_MODEL} 없음)")
-    policy = os.path.isfile(os.path.join(folder, GMT_POLICY))
-    return Found(folder, source, "G1 MuJoCo 모델, 추적 정책" if policy else "G1 MuJoCo 모델 (추적 정책 pretrained.pt 없음)")
+def gmt_sibling() -> str:
+    """..\\GMT next to the repository, where scripts\\install_gmt.ps1 puts it."""
+    return os.path.join(os.path.dirname(paths.REPO_ROOT), "GMT")
+
+
+def gmt_places(s: Settings | None = None) -> list[tuple[str, str]]:
+    """Every place GMT is looked for, in order (the setup assistant falls back along them)."""
+    s = s or load()
+    out = [(s.gmt_dir, "설정"), (os.environ.get(GMT_ENV, ""), f"환경변수 {GMT_ENV}"),
+           (os.path.join(paths.user_dir(), GMT_INSTALL), "자동 (설치 도우미)"),
+           (gmt_sibling(), "자동 (저장소 옆)")]
+    return [(p, how) for p, how in out if p]
+
+
+def gmt_dir(s: Settings | None = None) -> str:
+    """Where GMT (General Motion Tracking) is looked for (_gmt_place)."""
+    return _gmt_place(s)[0]
+
+
+def gmt_model(folder: str) -> str:
+    """GMT's G1 MuJoCo model: the GMT folder's, else the copy shipped in the program's resources
+    when there is one (the folder's path otherwise, missing)."""
+    own = os.path.join(folder, GMT_MODEL)
+    bundled = bundled_gmt_model()
+    return bundled if not os.path.isfile(own) and bundled else own
+
+
+def bundled_gmt_model() -> str:
+    """The G1 MuJoCo model shipped in the program's resources, '' when there is none (the repository)."""
+    p = paths.resource(*BUNDLED_G1_MODEL)
+    return p if os.path.isfile(p) else ""
+
+
+def find_gmt(s: Settings | None = None) -> Found:
+    """GMT's tracking policy (physics mode's 균형 제어 "추적 정책 (GMT)") and the G1 MuJoCo model
+    (also "없음 (MuJoCo)"). Found when the policy is there; the model may be the program's own copy."""
+    folder, source = _gmt_place(s)
+    policy = os.path.join(folder, GMT_POLICY)
+    model = os.path.isfile(gmt_model(folder))
+    if not os.path.isfile(policy):
+        return Found(None, source, problem=f"GMT 추적 정책이 없습니다 ({policy})" +
+                     ("" if model else ", G1 MuJoCo 모델도 없음"))
+    if not model:
+        return Found(None, source, problem=f"G1 MuJoCo 모델이 없습니다 ({os.path.join(folder, GMT_MODEL)})")
+    try:  # a policy file this program cannot run (another network) is no policy for it
+        from .gmt_policy import problem as policy_problem
+
+        bad = policy_problem(policy)
+    except ImportError:  # numpy missing (only in a bare Python): leave the check to the run
+        bad = ""
+    if bad:
+        return Found(None, source, problem=bad)
+    return Found(folder, source, "추적 정책, G1 MuJoCo 모델" +
+                 ("" if os.path.isfile(os.path.join(folder, GMT_MODEL)) else " (프로그램에 들어 있는 것)"))
 
 
 # ------------------------------------------------------------------------------ robot USD
@@ -233,14 +340,27 @@ def library_dirs(s: Settings | None = None) -> list[str]:
 
 def _writable(folder: str) -> bool:
     """The folder, or the nearest folder above it that exists (it is made on first use), can be
-    written to. Nothing is created here: the settings window checks paths while they are typed."""
+    written to - tried for real: on Windows os.access says yes to every folder, whatever its
+    permissions. A test file (or, above a folder still to be made, a test folder) is made and
+    removed at once; the folder itself is not created (the settings window checks while typing)."""
     p = os.path.abspath(folder)
     while not os.path.isdir(p):
         parent = os.path.dirname(p)
         if parent == p:
             return False
         p = parent
-    return os.access(p, os.W_OK)
+    probe = os.path.join(p, f".retlens-write-test-{os.getpid()}-{threading.get_ident()}")
+    try:
+        if os.path.normcase(p) == os.path.normcase(os.path.abspath(folder)):  # it exists: a file goes in it
+            with open(probe, "wb"):
+                pass
+            os.remove(probe)
+        else:  # it would be made under p: a folder must be allowed there
+            os.mkdir(probe)
+            os.rmdir(probe)
+        return True
+    except OSError:
+        return False
 
 
 # ------------------------------------------------------------------------------ the check
@@ -287,18 +407,14 @@ def check_all(s: Settings | None = None) -> list[Check]:
                      " · ".join(x for x in (usd.detail, usd.source) if x) if usd.path is not None else usd.problem,
                      "물리 모드, 동영상 저장", "" if usd.path is not None else
                      "USD 파일을 고르거나 칸을 비워 NVIDIA 에셋 서버의 G1을 쓰세요"))
-    if not paths.FROZEN:  # the installed program has no PyTorch: its menu says so instead of a check that cannot pass
-        gmt = find_gmt()
-        libs = [m for m in ("mujoco", "torch") if importlib.util.find_spec(m) is None]
-        policy = gmt.path is not None and os.path.isfile(os.path.join(gmt.path, GMT_POLICY))
-        ok = policy and not libs
-        detail = (f"{', '.join(libs)} 없음" if libs else " · ".join(x for x in (gmt.detail, gmt.source) if x)) \
-            if gmt.path else gmt.problem
-        out.append(Check("gmt", "균형 제어 (GMT)", ok, False, gmt.path or "", detail,
-                         "물리 모드 균형 제어: " + ("추적 정책 (GMT)" if gmt.path and "mujoco" not in libs else
-                                               "없음 (MuJoCo), 추적 정책 (GMT)"),
-                         "" if ok else f"scripts\\install_gmt.ps1을 실행하세요 (다른 곳에 두었으면 그 폴더를 환경변수 "
-                                       f"{GMT_ENV}에 넣습니다)", URLS["gmt"]))
+    gmt = find_gmt(s)  # the policy runs in numpy (khumanoid/gmt_policy.py): no PyTorch needed
+    mujoco = importlib.util.find_spec("mujoco") is not None
+    ok = gmt.path is not None and mujoco
+    detail = ("mujoco 없음" if not mujoco else " · ".join(x for x in (gmt.detail, gmt.source) if x)) \
+        if gmt.path else gmt.problem
+    out.append(Check("gmt", "추적 정책 (GMT)", ok, False, gmt.path or "", detail, "물리 모드 균형 제어: 추적 정책 (GMT)",
+                     "" if ok else "설치 도우미에서 받으세요(연구용 라이선스 동의 필요)" + (
+                         "" if paths.INSTALLED else ", 또는 scripts\\install_gmt.ps1"), URLS["gmt"]))
     vd = video_dir(s)
     out.append(Check("video", "동영상 저장 폴더", _writable(vd), False, vd, "", "동영상 저장",
                      "쓸 수 있는 폴더를 지정하세요"))

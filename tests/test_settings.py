@@ -15,7 +15,7 @@ from khumanoid.physics_runner import isaac_command  # noqa: E402
 def user(tmp_path, monkeypatch):
     """Settings in a temporary user folder, no tool environment variables."""
     monkeypatch.setenv("KHUMANOID_USER_DIR", str(tmp_path / "user"))
-    for k in (settings.ISAAC_ENV, "BLENDER", "SMPL_MODEL_DIR"):
+    for k in (settings.ISAAC_ENV, "BLENDER", "SMPL_MODEL_DIR", settings.GMT_ENV):
         monkeypatch.delenv(k, raising=False)
     settings.load(reload=True)
     yield tmp_path
@@ -86,28 +86,40 @@ def test_folders_and_check(user):
 
 
 def test_find_gmt(user, monkeypatch):
-    """균형 제어 (GMT): its folder from KHUMANOID_GMT_DIR (else ..\\GMT), checked for the model and the policy."""
+    """추적 정책 (GMT): its folder from the setting, KHUMANOID_GMT_DIR, the setup assistant's folder or
+    ..\\GMT; found once a policy this program runs is there (no PyTorch needed: it runs in numpy)."""
     import importlib.util
 
+    from khumanoid import gmt_policy
+
+    runnable = {"ok": True}  # stand-in files: the policy-file check itself is tests/test_gmt_policy.py's
+    monkeypatch.setattr(gmt_policy, "problem", lambda path: "" if runnable["ok"] else "쓸 수 없는 정책 파일: x")
+    monkeypatch.delenv(settings.GMT_ENV, raising=False)
+    assert settings.gmt_dir() == os.path.join(os.path.dirname(paths.REPO_ROOT), "GMT")  # next to the repository
+    own = user / "user" / settings.GMT_INSTALL
+    _file(own / settings.GMT_POLICY)  # the setup assistant's download (policy and model)
+    _file(own / settings.GMT_MODEL)
+    assert settings.gmt_dir() == str(own) and settings.find_gmt().source == "자동 (설치 도우미)"
+    runnable["ok"] = False
+    assert settings.find_gmt().path is None and "쓸 수 없는" in settings.find_gmt().problem
+    runnable["ok"] = True
     root = user / "GMT"
     monkeypatch.setenv(settings.GMT_ENV, str(root))
     assert settings.gmt_dir() == str(root)
     f = settings.find_gmt()
     assert f.path is None and str(root) in f.problem and f.source.startswith("환경변수")
     c = next(c for c in settings.check_all() if c.key == "gmt")
-    assert not c.ok and "install_gmt.ps1" in c.hint and "없음 (MuJoCo)" in c.needed_for
+    assert not c.ok and "설치 도우미" in c.hint and c.needed_for.endswith("추적 정책 (GMT)")
     _file(root / settings.GMT_MODEL)  # the model only: the open-loop replay can run, the policy cannot
-    f = settings.find_gmt()
-    assert f.path == str(root) and "추적 정책 pretrained.pt 없음" in f.detail
-    c = next(c for c in settings.check_all() if c.key == "gmt")
-    assert not c.ok and c.needed_for.endswith("추적 정책 (GMT)") and "없음 (MuJoCo)" not in c.needed_for
+    assert settings.find_gmt().path is None and "추적 정책이 없습니다" in settings.find_gmt().problem
     _file(root / settings.GMT_POLICY)
-    libs = all(importlib.util.find_spec(m) is not None for m in ("mujoco", "torch"))
-    assert next(c for c in settings.check_all() if c.key == "gmt").ok == libs
-    monkeypatch.delenv(settings.GMT_ENV)
-    assert settings.gmt_dir() == os.path.join(os.path.dirname(paths.REPO_ROOT), "GMT")  # next to the repository
-    monkeypatch.setattr(paths, "FROZEN", True)  # the installed program: no check (its menus say why instead)
-    assert "gmt" not in {c.key for c in settings.check_all()}
+    f = settings.find_gmt()
+    assert f.path == str(root) and f.detail == "추적 정책, G1 MuJoCo 모델"
+    assert next(c for c in settings.check_all() if c.key == "gmt").ok == (importlib.util.find_spec("mujoco") is not None)
+    s = settings.Settings(gmt_dir=str(own))  # the setting wins over the environment variable
+    assert settings.gmt_dir(s) == str(own) and settings.find_gmt(s).source == "설정"
+    monkeypatch.setattr(paths, "FROZEN", True)  # the installed program checks it too (the policy runs in numpy)
+    assert "gmt" in {c.key for c in settings.check_all()}
 
 
 def test_robot_usd_option(user):

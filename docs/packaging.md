@@ -6,24 +6,49 @@
 
 - **내려받아 바로 쓰는 한 폴더 실행파일이 있습니다.** `scripts\build_retlens.ps1 -Samples`가 `dist\RetLens\`를 만들고(창 프로그램 `RetLens.exe`와 명령줄 `retlens-cli.exe`가 `_internal\`을 함께 씀), `scripts\package_release.ps1`이 릴리즈용 zip과 SHA-256을 만듭니다.
 - conda 없는 조건에서 3D, 리타게팅(BVH, 묶인 샘플 BVH로 C3D), 발 지표, 분석 표, 로그 파일, 설치판 배치의 Isaac 물리·녹화까지 확인했습니다(아래 "작업 기록").
-- **받는 사람이 따로 설치하는 것**은 기능별로, 필요할 때만입니다. 위치는 RetLens "환경 설정"에서 정합니다.
+- **받는 사람이 따로 설치하는 것**은 기능별로, 필요할 때만입니다.
+  - RetLens의 "설치 도우미"(2026-10-22, `khumanoid/prereqs.py`)가 이 PC에 이미 있는지, 설치할 수 있는지 먼저 확인합니다.
+  - 필요하고 가능할 때만 배포처에서 받아 설치합니다. 우리가 재배포하는 것은 없습니다. 자세한 동작은 [retlens.md](retlens.md)의 "설치 도우미"에 있습니다.
 
-  | 기능 | 필요한 것 |
-  |---|---|
-  | BVH, 로봇 모션(npz·csv·pkl), C3D(같은 촬영의 BVH가 있을 때) | 없음 |
-  | FBX | Blender 4.5 LTS (GPL, 별도 설치) |
-  | AMASS SMPL-X | SMPL-X 모델 파일 (재배포 금지, 사용자가 등록해 받음) |
-  | 물리 모드·동영상 | NVIDIA RTX GPU, Isaac Sim 6.1 (사용자가 설치하고 EULA 동의), 인터넷(로봇 에셋) 또는 로컬 로봇 USD |
+  | 기능 | 필요한 것 | 설치 도우미 |
+  |---|---|---|
+  | BVH, 로봇 모션(npz·csv·pkl), C3D(같은 촬영의 BVH가 있을 때) | 없음 | - |
+  | FBX | Blender 4.5 LTS (GPL) | 자동 설치 (blender.org zip) |
+  | AMASS SMPL-X | SMPL-X 모델 파일 (재배포 금지, 사용자가 등록해 받음) | 사이트 열기 + 받은 zip 가져오기 |
+  | 물리 모드 "보조 힘 (Isaac)"·동영상 | NVIDIA RTX GPU, Isaac Sim 6.1 (EULA 동의), 인터넷(로봇 에셋) 또는 로컬 로봇 USD | EULA 동의 후 자동 설치 (NVIDIA zip) |
+  | 물리 모드 "추적 정책 (GMT)" | GMT 정책 파일 (연구용) | 라이선스 동의 후 자동 설치 (GitHub, 8 MB). PyTorch는 필요 없음(numpy) |
+  | 물리 모드 "없음 (MuJoCo)" | 없음 (G1 MuJoCo 모델 동봉) | - |
 
 - 대상 PC: Windows 10/11 64비트, WebGL이 되는 GPU(Direct3D 11), 디스크 약 1.2 GB(물리·녹화는 Isaac Sim 수십 GB 별도).
 
 ### 남은 일
 
-1. 설치 파일(Inno Setup)과 제3자 라이선스 고지 묶음(Qt·WebEngine LGPL/BSD, qpsolvers LGPL 등). 지금은 zip을 풀어 쓰고, 고지는 GMR·Unitree G1만 `_internal\licenses`에 있습니다. 깨끗한 Windows(VM)에서 설치·실행 시험도 함께 합니다.
+1. 설치 파일(Inno Setup, 아래 "설치 파일 설계")과 제3자 라이선스 고지 묶음(Qt·WebEngine LGPL/BSD, qpsolvers LGPL 등). 지금은 zip을 풀어 쓰고, 고지는 GMR·GMT·Unitree G1만 `_internal\licenses`에 있습니다. 깨끗한 Windows(VM)에서 설치·실행 시험도 함께 합니다.
 2. 크기 줄이기: 이 conda 환경의 numpy·scipy가 Intel MKL에 링크되어 약 550 MB가 MKL입니다. OpenBLAS로 만든 빌드 전용 환경에서 빌드하면 약 600 MB로 줄어듭니다.
 3. (공개 배포 시) 코드 서명. 서명이 없으면 Windows SmartScreen 경고가 뜹니다("추가 정보 > 실행"으로 실행은 됨).
 4. 오프라인 G1 USD로 물리 실행 확인. 로봇 USD 옵션은 있지만 실제 로컬 사본으로는 아직 돌려 보지 않았습니다.
-5. Isaac 없이도 물리를 볼 수 있게 MuJoCo 물리를 대안으로 둘지 결정.
+5. ~~Isaac 없이도 물리를 볼 수 있게 MuJoCo 물리를 대안으로 둘지 결정~~ 완료: 균형 제어 "없음 (MuJoCo)"·"추적 정책 (GMT)".
+
+### 설치 파일 설계 (Inno Setup, 아직 만들지 않음)
+
+zip 대신 `RetLens-<버전>-setup.exe` 하나로 설치하는 안입니다. 외부 프로그램은 설치 파일에 넣지 않고, 앱 안의 설치 도우미와 같은 코드(`retlens-cli setup`)로 처리합니다.
+
+- **설치 범위:** 사용자 단위(`{localappdata}\Programs\RetLens`, 관리자 권한 불필요). 시작 메뉴·바탕 화면 바로 가기, 제거 프로그램 등록.
+  - 제거할 때 `%LOCALAPPDATA%\RetLens`(캐시·설정·도우미가 받은 Blender·GMT)는 지울지 묻습니다.
+  - Isaac Sim(`C:\isaacsim`, `C:\isaacsim-6.1.0`)과 SMPL-X 모델은 지우지 않습니다.
+- **구성 요소 선택 화면** (Inno Setup `[Components]`/`[Tasks]`). 각 항목은 고르기 전에 `retlens-cli setup --offline`의 결과로 표시합니다.
+  - 이미 호환되는 것이 있으면 "설치됨"으로 표시하고 체크를 끕니다.
+  - 설치할 수 없으면(예: RTX GPU 없음) 회색으로 두고 이유를 보여 줍니다.
+  - **Blender 4.5 LTS (선택, 기본 켬):** 설치 마지막 단계(`[Run]`)에서 `retlens-cli setup --install blender`를 실행합니다.
+  - **GMT 추적 정책 (선택, 기본 끔):** 고르면 연구용 라이선스 안내 페이지(Inno Setup 사용자 정의 페이지, "동의함" 체크)를 거칩니다. 그다음 `--install gmt --accept-license`를 실행합니다.
+  - **Isaac Sim 6.1, SMPL-X:** 설치 파일에서 받지 않습니다. Isaac은 10 GB이고 EULA 동의 화면이 필요하며, SMPL-X는 회원 등록이 필요합니다. 마지막 화면에 "설치 도우미 열기" 체크(기본 켬)를 두고, 켜 두면 `RetLens.exe --setup`으로 앱의 설치 도우미를 엽니다.
+- **받기 실패:** `[Run]`의 `retlens-cli`가 실패해도 설치는 끝냅니다. 받기가 끊긴 파일은 다음에 이어 받고, 실패 내용은 마지막 화면과 로그에 남깁니다.
+- **필요한 작업:**
+  - `packaging\retlens.iss`(파일 목록은 `dist\RetLens` 전체)
+  - `RetLens.exe --setup` 인자(시작하자마자 설치 도우미 열기)
+  - `scripts\package_release.ps1`에서 Inno Setup 컴파일러(`iscc.exe`) 호출
+  - 제3자 라이선스 고지 묶음(`[Files]`에 `licenses\`)
+  - 깨끗한 Windows VM에서 설치·제거 시험
 
 ## 설치판 구성
 
@@ -39,10 +64,11 @@ RetLens\                            릴리즈 zip을 푼 폴더 (어디에 두�
     isaac\khumanoid\, isaac\tools\isaac_replay.py   Isaac 파이썬이 읽는 일반 소스
     licenses\                       제3자 라이선스 고지
     samples\                        (-Samples) CMU BVH·C3D
-%LOCALAPPDATA%\RetLens\             settings.json, cache\(리타겟·FBX·물리), uploads\, logs\, api.json
+%LOCALAPPDATA%\RetLens\             settings.json, cache\(리타겟·FBX·물리), uploads\, logs\, api.json,
+                                    tools\blender-4.5.x-windows-x64\, gmt\, models\smplx\, downloads\ (설치 도우미)
 문서\RetLens\                        videos\ (동영상), motions\ (내 모션 폴더)
 레지스트리 (QSettings RetLens)       창 배치, Isaac EULA 동의
-따로 설치 (환경 설정에서 지정)         Isaac Sim, Blender 4.5, SMPL-X 모델 폴더
+따로 설치 (설치 도우미 또는 환경 설정)  Isaac Sim (C:\isaacsim, 차 있으면 C:\isaacsim-6.1.0), Blender 4.5, SMPL-X 모델, GMT 정책
 ```
 
 ## 빌드
@@ -74,13 +100,13 @@ powershell -ExecutionPolicy Bypass -File scripts\package_release.ps1          # 
 | torch / MKL | BSD-3 / Intel Simplified | 가능 (빼는 편이 나음) |
 | Unitree G1 URDF·메시 | BSD-3 | 가능 |
 | GMT G1 MuJoCo 모델 (`g1.xml`) | Apache-2.0 (GMT, Unitree BSD-3 설명 기반) | 가능. `licenses\GMT-LICENSE.txt` 동봉 |
-| **GMT 추적 정책 (`pretrained.pt`)** | Apache-2.0, README: "연구용" | **넣지 않음** (PyTorch도 빠짐) |
+| **GMT 추적 정책 (`pretrained.pt`)** | Apache-2.0, README: "연구용" | **넣지 않음.** 사용자가 동의하면 설치 도우미가 GitHub 원본에서 받음. numpy로 계산해 PyTorch도 필요 없음 |
 | **smplx (코드)** | **MPI 비상업** | **넣지 말 것** (아래 "작업 기록" 4번) |
 | **SMPL-X 모델 파일** | **MPI 비상업, 재배포 금지** | **불가.** 사용자가 받아 폴더를 지정 |
 | **AMASS·LAFAN1 데이터** | 비상업 / CC BY-NC-ND | **불가** |
 | CMU 데이터 (BVH, FBX, C3D) | 재배포 가능, 판매만 금지 | 샘플로 넣을 수 있음 |
-| **Blender** | GPL (별도 프로세스) | 별도 설치를 권장 |
-| **Isaac Sim** | NVIDIA 라이선스 | **불가.** 사용자가 설치하고 EULA에 동의 |
+| **Blender** | GPL (별도 프로세스) | 넣지 않음. 설치 도우미가 blender.org에서 받음 |
+| **Isaac Sim** | NVIDIA 라이선스 | **불가.** 사용자가 EULA에 동의하면 설치 도우미가 NVIDIA에서 받음 |
 
 ## 작업 기록 (2026-10-19)
 

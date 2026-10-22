@@ -135,9 +135,11 @@ def robot_urdf() -> str:
 
 def smpl_model_dir() -> str:
     """Folder holding smplx/SMPLX_*.npz (licence-gated: each user downloads it)."""
-    env = os.environ.get("SMPL_MODEL_DIR")
-    if env:
-        return env
+    return os.environ.get("SMPL_MODEL_DIR") or default_smpl_model_dir()
+
+
+def default_smpl_model_dir() -> str:
+    """Where SMPL-X models go without SMPL_MODEL_DIR: models\\ in the repository, <user data>\\models installed."""
     return os.path.join(REPO_ROOT, "models") if not INSTALLED else os.path.join(user_dir(), "models")
 
 

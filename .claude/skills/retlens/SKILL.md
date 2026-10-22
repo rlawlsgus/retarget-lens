@@ -35,6 +35,8 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 | `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이) | 마커 수, `missing_pct`, `most_missing`, `longest_gap_s`, `spike_frames` |
 | `physics FILE [--assist 1]` | Isaac PhysX 물리 검사(짧은 클립 약 1분) | `physics.metrics`(phys_falls, phys_harness_pct, phys_saturated_pct, phys_ok), `physics.falls[]` |
 | `video FILE [--out X.mp4] [--physics]` | Isaac으로 녹화 | `video` 경로 |
+| `setup [--offline]` | 설치 도우미 점검: Blender·GMT·Isaac Sim·SMPL-X가 이 PC에 있는지, 없으면 설치할 수 있는지(GPU·드라이버·디스크·인터넷·쓰기 권한) | `components[]`(key, state, action, found, detail, note, requirements[], license) |
+| `setup --install KEY [--accept-license] [--source ZIP]` | 그 구성 요소를 필요할 때만 설치. 이미 호환되는 것이 있으면 아무것도 받지 않음 | 설치 뒤 상태 |
 | `api` | 떠 있는 창의 HTTP API 주소와 토큰 | `url`, `token` |
 | `install-skill [--project DIR]` | 이 안내를 Claude Code 스킬 폴더에 복사 | `installed` |
 
@@ -98,7 +100,7 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
   - 각 로봇을 Isaac Sim PhysX로 시뮬레이션해서, 관절 PD로 클립을 따라가게 합니다.
   - 골반 보조 힘(`assist` 1 = 기본, 0 = 끔)은 균형 제어기를 대신합니다. 이 힘에 기대는 비율이 크면 그 동작은 로봇이 혼자 하기 어렵다는 뜻입니다.
   - 결과는 캐시되어 다시 요청하면 바로 나옵니다.
-  - **균형 제어**(`balance`)를 `pd`/`gmt`로 바꾸면 Isaac 대신 MuJoCo로 계산합니다(클립당 몇 초, 라이선스 동의 불필요). `pd`는 제어기 없는 개루프 재생이라 거의 다 넘어지고, `gmt`는 실제 로봇처럼 추적 정책이 균형을 잡습니다. 같은 클립에서 `gmt`도 넘어지거나 `phys_body_error_cm`·토크 한계 초과가 크면 로봇이 따라 하기 어려운 동작입니다. `gmt`는 저장소 실행에서만 됩니다(설치판에는 PyTorch가 없음).
+  - **균형 제어**(`balance`)를 `pd`/`gmt`로 바꾸면 Isaac 대신 MuJoCo로 계산합니다(클립당 몇 초, 라이선스 동의 불필요). `pd`는 제어기 없는 개루프 재생이라 거의 다 넘어지고, `gmt`는 실제 로봇처럼 추적 정책이 균형을 잡습니다. 같은 클립에서 `gmt`도 넘어지거나 `phys_body_error_cm`·토크 한계 초과가 크면 로봇이 따라 하기 어려운 동작입니다. `gmt`는 GMT의 정책 파일이 있어야 합니다. 연구용 라이선스라 프로그램에 넣지 않았고, 사용자가 동의하면 설치 도우미로 받습니다. 정책은 numpy로 계산해서 PyTorch는 필요 없습니다.
 - **리타게팅 품질:** 리타게팅이 잘 됐는지를 로봇에 상관없이 같은 기준으로 잽니다(`khumanoid/retarget_quality.py`). 사람 모션을 열면 계산됩니다.
   - 무엇을 보나: 팔다리가 사람과 같은 쪽을 가리키는지(`pose_err_deg`), 발이 같은 때 바닥에 닿는지(`contact_mismatch_pct`), 로봇 관절이 범위 끝에 걸리는지(`joint_limit_pct`), 로봇 몸끼리 뚫고 지나가는지(`self_collision_pct`).
   - 이 네 지표와 발·균형 지표로 `retarget_score`(0–100)를 냅니다. `inspect`·`/api/motion`의 `retarget_quality`에 부위별 각도, 한계에 붙은 관절, 충돌 부위, 감점 내역이 있습니다.
@@ -157,6 +159,13 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 
 ## 7. 지킬 것
 
+- **설치 도우미(`setup`)로 무언가를 설치하기 전에는 사용자에게 먼저 묻습니다.** 무엇을, 어디서, 얼마나 받는지(`download`)를 말합니다.
+  - `action`이 `none`이면 이미 있으니 설치하지 않습니다.
+  - `configure`면 이미 이 PC에 있는 호환 버전(`target`)으로 환경 설정만 바꿉니다. 아무것도 받지 않지만 설정이 바뀌므로 그 경로를 알리고 묻습니다.
+  - Isaac은 기존 폴더를 덮어쓰지 않습니다. `C:\isaacsim`이 차 있으면 `C:\isaacsim-6.1.0`에 설치합니다(`download`에 나옴).
+  - `blocked`면 `note`의 이유(예: RTX GPU 없음, 디스크 부족)를 그대로 전합니다.
+  - `manual`(SMPL-X)은 사용자가 사이트에서 등록하고 받아야 합니다. 대신 받지 않습니다.
+  - `--accept-license`는 사용자가 그 라이선스(GMT 연구용, NVIDIA EULA)에 직접 동의했다고 말했을 때만 붙입니다.
 - **Isaac Sim 라이선스(NVIDIA Omniverse EULA)는 사용자만 동의할 수 있습니다.**
   - `isaac_eula_accepted`가 false면 물리·녹화를 하지 말고, 사용자에게 RetLens 창에서 물리 모드를 한 번 켜서 동의해 달라고 하세요.
   - `--isaac-accept-eula`는 사용자가 직접 동의했다고 말했을 때만 씁니다.
@@ -173,7 +182,8 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 |---|---|
 | `retlens-cli api`가 오류 | RetLens 창이 안 떠 있거나 API가 꺼짐. 사용자에게 창을 띄워 달라고 하거나 명령줄로 처리 |
 | 401 | 토큰이 틀림. 창을 다시 켜면 바뀌므로 `api.json`을 다시 읽음 |
-| FBX·SMPL-X를 못 엶 | `info`의 `checks`(blender / smpl). 사용자가 환경 설정에서 지정해야 함 |
+| FBX·SMPL-X를 못 엶 | `info`의 `checks`(blender / smpl), `setup`. 사용자가 환경 설정이나 설치 도우미에서 지정·설치 |
+| 균형 제어 GMT "설치 필요" | `setup`의 `gmt`. 연구용 라이선스에 사용자가 동의하면 설치 도우미(또는 `setup --install gmt --accept-license`)로 받음. PyTorch는 필요 없음 |
 | 물리 "실행할 수 없음" | Isaac Sim 경로(`checks.isaac`)와 라이선스 동의 확인. 로봇 USD는 기본으로 NVIDIA 에셋 서버에서 받으므로 인터넷이 필요 |
 | 비교 `frames: 0` | 두 모션이 같이 재생되는 구간이 없음. 오프셋을 확인하거나 `--align` |
 

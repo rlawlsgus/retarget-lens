@@ -20,7 +20,9 @@ would trip). After a fall the robot restarts in the clip's pose at that time.
 The GMT part is a numpy port of the authors' sim2sim.py / utils/motion_lib.py (commit 2a590de):
 same observation layout and scales, same velocity estimate (finite difference + 19-frame box filter
 with zero padding), same action scaling and torque PD. One deliberate difference: at the end of the
-clip the reference holds the last frame instead of looping back to the start.
+clip the reference holds the last frame instead of looping back to the start. The policy network
+itself runs in numpy too (khumanoid/gmt_policy.py reads pretrained.pt without PyTorch), so the
+installed program needs no PyTorch.
 """
 
 from __future__ import annotations
@@ -77,19 +79,15 @@ def gmt_paths(root: str | None = None) -> dict:
     """{"policy", "model"}: where GMT's files are (whether or not they are there). The model falls back to
     the copy staged into the program's resources when the GMT folder has none (the installed program)."""
     root = root or gmt_dir()
-    model = os.path.join(root, settings.GMT_MODEL)
-    bundled = paths.resource(*settings.BUNDLED_G1_MODEL)
-    if not os.path.isfile(model) and os.path.isfile(bundled):
-        model = bundled
-    return {"policy": os.path.join(root, settings.GMT_POLICY), "model": model}
+    return {"policy": os.path.join(root, settings.GMT_POLICY), "model": settings.gmt_model(root)}
 
 
 def gmt_files(root: str | None = None) -> dict:
     out = gmt_paths(root)
     missing = [p for p in out.values() if not os.path.isfile(p)]
     if missing:
-        raise FileNotFoundError(f"GMT not found ({', '.join(missing)}): run scripts\\install_gmt.ps1 "
-                                "or set KHUMANOID_GMT_DIR")
+        raise FileNotFoundError(f"GMT not found ({', '.join(missing)}): get it with RetLens's 설치 도우미, "
+                                "scripts\\install_gmt.ps1, or point KHUMANOID_GMT_DIR at a GMT folder")
     return out
 
 
@@ -314,12 +312,10 @@ class G1Sim:
                      if self.model.body(self.model.geom_bodyid[g]).name.endswith("ankle_roll_link")
                      and self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
         self.policy = None
-        if controller == "gmt":
-            import torch
+        if controller == "gmt":  # the TorchScript file, evaluated in numpy (no PyTorch needed)
+            from .gmt_policy import GMTPolicy
 
-            self.torch = torch
-            self.policy = torch.jit.load(policy_path, map_location="cpu")
-            self.policy.eval()
+            self.policy = GMTPolicy(policy_path)
 
     # -- state
     def set_pose(self, data, pos, rot_xyzw, dof, vel=None, ang_vel=None, dof_vel=None, lift: bool = False):
@@ -366,8 +362,7 @@ class G1Sim:
         prop = np.concatenate([ang_vel * ANG_VEL_SCALE, rpy_wxyz(quat)[:2], (dof_pos - GMT_DEFAULT),
                                obs_vel * DOF_VEL_SCALE, self.last_action])
         obs = np.concatenate([ref.mimic_obs(step), prop, np.array(self.history).reshape(-1)])
-        with self.torch.no_grad():
-            raw = self.policy(self.torch.from_numpy(obs).float().unsqueeze(0)).numpy().squeeze()
+        raw = self.policy(obs)  # float32, as the TorchScript module computes
         self.last_action = raw.copy()
         self.history.append(prop)
         return np.clip(raw, -10.0, 10.0) * ACTION_SCALE + GMT_DEFAULT

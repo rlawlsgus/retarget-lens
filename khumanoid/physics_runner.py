@@ -22,7 +22,7 @@ Finding Isaac Sim (first match, khumanoid.settings.find_isaac):
      import isaacsim)
   3. this interpreter, when it can import isaacsim (the k-humanoid dev env);
      never in a frozen (packaged) build, where sys.executable is the program itself
-  4. the standalone install folders in ISAAC_DIRS (C:\\isaacsim)
+  4. the standalone install folders (settings.isaac_dirs(): C:\\isaacsim, C:\\isaacsim-<version>)
 
 The Isaac EULA is never accepted here: pass accept_eula=True only after the user
 accepted it (viewer --isaac-accept-eula); otherwise a run fails with that message.

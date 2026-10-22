@@ -36,7 +36,8 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-                               QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+                               QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+                               QSpinBox,
                                QSplitter,
                                QStyle, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -1383,6 +1384,7 @@ class SettingsDialog(QDialog):
         ("isaac", "Isaac Sim", "Isaac Sim python.bat (python.bat);;모든 파일 (*)", "isaac_python"),
         ("blender", "Blender 4.5", "blender.exe (blender.exe);;모든 파일 (*)", "blender"),
         ("smpl", "SMPL-X 모델 폴더", None, "smpl_model_dir"),
+        ("gmt", "GMT 폴더", None, "gmt_dir"),
         ("robot_usd", "로봇 USD (선택)", "USD (*.usd *.usda *.usdc *.usdz);;모든 파일 (*)", "robot_usd"),
         ("video", "동영상 저장 폴더", None, "video_dir"),
     ]
@@ -1392,14 +1394,17 @@ class SettingsDialog(QDialog):
                          "바꾸면 물리 결과를 따로 계산합니다.",
             "blender": "FBX 파일을 읽을 때 씁니다. blender.exe를 고르세요.",
             "smpl": "AMASS SMPL-X 파일을 열 때 씁니다. smplx\\SMPLX_NEUTRAL.npz가 들어 있는 폴더를 고르세요.",
+            "gmt": "물리 모드의 균형 제어 '추적 정책 (GMT)'에 씁니다. assets\\pretrained_checkpoints\\pretrained.pt가 있는 "
+                   "GMT 폴더를 고르세요(설치 도우미가 받으면 자동으로 채워짐).",
             "video": "'동영상 저장'이 MP4를 쓰는 폴더입니다."}
 
     def __init__(self, win: "EditorWindow"):
         super().__init__(win)
         self.win = win
         self.setWindowTitle(f"{APP_NAME} 환경 설정")
-        self.resize(900, 640)
+        self.resize(900, 700)
         s = settings.load(reload=True)
+        self._loaded = settings.load(reload=True)  # what the fields started from (_merge_saved)
         lay = QVBoxLayout(self)
         intro = QLabel("비워 두면 자동으로 찾습니다(환경변수, 기본 설치 위치). 찾지 못한 항목은 그 기능만 쓸 수 없고, "
                        "나머지는 그대로 동작합니다.")
@@ -1489,9 +1494,7 @@ class SettingsDialog(QDialog):
         pf = QGridLayout(prog)
         pf.setColumnStretch(1, 1)
         self.prog_status: dict[str, QLabel] = {}
-        have = {c.key for c in settings.check_all(s)}  # 균형 제어 (GMT): not in the installed program
-        rows = [(k, label) for k, label in (("robot", "로봇 모델"), ("gmr", "리타게팅 (GMR)"), ("gmt", "균형 제어 (GMT)"))
-                if k in have]
+        rows = [("robot", "로봇 모델"), ("gmr", "리타게팅 (GMR)")]
         for r, (key, label) in enumerate(rows):
             pf.addWidget(QLabel(f"<b>{label}</b>"), r, 0)
             st = QLabel()
@@ -1512,6 +1515,9 @@ class SettingsDialog(QDialog):
         buttons.button(QDialogButtonBox.Cancel).setText("취소")
         again = buttons.addButton("다시 점검", QDialogButtonBox.ResetRole)
         again.clicked.connect(self.refresh)
+        setup = buttons.addButton("설치 도우미...", QDialogButtonBox.ResetRole)
+        setup.setToolTip("빠진 프로그램이 이 PC에 설치될 수 있는지 보고, 필요할 때만 설치합니다")
+        setup.clicked.connect(self._open_setup)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
@@ -1534,7 +1540,8 @@ class SettingsDialog(QDialog):
         checks = {c.key: c for c in settings.check_all(s)}
         auto = settings.Settings(library_dirs=s.library_dirs)  # what is found with the field left empty
         found_auto = {"isaac": settings.find_isaac(auto).path, "blender": settings.find_blender(auto).path,
-                      "smpl": settings.find_smpl(auto).path, "video": settings.video_dir(auto)}
+                      "smpl": settings.find_smpl(auto).path, "gmt": settings.find_gmt(auto).path,
+                      "video": settings.video_dir(auto)}
         for key, _, _, _ in self.ROWS:
             if key == "robot_usd":
                 self.edits[key].setPlaceholderText("비우면 NVIDIA 에셋 서버의 Unitree G1 (인터넷 필요)")
@@ -1579,9 +1586,267 @@ class SettingsDialog(QDialog):
         self.refresh()
 
     def accept(self) -> None:
+        self._merge_saved(typed_wins=True)  # an install that finished in the background keeps the path it saved
         settings.save(self.current())
         self.win.apply_settings()
         super().accept()
+
+    def _merge_saved(self, typed_wins: bool) -> None:
+        """The paths the setup assistant saves (prereqs.SETTING) that changed on disk since this window
+        read them replace what the fields show - except, with typed_wins, a field the user has typed in."""
+        from ..prereqs import SETTING
+
+        disk = settings.load(reload=True)
+        for key, _, _, f in self.ROWS:
+            if f in SETTING.values() and getattr(disk, f) != getattr(self._loaded, f):
+                if not typed_wins or self.edits[key].text().strip().strip('"') == getattr(self._loaded, f):
+                    self.edits[key].setText(getattr(disk, f))
+                setattr(self._loaded, f, getattr(disk, f))
+
+    def _open_setup(self) -> None:
+        """The assistant works on the saved settings and saves what it installs. Nothing typed here is
+        saved by opening it; afterwards the paths it set show here (the other fields stay as typed)."""
+        self.win.open_setup()
+        self._merge_saved(typed_wins=False)
+        self.refresh()
+
+
+class _SetupSignals(QObject):
+    probed = Signal(object)  # list[prereqs.Status]
+    progress = Signal(str, str, float, float)  # key, stage, done, total
+    finished = Signal(str, object)  # key, Status or the exception
+
+
+class SetupAssistant(QDialog):
+    """설치 도우미 (khumanoid/prereqs.py): per optional component, what this PC has, whether it is
+    needed and whether this PC can take it; the install button is on only when an install is needed
+    and possible. Checks and installs run in the background; one install at a time."""
+    STATE = {"ready": ("✓", OK_COLOR, "있음"), "incompatible": ("⚠", WARN_COLOR, "맞지 않는 버전"),
+             "missing": ("✗", WARN_COLOR, "없음")}
+    BUTTON = {"install": "설치", "configure": "이것으로 설정", "manual": "zip 가져오기..."}
+
+    def __init__(self, win: "EditorWindow"):
+        super().__init__(win)
+        from .. import prereqs
+
+        self.win, self.prereqs = win, prereqs
+        self.setWindowTitle(f"{APP_NAME} 설치 도우미")
+        self.resize(900, 720)
+        self.sig = _SetupSignals()
+        self.sig.probed.connect(self._show)
+        self.sig.progress.connect(self._progress)
+        self.sig.finished.connect(self._finished)
+        self.status: dict = {}
+        self.running: str | None = None
+        self.cancel = threading.Event()
+        self.worker: threading.Thread | None = None
+        lay = QVBoxLayout(self)
+        intro = QLabel("RetLens가 쓸 수 있는 외부 프로그램과 파일입니다. 먼저 이 PC에 호환되는 것이 있는지 찾고, 없을 때만 "
+                       "이 PC에 설치할 수 있는지(GPU·드라이버·디스크·인터넷·쓰기 권한) 확인합니다. 설치는 필요하고 가능할 때만 "
+                       "켜지며, 파일은 각 배포처에서 직접 받고 체크섬을 확인합니다. 동의가 필요한 라이선스는 설치 전에 묻습니다.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        body = QWidget()
+        rows = QVBoxLayout(body)
+        self.ui: dict[str, dict] = {}
+        for key in prereqs.KEYS:  # per component: the whole report, then a line of progress and buttons
+            box = QGroupBox(f"{prereqs.NAMES[key]} · {prereqs.NEEDED_FOR[key]}")
+            v = QVBoxLayout(box)
+            text = QLabel("점검 중...")
+            text.setWordWrap(True)
+            text.setTextFormat(Qt.RichText)
+            text.setOpenExternalLinks(True)
+            text.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            text.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+            v.addWidget(text)
+            line = QHBoxLayout()
+            bar = QProgressBar()
+            bar.setVisible(False)
+            stop = QPushButton("취소")
+            stop.setVisible(False)
+            stop.clicked.connect(self.cancel.set)
+            site = QPushButton("배포처 열기")
+            site.setToolTip(prereqs.LICENSES[key].url)
+            site.clicked.connect(lambda _=False, k=key: QDesktopServices.openUrl(QUrl(self.prereqs.LICENSES[k].url)))
+            act = QPushButton("설치")
+            act.setEnabled(False)
+            act.clicked.connect(lambda _=False, k=key: self._act(k))
+            line.addWidget(bar, 1)
+            line.addWidget(stop)
+            line.addStretch(0)
+            line.addWidget(site)
+            line.addWidget(act)
+            v.addLayout(line)
+            rows.addWidget(box)
+            self.ui[key] = {"text": text, "act": act, "bar": bar, "stop": stop}
+        rows.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body)
+        lay.addWidget(scroll, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.button(QDialogButtonBox.Close).setText("닫기")
+        self.again = buttons.addButton("다시 점검", QDialogButtonBox.ResetRole)
+        self.again.clicked.connect(self.refresh)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.refresh()
+
+    # -- checks
+    def refresh(self) -> None:
+        if self.running:
+            return
+        for u in self.ui.values():
+            u["act"].setEnabled(False)
+        self.again.setEnabled(False)
+
+        def work():
+            try:
+                self.sig.probed.emit(self.prereqs.probe_all(online=True))
+            except Exception as e:  # never leave the dialog at "점검 중"
+                self.sig.probed.emit(e)
+
+        threading.Thread(target=work, name="setup-probe", daemon=True).start()
+
+    def _html(self, st) -> str:
+        mark, color, word = self.STATE[st.state]
+        out = f"<span style='color:{color}'><b>{mark} {word}</b></span>"
+        if st.found:
+            out += f" {escape(st.found)}"
+        if st.detail:
+            out += f"<br><span style='color:gray'>{escape(st.detail)}</span>"
+        if st.action != "none":
+            out += f"<br><b>{escape(st.note)}</b>"
+            if st.download:
+                out += f"<br><span style='color:gray'>받는 곳: {escape(st.download)}</span>"
+            if st.requirements:
+                marks = []
+                for r in st.requirements:
+                    c, m = (OK_COLOR, "✓") if r.ok else ((BAD_COLOR, "✗") if r.blocking else (WARN_COLOR, "⚠"))
+                    marks.append(f"<span style='color:{c}'>{m}</span> {escape(r.name)}: {escape(r.detail)}")
+                out += "<br>" + "<br>".join(marks)
+            lic = st.license
+            if lic is not None:
+                out += (f"<br><span style='color:gray'>라이선스: <a href='{escape(lic.url)}'>{escape(lic.name)}</a>"
+                        + (" (설치 전에 동의를 묻습니다)" if lic.consent and st.action == "install" else "") + "</span>")
+        else:
+            out += f"<br><span style='color:gray'>{escape(st.note)}</span>"
+        return out
+
+    def _show(self, result) -> None:
+        self.again.setEnabled(True)
+        if isinstance(result, Exception):
+            for u in self.ui.values():
+                u["text"].setText(f"<span style='color:{BAD_COLOR}'>점검 실패: {escape(str(result))}</span>")
+            return
+        for st in result:
+            self._show_one(st)
+
+    def _show_one(self, st) -> None:
+        self.status[st.key] = st
+        u = self.ui[st.key]
+        u["text"].setText(self._html(st))
+        label = self.BUTTON.get(st.action)
+        u["act"].setText(label or ("설치 필요 없음" if st.action == "none" else "설치할 수 없음"))
+        u["act"].setEnabled(bool(label) and not self.running)
+        u["act"].setToolTip(st.note)
+
+    # -- installs
+    def _consent(self, st) -> bool:
+        lic = st.license
+        box = QMessageBox(self)
+        box.setWindowTitle(f"{st.name} 설치")
+        box.setIcon(QMessageBox.Question)
+        box.setTextFormat(Qt.RichText)
+        text = (f"<b>{escape(st.name)}</b>을(를) 설치합니다.<br>{escape(st.download)}<br><br>"
+                f"라이선스: <a href='{escape(lic.url)}'>{escape(lic.name)}</a><br>{escape(lic.summary)}")
+        if st.key == "isaac":
+            text += (f"<br><br><a href='{escape(self.prereqs.ISAAC_EULA_URL)}'>NVIDIA Omniverse License Agreement</a> 전문을 "
+                     "읽고 동의하는 경우에만 진행하세요.")
+        box.setText(text + "<br><br>" + ("동의하고 설치하시겠습니까?" if lic.consent else "설치하시겠습니까?"))
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("동의하고 설치" if lic.consent else "설치")
+        box.button(QMessageBox.No).setText("취소")
+        return box.exec() == QMessageBox.Yes
+
+    def _act(self, key: str) -> None:
+        st = self.status.get(key)
+        if st is None or self.running:
+            return
+        source = None
+        if st.action == "manual":  # SMPL-X: the zip the user downloaded from the site
+            path, _ = QFileDialog.getOpenFileName(self, "SMPL-X zip 고르기 (smpl-x.is.tue.mpg.de에서 받은 파일)",
+                                                  os.path.join(os.path.expanduser("~"), "Downloads"), "zip (*.zip)")
+            if not path:
+                return
+            source = path
+        elif st.action == "install" and not self._consent(st):
+            return
+        if key == "isaac" and st.action == "install":  # the same consent the physics mode asks for
+            self.win.accept_isaac_eula()
+        self.running = key
+        self.cancel.clear()
+        for k, u in self.ui.items():
+            u["act"].setEnabled(False)
+        u = self.ui[key]
+        u["bar"].setVisible(True)
+        u["bar"].setRange(0, 0)
+        u["stop"].setVisible(st.action == "install")
+        self.again.setEnabled(False)
+
+        def work():
+            try:  # accept only after the consent box above; expect: refuse if the PC changed since the check
+                out = self.prereqs.install(key, accept=st.action == "install", expect=st.action, source=source,
+                                           cancel=self.cancel,
+                                           progress=lambda stage, d, t: self.sig.progress.emit(key, stage, d, t))
+            except Exception as e:  # SetupError, Cancelled, network: shown, never fatal
+                out = e
+            self.sig.finished.emit(key, out)
+
+        self.worker = threading.Thread(target=work, name=f"setup-{key}", daemon=True)
+        self.worker.start()
+
+    def _progress(self, key: str, stage: str, done: float, total: float) -> None:
+        bar = self.ui[key]["bar"]
+        if total > 0:
+            bar.setRange(0, 1000)
+            bar.setValue(int(1000 * min(done / total, 1.0)))
+            unit = 1e9 if total > 2e9 else 1e6
+            bar.setFormat(f"{stage} {done / unit:.1f} / {total / unit:.1f} {'GB' if unit == 1e9 else 'MB'}")
+        else:
+            bar.setRange(0, 0)
+            bar.setFormat(stage)
+
+    def _finished(self, key: str, result) -> None:
+        self.running = None
+        u = self.ui[key]
+        u["bar"].setVisible(False)
+        u["stop"].setVisible(False)
+        if isinstance(result, self.prereqs.Cancelled):
+            self.win.status(f"{self.prereqs.NAMES[key]} 설치를 취소했습니다(받던 파일은 다음에 이어 받습니다)", 8000)
+        elif isinstance(result, Exception):
+            QMessageBox.warning(self, "설치하지 못했습니다", f"{self.prereqs.NAMES[key]}: {type(result).__name__}: {result}")
+        else:
+            self.win.apply_settings(quiet=True)  # the new paths take effect at once (menus, checks)
+            self.win.status(f"{self.prereqs.NAMES[key]}: {result.note}", 10000)
+        self.refresh()
+
+    def reject(self) -> None:
+        """Closing hides the window; a running install goes on (or stops, if the user says so) and the
+        same window, reopened from the menu, still shows it - so it can never be started twice."""
+        if self.running and not self.cancel.is_set():
+            box = QMessageBox(self)
+            box.setWindowTitle("설치 중")
+            box.setText(f"{self.prereqs.NAMES[self.running]}을(를) 설치하고 있습니다.")
+            keep = box.addButton("계속 설치 (창만 닫기)", QMessageBox.AcceptRole)
+            stop = box.addButton("설치 멈추기", QMessageBox.DestructiveRole)
+            box.addButton("취소", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is stop:
+                self.cancel.set()
+            elif box.clickedButton() is not keep:
+                return
+        super().reject()
 
 
 # ------------------------------------------------------------------------------ main window
@@ -1739,6 +2004,8 @@ class EditorWindow(QMainWindow):
         self.a_labels = act("CMU 동작 라벨 목록", lambda: self.open_path(app_paths.doc("docs", "cmu_motion_labels.md")))
         self.a_folders = act("데이터 폴더 열기", lambda: self.open_path(app_paths.user_dir()),
                              tip="캐시·업로드·로그가 있는 폴더 (설치판: %LOCALAPPDATA%\\RetLens)")
+        self.a_setup = act("설치 도우미...", lambda: self.open_setup(), icon=QStyle.SP_DriveNetIcon,
+                           tip="Blender·GMT·Isaac Sim·SMPL-X가 이 PC에 있는지 보고, 없고 설치할 수 있을 때만 설치합니다")
         self.a_settings = act("환경 설정...", lambda: self.open_settings(), "Ctrl+,", QStyle.SP_FileDialogDetailedView,
                               tip="Isaac Sim·Blender·SMPL-X 모델·모션 폴더·동영상 폴더 위치와 점검")
         self.a_about = act("정보", self._about)
@@ -1752,7 +2019,7 @@ class EditorWindow(QMainWindow):
 
         mb = self.menuBar()
         m = mb.addMenu("파일(&F)")
-        for a in (self.a_open, None, self.a_video, self.a_video_dir, self.a_folders, None, self.a_settings, None,
+        for a in (self.a_open, None, self.a_video, self.a_video_dir, self.a_folders, None, self.a_settings, self.a_setup, None,
                   self.a_quit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("편집(&E)")
@@ -1774,8 +2041,8 @@ class EditorWindow(QMainWindow):
         m.addAction(self.a_swing)
         m = mb.addMenu("물리(&S)")
         m.addAction(self.a_physics)
-        # 균형 제어: what keeps the simulated robot up. The installed program cannot run every mode
-        # (no PyTorch for GMT): those entries are greyed out with the reason as their tip
+        # 균형 제어: what keeps the simulated robot up. A mode whose files are not here yet (GMT before the
+        # setup assistant fetched it) says so in its label and tip; picking it explains and offers the assistant
         sub = m.addMenu("균형 제어")
         sub.setToolTipsVisible(True)
         grp = QActionGroup(self)
@@ -1783,21 +2050,14 @@ class EditorWindow(QMainWindow):
         self.balance_box = QComboBox()
         self.balance_box.setToolTip("물리 모드의 균형 제어 (물리 메뉴에도 있음). 고르면 물리 모드를 켭니다")
         for key, label in BALANCE.items():
-            why = sc.balance_problem(key) if app_paths.FROZEN else ""
-            tip = f"쓸 수 없음: {why}" if why else BALANCE_TIPS[key]
-            a = QAction(label + (" - 쓸 수 없음" if why else ""), self, checkable=True)
+            a = QAction(label, self, checkable=True)
             a.setChecked(key == sc.balance)
-            a.setEnabled(not why)
-            a.setToolTip(tip)
-            a.setStatusTip(tip)
             a.triggered.connect(lambda _=False, k=key: self.set_balance(k))
             grp.addAction(a)
             sub.addAction(a)
             self.a_balance[key] = a
-            self.balance_box.addItem(label + (" - 쓸 수 없음" if why else ""), key)
-            self.balance_box.setItemData(self.balance_box.count() - 1, tip, Qt.ToolTipRole)
-            if why:
-                self.balance_box.model().item(self.balance_box.count() - 1).setEnabled(False)
+            self.balance_box.addItem(label, key)
+        self._refresh_balance_entries()
         self.balance_box.setCurrentIndex(self.balance_box.findData(sc.balance))
         self.balance_box.activated.connect(lambda i: self.set_balance(self.balance_box.itemData(i)))
         self.m_assist = m.addMenu("골반 보조 힘 (Isaac)")
@@ -1868,17 +2128,30 @@ class EditorWindow(QMainWindow):
     def open_settings(self) -> None:
         SettingsDialog(self).exec()
 
-    def apply_settings(self) -> None:
-        """Saved 환경 설정 take effect now (scene folders, project panel, the status bar)."""
-        s = settings.load()
+    _setup: "SetupAssistant | None" = None
+
+    def open_setup(self) -> None:
+        """One 설치 도우미 per window, reused: an install keeps running while it is closed and shows
+        again when it is reopened."""
+        if self._setup is None:
+            self._setup = SetupAssistant(self)
+        else:
+            self._setup.refresh()
+        self._setup.exec()
+
+    def apply_settings(self, quiet: bool = False) -> None:
+        """Saved 환경 설정 take effect now (scene folders, project panel, the status bar, 균형 제어)."""
+        s = settings.load(reload=True)
         self.scene.apply_settings(s)
         self.project.reload()
         self._refresh_env()
+        self._refresh_balance_entries()
         if bool(self.api) != s.api_enabled or (self.api is not None and self.api.port != s.api_port
                                                and self._api_port_asked != s.api_port):
             self._stop_api()
             self._start_api()
-        self.status("환경 설정을 저장했습니다", 4000)
+        if not quiet:
+            self.status("환경 설정을 저장했습니다", 4000)
 
     # ---------------------------------------------------------------- AI API
     api = None
@@ -1958,11 +2231,16 @@ class EditorWindow(QMainWindow):
         box.setTextFormat(Qt.RichText)
         box.setText(f"{escape(what)}에는 <b>{escape(c.name)}</b>이(가) 필요합니다.<br><br>{escape(c.detail)}<br>"
                     f"{escape(c.hint)}")
+        from ..prereqs import KEYS
+
+        setup = box.addButton("설치 도우미 열기", QMessageBox.AcceptRole) if key in KEYS else None
         go = box.addButton("환경 설정 열기", QMessageBox.AcceptRole)
         box.addButton("닫기", QMessageBox.RejectRole)
         box.exec()
         if box.clickedButton() is go:
             self.open_settings()
+        elif setup is not None and box.clickedButton() is setup:
+            self.open_setup()
         return False
 
     def reset_layout(self) -> None:
@@ -2076,6 +2354,12 @@ class EditorWindow(QMainWindow):
         self.add_paths(paths)
 
     # ---------------------------------------------------------------- physics / video
+    def accept_isaac_eula(self) -> None:
+        """The user accepted NVIDIA's license (here or in the setup assistant's Isaac install)."""
+        self._eula = True
+        self.settings.setValue("isaac/eula_accepted", True)
+        self.scene.runner.accept_eula = True
+
     def _ensure_eula(self) -> bool:
         """Isaac Sim runs only after the user accepted NVIDIA's license (asked once)."""
         if self._eula:
@@ -2092,9 +2376,7 @@ class EditorWindow(QMainWindow):
         box.button(QMessageBox.No).setText("취소")
         if box.exec() != QMessageBox.Yes:
             return False
-        self._eula = True
-        self.settings.setValue("isaac/eula_accepted", True)
-        self.scene.runner.accept_eula = True
+        self.accept_isaac_eula()
         return True
 
     def set_physics(self, on: bool) -> None:
@@ -2133,17 +2415,36 @@ class EditorWindow(QMainWindow):
                 a.setChecked(on)
                 a.blockSignals(False)
 
+    def _refresh_balance_entries(self) -> None:
+        """Labels and tips of the 균형 제어 menu and box: '(설치 필요)' on a mode that cannot run yet."""
+        for i, (key, label) in enumerate(BALANCE.items()):
+            why = self.scene.balance_problem(key)
+            tip = f"아직 쓸 수 없음: {why}" if why else BALANCE_TIPS[key]
+            text = label + (" (설치 필요)" if why else "")
+            a = self.a_balance[key]
+            a.setText(text)
+            a.setToolTip(tip)
+            a.setStatusTip(tip)
+            self.balance_box.setItemText(i, text)
+            self.balance_box.setItemData(i, tip, Qt.ToolTipRole)
+
     def _balance_ready(self, mode: str) -> bool:
-        """What the mode needs is there (Isaac: installed and its EULA accepted; MuJoCo: GMT);
-        otherwise say what is missing."""
+        """What the mode needs is there (Isaac: installed and its EULA accepted; MuJoCo: GMT's files);
+        otherwise say what is missing and offer the setup assistant."""
         if mode == "isaac":
             return self.need("isaac", "물리 모드 (보조 힘, Isaac)") and self._ensure_eula()
         why = self.scene.balance_problem(mode)
         if not why:
             return True
-        if not app_paths.FROZEN and not self.need("gmt", f"균형 제어 '{BALANCE[mode]}'"):
-            return False  # need() said what is missing and offered 환경 설정
-        QMessageBox.warning(self, "균형 제어", f"'{BALANCE[mode]}'을(를) 쓸 수 없습니다.\n\n{why}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("균형 제어")
+        box.setText(f"'{BALANCE[mode]}'을(를) 아직 쓸 수 없습니다.\n\n{why}")
+        go = box.addButton("설치 도우미 열기", QMessageBox.AcceptRole)
+        box.addButton("닫기", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is go:
+            self.open_setup()
         return False
 
     def save_video(self, item: Item | None) -> None:
@@ -2261,6 +2562,15 @@ class EditorWindow(QMainWindow):
                                           f"<b>파일 위치</b><table>{where}</table>")
 
     def closeEvent(self, e):
+        setup = self._setup
+        if setup is not None and setup.running:  # an install in the (maybe hidden) 설치 도우미
+            name = setup.prereqs.NAMES[setup.running]
+            if QMessageBox.question(self, "설치 중", f"{name}을(를) 설치하고 있습니다. 종료하면 설치가 멈춥니다"
+                                    "(받던 파일은 다음에 이어 받습니다). 종료할까요?") != QMessageBox.Yes:
+                e.ignore()
+                return
+            setup.cancel.set()
+            setup.worker.join(timeout=15)  # downloads and unpacks stop at the next chunk / file and clean up
         self.settings.setValue(layout_key("window/geometry"), self.saveGeometry())
         self.settings.setValue(layout_key("window/state"), self.saveState())
         self.timer.stop()

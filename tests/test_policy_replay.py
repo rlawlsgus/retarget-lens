@@ -17,8 +17,7 @@ from khumanoid import policy_replay as pr  # noqa: E402
 
 
 def _gmt():
-    pytest.importorskip("torch")
-    pytest.importorskip("mujoco")
+    pytest.importorskip("mujoco")  # the policy itself runs in numpy (khumanoid/gmt_policy.py)
     try:
         return pr.gmt_files()
     except FileNotFoundError as e:

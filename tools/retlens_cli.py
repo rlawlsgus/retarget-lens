@@ -12,6 +12,8 @@ JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"
     python tools/retlens_cli.py c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
     python tools/retlens_cli.py physics FILE [--assist 1]   # Isaac PhysX check (needs the EULA accepted)
     python tools/retlens_cli.py video FILE --out X.mp4 [--physics]
+    python tools/retlens_cli.py setup [--offline]           # 설치 도우미: what is here, what is missing, what can be installed
+    python tools/retlens_cli.py setup --install blender     # install one, only when needed (gmt / isaac: --accept-license)
     python tools/retlens_cli.py api                         # the running RetLens window's HTTP API (url, token)
     python tools/retlens_cli.py install-skill [--project DIR]   # copy the AI guide (SKILL.md) for Claude Code
 
@@ -26,6 +28,7 @@ import json
 import os
 import shutil
 import sys
+import time
 
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
@@ -82,6 +85,20 @@ def run(args) -> dict:
         if d is None:
             raise RuntimeError("RetLens is not running with its API on (환경 설정 > AI용 로컬 API)")
         return d
+    if c == "setup":
+        from khumanoid import prereqs
+
+        if not args.install:
+            return {"components": [st.to_dict() for st in prereqs.probe_all(online=not args.offline)]}
+        last = [0.0]
+
+        def progress(stage, done, total):
+            if time.time() - last[0] > 2.0 or (total and done >= total):
+                last[0] = time.time()
+                _log(f"{stage} {done / 1e6:.0f}/{total / 1e6:.0f} MB" if total else stage)
+
+        st = prereqs.install(args.install, accept=args.accept_license, source=args.source, progress=progress)
+        return {"installed": args.install, **st.to_dict()}
     if c == "install-skill":
         src = skill_source()
         base = args.project or os.path.expanduser("~")
@@ -210,6 +227,13 @@ def parser() -> argparse.ArgumentParser:
         else:
             p.add_argument("--out", default=None, help="the .mp4 to write (default: the video folder)")
             p.add_argument("--physics", action="store_true", help="record the simulated motion")
+    p = sub.add_parser("setup", help="setup assistant: optional programs here / missing / installable (JSON)")
+    p.add_argument("--offline", action="store_true", help="skip the publishers' reachability check")
+    p.add_argument("--install", choices=("blender", "gmt", "isaac", "smpl"), default=None,
+                   help="install it, only when it is missing and this PC can take it")
+    p.add_argument("--accept-license", action="store_true",
+                   help="the user agreed to its licence (GMT research-only, NVIDIA EULA) - never on their behalf")
+    p.add_argument("--source", default=None, help="SMPL-X: the zip from smpl-x.is.tue.mpg.de (or its folder)")
     sub.add_parser("api", help="url and token of the running RetLens window's HTTP API")
     p = sub.add_parser("install-skill", help="copy the AI guide (SKILL.md) to Claude Code's skills folder")
     p.add_argument("--project", default=None, help="a project folder (default: your user folder, ~/.claude/skills)")

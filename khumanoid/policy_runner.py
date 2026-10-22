@@ -7,14 +7,15 @@ motion replayed with no controller ("pd": open-loop stiff PD) or followed by GMT
     job.state, job.stage, job.progress   # "running", "시뮬레이션", 0.4
     job.result                           # the simulated npz (+ json), once done
 
-MuJoCo at 1 kHz is quick (CMU 143_11, 10.9 s: about 2 s open loop, 4 s with the policy, plus about
-5 s to load PyTorch the first time), so unlike the Isaac runs nothing starts a process: one worker
-thread runs one clip at a time, and a cancel stops it within 0.5 s of simulated time.
+MuJoCo at 1 kHz is quick (CMU 143_11, 10.9 s: about 2 s open loop, 4 s with the policy), so unlike
+the Isaac runs nothing starts a process: one worker thread runs one clip at a time, and a cancel
+stops it within 0.5 s of simulated time.
 
 Results are keyed by the motion's arrays, the controller, configs/physics.yaml (PD gains, fall
 rules), the GMT files, the hold after the clip and CACHE_VERSION, and saved as tools/policy_replay.py
 saves them, so compare.load_item opens both (kind "MuJoCo 재생 · ...", info["policy_replay"]).
-The installed program has no PyTorch: problem("gmt") says why instead.
+The policy runs in numpy (khumanoid/gmt_policy.py), so the installed program runs it too once GMT's
+files are there (설치 도우미, khumanoid/prereqs.py).
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from . import policy_replay as pr
 from .motion import RobotMotion
 from .physics_runner import PHYSICS_CONFIG, _file_id, _safe
 
-CACHE_VERSION = 1  # bump when policy_replay's results change meaning
+CACHE_VERSION = 2  # bump when policy_replay's results change meaning (2: the policy in numpy, not torch)
 HOLD_S = 1.0  # stand on the last pose this long after the clip, as tools/policy_replay.py does
 MODEL_TEXT = "GMT G1 (23 DoF, wrists fixed), MuJoCo 1 kHz"
 
@@ -54,22 +55,22 @@ def problem(controller: str, gmt_root: str | None = None) -> str:
     """'' when this controller can run here, else why not (menus show it, request() raises it)."""
     if controller not in pr.CONTROLLERS:
         return f"알 수 없는 제어기: {controller}"
-    if controller == "gmt" and paths.FROZEN:
-        return "설치판에는 PyTorch가 들어 있지 않아 추적 정책(GMT)은 저장소에서 실행할 때만 쓸 수 있습니다"
     if importlib.util.find_spec("mujoco") is None:
         return "MuJoCo(mujoco 패키지)가 없습니다"
     root = gmt_root or settings.gmt_dir()
     files = pr.gmt_paths(root)
+    get = ("'파일 > 설치 도우미'에서 GMT를 받으세요(연구용 라이선스 동의 필요)" if paths.INSTALLED else
+           "설치 도우미나 scripts\\install_gmt.ps1로 받으세요")
     if not os.path.isfile(files["model"]):
-        if paths.FROZEN:
-            return (f"설치판에는 GMT의 G1 MuJoCo 모델이 들어 있지 않습니다(GMT 폴더를 환경변수 {settings.GMT_ENV}에 "
-                    f"넣으면 씁니다)")
-        return f"GMT를 찾지 못했습니다({root}에 없음). scripts\\install_gmt.ps1을 실행하세요"
+        return f"GMT의 G1 MuJoCo 모델이 없습니다({root}). {get}"
     if controller == "gmt":
-        if importlib.util.find_spec("torch") is None:
-            return "PyTorch가 없습니다(environment.yml의 pytorch)"
         if not os.path.isfile(files["policy"]):
-            return f"GMT 추적 정책이 없습니다({files['policy']}). scripts\\install_gmt.ps1을 실행하세요"
+            return f"GMT 추적 정책이 없습니다({files['policy']}). {get}"
+        from .gmt_policy import problem as policy_problem
+
+        bad = policy_problem(files["policy"])  # another network than the one the numpy port reproduces
+        if bad:
+            return f"{bad}. {get}"
     return ""
 
 

@@ -11,7 +11,7 @@ K-온디바이스 휴머노이드 과제 1차년도 산출물인 **Human MoCap �
 
 ## 시작하기
 
-**설치판 (권장):** [Releases](https://github.com/rlawlsgus/retarget-lens/releases)에서 `RetLens-<버전>-win64.zip`을 받아 풀고 `RetLens.exe`를 실행합니다. FBX·SMPL-X·물리 기능은 "파일 > 환경 설정"에서 Blender, SMPL-X 모델, Isaac Sim을 지정하면 켜집니다. 사용법은 [docs/retlens.md](docs/retlens.md)에 있습니다.
+**설치판 (권장):** [Releases](https://github.com/rlawlsgus/retarget-lens/releases)에서 `RetLens-<버전>-win64.zip`을 받아 풀고 `RetLens.exe`를 실행합니다. FBX·SMPL-X·물리 기능에 필요한 Blender, SMPL-X 모델, Isaac Sim, GMT 정책은 "파일 > 설치 도우미"가 이 PC에 이미 있는지, 설치할 수 있는지 확인하고, 필요할 때만 배포처에서 받아 설치합니다(라이선스 동의는 사용자가 직접). 이미 설치했다면 "환경 설정"에서 위치를 지정해도 됩니다. 사용법은 [docs/retlens.md](docs/retlens.md)에 있습니다.
 
 **저장소에서 (개발):** [docs/setup.md](docs/setup.md)대로 conda 환경 `k-humanoid`를 만든 뒤:
 
@@ -49,7 +49,9 @@ khumanoid/            코어 패키지 (numpy 위주, Isaac Sim 파이썬에서�
   compare.py, markers.py   여러 포맷을 같은 로봇으로 불러오기(캐시), C3D 마커
   physics_runner.py   Isaac 작업(물리·녹화)을 백그라운드 프로세스로 돌리고 캐시
   policy_replay.py    균형 켬/끔 비교: MuJoCo에서 제어기 없는 PD 재생 vs GMT 추적 정책
+  gmt_policy.py       GMT 추적 정책 신경망 (PyTorch 없이 numpy로)
   paths.py, settings.py    파일 위치(저장소/설치판), 환경 설정과 점검
+  prereqs.py          설치 도우미: Blender·GMT·Isaac Sim·SMPL-X가 있는지, 설치할 수 있는지, 필요할 때만 설치
   app/                RetLens: editor.py(Qt 창), scene.py(화면과 무관한 장면 코어), robots.py(배치 메시),
                       api_core.py / api_server.py(AI용 JSON 코어, 로컬 HTTP API), runtime.py(로그·오류 창)
 tools/                명령줄: editor.py, retlens_cli.py, retarget.py, qc_report.py, isaac_replay.py,
