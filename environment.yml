@@ -1,0 +1,54 @@
+# RetLens conda environment
+#
+# Isaac Sim itself is NOT installed into this env. It lives globally at
+# C:\isaacsim (standalone zip install, 6.1.0) and is linked into this env by
+# the activation hook that scripts\setup_env.ps1 installs.
+#
+#   powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
+#   conda activate retlens
+#
+# Python / numpy / scipy are pinned to what Isaac Sim 6.1 bundles (3.12 / 2.3 /
+# 1.17), so code shared between plain scripts and Isaac Sim sees the same APIs.
+# Inside a SimulationApp, Kit's import hook serves its own bundled numpy/scipy/
+# torch unless the env's were imported before Kit started (tools/isaac_replay.py
+# keeps the env's torch out for that reason).
+#
+# Retargeting: GMR's solver and G1 IK configs are vendored in retlens/gmr (MIT). GMR itself is
+# not a package on any index; scripts\install_gmr.ps1 downloads a pinned commit for the robot
+# meshes (assets/) and for development comparisons (setup_env.ps1 runs it).
+name: retlens
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy=2.3
+  - scipy=1.17
+  - pandas
+  - matplotlib
+  - pyyaml
+  - tqdm
+  - ezc3d        # C3D (optical marker) reader
+  - pytest
+  # --- GMR (General Motion Retargeting) dependencies ---
+  - mujoco-python=3.11.0   # same version Isaac Sim 6.1 bundles (isaacsim.pip.newton)
+  - qpsolvers>=4.12
+  - daqp                   # GMR's default QP solver
+  - loop-rate-limiters
+  - rich<15                # viser 1.1.1 requires < 15; GMR works with any
+  - natsort
+  - imageio
+  - pytorch=*=cpu*         # dev only: GMR's own package imports torch; RetLens uses the vendored retlens/gmr (no torch)
+  # --- comparison viewer (tools/compare_viewer.py) ---
+  - viser=1.1.1            # MIT, browser-based 3D viewer + GUI
+  - yourdfpy               # URDF loader used by viser's robot display
+  - plotly
+  # --- desktop editor (tools/editor.py) ---
+  - pyside6=6.11           # LGPL-3.0, Qt 6 widgets
+  - qt6-webengine=6.11     # LGPL-3.0, shows the viser scene inside the editor (same Qt version as pyside6)
+  # --- packaging (scripts\build_retlens.ps1) ---
+  - pyinstaller            # GPL-2.0 with the bootloader exception (the built program is not GPL)
+  - pip:
+    - mink==1.3.0          # Apache-2.0, differential IK on MuJoCo; not on conda-forge
+    - smplx==0.1.28        # dev only (--format smplx-gmr comparison). Code licence: non-commercial research (MPI); not shipped

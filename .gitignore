@@ -1,0 +1,23 @@
+# motion data and generated outputs stay out of git
+data/
+reports/
+*.usd
+*.usda
+*.usdc
+!assets/**/*.usd*
+
+# body-model files are licence-gated (SMPL / SMPL-X / MANO)
+models/
+
+# packaging output (scripts\build_retlens.ps1, scripts\package_release.ps1)
+/build/
+/dist/
+
+# machine-specific Claude Code settings (launch.json has local paths); the project's skills are shared
+.claude/*
+!.claude/skills/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/

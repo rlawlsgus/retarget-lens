@@ -1,0 +1,40 @@
+# Mocap validation settings (see retlens/qc.py for what each check does).
+# Checked on public mocap data; changes from the first guesses are marked.
+
+thresholds:
+  # --- human (BVH / SMPL / C3D) ---
+  max_joint_speed: 15.0      # m/s, faster = marker swap / solver pop (clean data peaks at 6-12 m/s)
+  max_glitch_duration: 1.0   # s, frames between two pops this close are bad too
+  penetration_depth: 0.03    # m below the floor
+  float_height: 0.15         # m, lowest joint of the whole body above the floor ...
+  float_min_duration: 0.5    # s ... for at least this long (shorter = jump)
+  contact_height: 0.02       # m above the foot joint's own floor = "in contact" (was 0.05:
+                             #   caught heel strike / toe-off, 25-72% "skating" on clean clips)
+  skate_speed: 0.3           # m/s, horizontal foot speed while in contact
+  skate_min_duration: 0.1    # s, a slide must last this long (new; clean clips now 0-5 %,
+                             #   pivot turns / shuffling 13-20 %, a sliding walk 65 %)
+  max_missing_markers: 0.10  # C3D: fraction of markers missing in a frame
+  floor_offset_tol: 0.05     # m, floor calibration warning
+  # --- robot (retargeted) ---
+  joint_limit_margin: 0.01   # rad tolerated past the URDF limit (was 0.0: IK solutions resting
+                             #   on a limit were flagged for float rounding, excess < 1e-4 rad)
+  default_max_joint_velocity: 25.0  # rad/s if the URDF has no velocity limit
+  max_root_tilt_deg: 75.0
+  min_root_height: 0.25      # m
+  # --- robot balance (retlens/stability.py; needs the robot model: Isaac check, viewer,
+  #     qc_report.py --balance). Soft flag static_unbalanced: standing still (CoM < 0.1 m/s)
+  #     with the CoM projection > 2 cm outside the feet's support polygon for >= 0.2 s.
+  #     Clean retargets show 0-1 %; heel-standing retargets (feet pitched toe-up) far more.
+  #     Soft = it only warns: the polygon knows only the feet (hands or props on the floor are
+  #     not in it), and balance is the controller's job. ZMP outside the support is reported,
+  #     not flagged: the cart-table model puts it outside in most frames of dances and runs.
+  support_contact_height: 0.02     # m, sole points this close to the floor support the robot
+  balance_tolerance: 0.02          # m outside the polygon before it counts
+  static_max_speed: 0.1            # m/s CoM speed = standing still
+  static_min_duration: 0.2         # s
+  max_static_unbalanced_ratio: 0.05  # more -> clip WARN
+  # --- clip verdict ---
+  min_duration: 1.0          # s
+  pass_hard_ratio: 0.02      # <= 2 % hard-flagged frames -> PASS
+  warn_hard_ratio: 0.10      # <= 10 % -> WARN, more -> FAIL (counts 0 s)
+  max_skate_ratio: 0.15

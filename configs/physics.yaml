@@ -1,0 +1,74 @@
+# PhysX tracking replay: tools/isaac_replay.py --robot-motion clip.npz --physics
+#
+# The robot starts in the clip's first pose on a floor with friction, gravity on,
+# and its joint drives (PD) track the clip. A virtual harness on the pelvis pulls
+# toward the clip's root (horizontal position and orientation); the force it needs
+# measures how much balance help the motion needs beyond what the robot's feet give.
+# --assist 0 turns the harness off: then the robot falls when balance needs
+# feedback the open-loop drives cannot give (resets to the clip and counts).
+
+sim:
+  physics_hz: 240            # rounded to a whole number of steps per motion frame
+  static_friction: 1.0       # floor and feet
+  dynamic_friction: 0.8
+  solver_position_iterations: 8
+  solver_velocity_iterations: 2
+
+# Joint drive gains (first matching regex wins). Stiff servos on purpose: with no
+# policy and no feed-forward torque, policy-level gains (kp ~ 100-200) let the
+# stance leg sag 10+ deg under body weight and the harness ends up carrying it.
+# Stiff drives track closely, so the drive torque approaches what the motion
+# really needs; effort limits stay the robot asset's, and demands above them are
+# reported as torque saturation.
+pd:
+  - {pattern: ".*_(hip|knee)_.*", stiffness: 1500.0, damping: 40.0}
+  - {pattern: ".*_ankle_.*", stiffness: 800.0, damping: 20.0}
+  - {pattern: "waist_.*", stiffness: 1000.0, damping: 30.0}
+  - {pattern: ".*_(shoulder|elbow)_.*", stiffness: 300.0, damping: 10.0}
+  - {pattern: ".*_wrist_.*", stiffness: 80.0, damping: 4.0}
+  - {pattern: ".*", stiffness: 100.0, damping: 5.0}
+
+# Virtual harness (--assist scales all gains; 0 = off). It stands in for the balance
+# feedback an open-loop replay lacks: horizontal position and orientation only. No
+# vertical spring by default: the robot's weight must go through its feet, and a clip
+# that floats above or sinks into the floor (CMU 02_01's feet rise ~4 cm over the
+# clip) shows up as root height error, not as harness force.
+# The rotation spring must be stiffer than gravity's tipping (m g h ~ 230 N m / rad
+# for the G1) to hold it up.
+assist:
+  vertical: false            # true: also spring the root height to the clip
+  pos_hz: 1.0                # position spring natural frequency (critically damped, per kg of robot)
+  rot_stiffness: 600.0       # N m / rad
+  rot_damping: 60.0          # N m s / rad
+
+# A frame counts as fallen when the simulated root is this far from the clip
+fall:
+  root_error_m: 0.5
+  tilt_error_deg: 60.0
+  min_pelvis_height_m: 0.3
+  drop_m: 0.25               # pelvis this much below the clip's (collapsed onto the knees)
+
+# First cause of each fall (retlens/diagnosis.py): conditions checked in the frames
+# before the fall. Primary = the earliest one that starts inside the window; else the
+# chronic one active the longest; harness_spike only if nothing else (it is a consequence).
+# support_exit uses the CoM only while the harness is on (the ZMP then includes its pull).
+diagnosis:
+  window_s: 0.75             # look this far back from the fall (and not before the previous reset)
+  min_frames: 2              # a condition must hold this many frames in a row
+  contact_height_m: 0.005    # a sole point this close to the floor = foot on the floor ...
+  contact_force_bw: 0.05     # ... or a contact force above this share of body weight
+  swing_speed_mps: 0.5       # the clip's foot moves this fast above the floor (> contact_height_m) = swing;
+                             #   the simulated foot on the floor then = toe_catch
+  slip_speed_mps: 0.3        # a foot on the floor sliding this fast while the clip's foot stands = foot_slip
+  torque_ratio: 1.5          # drive demand / effort limit = torque_saturation
+  com_outside_m: 0.03        # CoM projection this far outside the support = support_exit ...
+  zmp_outside_m: 0.05        # ... or the ZMP this far
+  self_distance_m: 0.09      # left/right feet or knees closer than this = self_collision (proxy:
+                             #   self-collision is off in the replay)
+  harness_bw: 0.5            # harness force above this share of body weight = harness_spike
+
+report:
+  assist_flag_ratio: 0.2     # frames where the harness carries > 20 % of body weight are flagged
+  # clip verdict "consistent": no fall, flagged frames and torque-saturated frames below these
+  max_flagged_ratio: 0.05
+  max_saturated_ratio: 0.05
