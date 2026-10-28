@@ -78,6 +78,32 @@ def test_add_play_measure_remove(scene):
     assert scene.items == [] and scene.robots.handles == []
 
 
+def test_videos_are_named_by_what_they_record(scene, monkeypatch):
+    """The same clip retargeted another way is recorded to its own file: an existing file is
+    handed back as done (physics_runner), so the old recording must not sit at the new one's path."""
+    jobs = []
+
+    def submit(job, motion, on_done):  # no Isaac: the job is taken as done
+        job.state = "done"
+        jobs.append(job)
+        return job
+
+    monkeypatch.setattr(scene.runner, "_submit", submit)
+    a = scene.add(SAMPLE)
+    try:
+        scene.save_video(a)
+        first = jobs[-1].outputs[0]
+        assert os.path.dirname(first) == os.path.abspath(scene.opts.video_dir) and first.endswith(".mp4")
+        assert os.path.basename(first).startswith("samples_synthetic_g1_walk_kinematic_")
+        scene.save_video(a)
+        assert jobs[-1].outputs[0] == first  # the same motion: the same file, reused
+        a.robot.dof_pos[:, 0] += 0.05  # as if retargeted with other settings
+        scene.save_video(a)
+        assert jobs[-1].outputs[0] != first and jobs[-1].key != jobs[0].key
+    finally:
+        scene.remove(a)
+
+
 def test_retarget_settings_apply_to_motions_opened_next(scene, tmp_path, monkeypatch):
     """리타게팅 보정 (RetLens's 리타게팅 menu, the viewer's checkboxes, /api/retarget): human
     motions opened after a change are retargeted with it, each setting in its own cache entry;
@@ -86,7 +112,7 @@ def test_retarget_settings_apply_to_motions_opened_next(scene, tmp_path, monkeyp
 
     monkeypatch.setattr(compare, "CACHE", str(tmp_path))  # not the user's retarget cache
     bvh = os.path.join(os.path.dirname(SAMPLE), "synthetic_walk.bvh")
-    off = {"smooth_hz": 6.0, "foot_flat": False, "swing_clearance_cm": 0.0}
+    off = {"smooth_hz": 6.0, "foot_flat": False, "swing_clearance_cm": 0.0, "self_collision": False}
     assert scene.retarget_settings() == off
     plain = scene.add(bvh)
     events = []
@@ -107,8 +133,13 @@ def test_retarget_settings_apply_to_motions_opened_next(scene, tmp_path, monkeyp
         with pytest.raises(ValueError):
             scene.set_retarget(swing_clearance_cm=-1.0)
         assert scene.set_retarget(foot_flat=False)["swing_clearance_cm"] == 2.0  # each setting on its own
+        assert scene.set_retarget(self_collision=True) == {**off, "swing_clearance_cm": 2.0, "self_collision": True}
+        sep = scene.add(bvh)
+        assert sep.retarget["self_collision"] is True and isinstance(sep.info["self_collision"], dict)
+        assert sep.kind.endswith("swing >= 2 cm, self-collision") and "자기 관통 보정" in dict(scene.item_facts(sep))
+        scene.remove(sep)
     finally:
-        scene.set_retarget(foot_flat=False, swing_clearance_cm=0.0)
+        scene.set_retarget(foot_flat=False, swing_clearance_cm=0.0, self_collision=False)
         scene.remove(plain)
         scene.remove(flat)
 

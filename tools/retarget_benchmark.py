@@ -75,7 +75,8 @@ def run_robot(robot: str, files: list[str], args, log=print) -> list[dict]:
         label = paths.rel(f).replace(os.sep, "/")
         try:
             item = load_item(f, robot=robot, smooth=args.smooth, fps=args.fps, smpl_model_dir=args.smpl_model_dir,
-                             swing_clearance=args.swing_clearance / 100.0, foot_flat=args.foot_flat, log=None)
+                             swing_clearance=args.swing_clearance / 100.0, foot_flat=args.foot_flat,
+                             self_collision=args.self_collision, log=None)
             compute_metrics(item, fk, limits)
         except Exception as e:  # keep going over the set; report it
             log(f"[fail] {robot} {label}: {type(e).__name__}: {e}")
@@ -111,7 +112,8 @@ def write_report(rows: list[dict], args, out_dir: str) -> str:
     robots = list(dict.fromkeys(r["robot"] for r in rows))
     summary = {rb: summarize([r for r in rows if r["robot"] == rb]) for rb in robots}
     settings_txt = (f"smooth {args.smooth:g} Hz" + (", foot-flat" if args.foot_flat else "")
-                    + (f", swing >= {args.swing_clearance:g} cm" if args.swing_clearance else ""))
+                    + (f", swing >= {args.swing_clearance:g} cm" if args.swing_clearance else "")
+                    + (", self-collision" if args.self_collision else ""))
     lines = ["# 리타게팅 품질 (로봇별)", "",
              f"{dt.date.today().isoformat()} · `tools/retarget_benchmark.py` · 리타게팅 설정: {settings_txt} · "
              f"클립 {len({r['clip'] for r in rows})}개", "",
@@ -144,7 +146,8 @@ def write_report(rows: list[dict], args, out_dir: str) -> str:
         fh.write("\n".join(lines) + "\n")
     with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as fh:
         json.dump({"settings": {"smooth_hz": args.smooth, "foot_flat": args.foot_flat,
-                                "swing_clearance_cm": args.swing_clearance, "fps": args.fps},
+                                "swing_clearance_cm": args.swing_clearance, "self_collision": args.self_collision,
+                                "fps": args.fps},
                    "summary": summary, "clips": rows}, fh, ensure_ascii=False, indent=1, default=float)
     return md
 
@@ -157,6 +160,7 @@ def main(argv=None) -> int:
     ap.add_argument("--smooth", type=float, default=6.0, metavar="HZ")
     ap.add_argument("--foot-flat", action="store_true")
     ap.add_argument("--swing-clearance", type=float, default=2.0, metavar="CM", help="default 2 (the recommended setting)")
+    ap.add_argument("--self-collision", action="store_true")
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--smpl-model-dir", default=None, help="for AMASS SMPL-X inputs (default: 환경 설정)")
     ap.add_argument("--out", default=os.path.join(ROOT, "reports", "retarget_quality"), help="output folder")

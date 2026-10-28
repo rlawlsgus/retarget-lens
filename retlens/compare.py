@@ -29,7 +29,8 @@ HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
 MARKER_EXT = (".c3d",)  # raw optical markers: shown on the same take's retargeted robot
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
-PIPELINE_VERSION = 4  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist
+PIPELINE_VERSION = 5  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
+# 5: feet levelled from the clip's stance, foot-flat through legs and pelvis height
 MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",) + MARKER_EXT
 # folders the viewer lists motions from (dev: data/raw, data/samples, data/retargeted,
 # data/uploads, reports; installed: see retlens.paths); uploads land in UPLOADS
@@ -119,7 +120,7 @@ def human_format(path: str) -> str | None:
 
 
 def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance: float = 0.0,
-               foot_flat: bool = False) -> str:
+               foot_flat: bool = False, self_collision: bool = False) -> str:
     from .retarget import ROBOT_TAGS
 
     st = os.stat(path)
@@ -128,6 +129,8 @@ def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance
         key.append(["swing_clearance", swing_clearance])
     if foot_flat:
         key.append(["foot_flat", True])
+    if self_collision:
+        key.append(["self_collision", True])
     key = json.dumps(key)
     h = hashlib.sha1(key.encode()).hexdigest()[:10]
     stem = os.path.splitext(os.path.basename(path))[0]
@@ -136,17 +139,19 @@ def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance
 
 def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: float = 30.0,
               csv_fps: float = 30.0, smpl_model_dir: str | None = None, swing_clearance: float = 0.0,
-              foot_flat: bool = False, log=print) -> Item:
+              foot_flat: bool = False, self_collision: bool = False, log=print) -> Item:
     """Robot motion as is, or human motion retargeted (cached) plus its skeleton.
-    foot_flat turns the soles of feet standing still parallel to the floor and swing_clearance
-    (m) > 0 lifts skimming swing feet, after retargeting (retlens.retarget.retarget_file)."""
+    foot_flat stands feet that stand still flat on the floor (legs and pelvis height), swing_clearance
+    (m) > 0 lifts skimming swing feet and self_collision pushes apart robot parts that go through
+    each other, after retargeting (retlens.retarget.retarget_file)."""
     log = log or (lambda *_: None)
     path = os.path.abspath(path)
     name = os.path.splitext(os.path.basename(path))[0]
     folder = os.path.basename(os.path.dirname(path))
     if path.lower().endswith(MARKER_EXT):
         return _load_marker_item(path, log=log, robot=robot, smooth=smooth, fps=fps, csv_fps=csv_fps,
-                                 smpl_model_dir=smpl_model_dir, swing_clearance=swing_clearance, foot_flat=foot_flat)
+                                 smpl_model_dir=smpl_model_dir, swing_clearance=swing_clearance, foot_flat=foot_flat,
+                                 self_collision=self_collision)
     fmt = human_format(path)
     if fmt is None:
         m = load_motion(path, fps=csv_fps)
@@ -165,7 +170,7 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
 
     from .retarget import retarget_file
 
-    cached = cache_path(path, robot, smooth, fps, swing_clearance, foot_flat)
+    cached = cache_path(path, robot, smooth, fps, swing_clearance, foot_flat, self_collision)
     if os.path.isfile(cached) and os.path.isfile(cached[:-4] + ".json"):
         m = load_motion(cached)
         with open(cached[:-4] + ".json", encoding="utf-8") as f:
@@ -174,7 +179,8 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
     else:
         log(f"{name}: retargeting ({fmt}) ...")
         m, info = retarget_file(path, robot=robot, fmt=fmt, fps=fps, smooth_hz=smooth, foot_flat=foot_flat,
-                                swing_clearance=swing_clearance, smpl_model_dir=smpl_model_dir, log=None)
+                                swing_clearance=swing_clearance, self_collision=self_collision,
+                                smpl_model_dir=smpl_model_dir, log=None)
         os.makedirs(CACHE, exist_ok=True)
         m.save_npz(cached)
         with open(cached[:-4] + ".json", "w", encoding="utf-8") as f:
@@ -192,9 +198,12 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
         smooth_txt += ", foot-flat"
     if swing_clearance:
         smooth_txt += f", swing >= {100 * swing_clearance:g} cm"
+    if self_collision:
+        smooth_txt += ", self-collision"
     return Item(label=f"{folder}/{name}", source=path, kind=f"{label_fmt} -> GMR{smooth_txt}", robot=m,
                 human=human, info=info, retarget={"smooth_hz": smooth, "foot_flat": bool(foot_flat),
-                                                  "swing_clearance_cm": round(100 * swing_clearance, 3)})
+                                                  "swing_clearance_cm": round(100 * swing_clearance, 3),
+                                                  "self_collision": bool(self_collision)})
 
 
 def find_take(path: str, files: list[str] | None = None) -> str | None:

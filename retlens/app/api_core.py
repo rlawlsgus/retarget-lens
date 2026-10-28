@@ -49,7 +49,7 @@ def headless_scene(log=None, mesh_cell: float = 0.004, **opts) -> MotionScene:
     """A MotionScene without a window (the command line): its viser server only listens on
     127.0.0.1 and nothing connects; motions, metrics, comparisons and Isaac jobs work as in
     the window. Paths and tools come from 환경 설정; opts are more SceneOptions (smooth,
-    foot_flat, swing_clearance_cm)."""
+    foot_flat, swing_clearance_cm, self_collision)."""
     import socket
 
     import viser
@@ -88,14 +88,21 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
         "frames": r.num_frames, "fps": r.fps, "duration_s": r.duration, "offset_s": item.offset,
         "visible": item.visible, "color": list(item.color), "qc": m.get("qc"), "qc_notes": m.get("qc_notes") or "",
         "ik_position_residual": item.info.get("ik_position_residual"),
-        "retarget": item.retarget or None,  # human inputs: smooth_hz, foot_flat, swing_clearance_cm
+        "retarget": item.retarget or None,  # human inputs: smooth_hz, foot_flat, swing_clearance_cm, self_collision
     }
     if m.get("_quality"):  # retlens.retarget_quality: worst limbs, pinned joints, colliding parts, what cost points
         out["retarget_quality"] = m["_quality"]
     if item.info.get("foot_flat"):
         ff = item.info["foot_flat"]
-        out["foot_flat"] = {k: ff.get(k) for k in ("frames_changed", "stance_pitch_deg", "sole_lift_cm",
-                                                   "ankle_change_deg")}
+        out["foot_flat"] = {k: ff.get(k) for k in ("frames_changed", "stance_pitch_deg", "stance_tilt_deg", "sole_lift_cm",
+                                                   "leg_change_deg", "root_drop_cm", "two_feet_height_diff_cm")}
+    if item.info.get("foot_reference"):  # T-pose formats: the feet levelled as the clip stands (retarget._canonical_feet)
+        out["foot_reference"] = item.info["foot_reference"]
+    if item.info.get("self_collision"):  # 자기 관통 보정 (retarget.separate_self_collisions)
+        sc = item.info["self_collision"]
+        out["self_collision"] = {k: sc.get(k) for k in ("frames_changed", "frames_deeper_than_target",
+                                                        "frames_deeper_than_3cm", "deepest_cm", "joint_change_deg",
+                                                        "unresolved_pairs")}
     if item.info.get("c3d"):
         out["c3d"] = item.info["c3d"]
         out["solved_motion"] = item.info.get("solved_motion")

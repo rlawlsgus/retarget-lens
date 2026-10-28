@@ -211,6 +211,93 @@ def test_bend_axes_come_from_the_clip():
     assert straight["right_shoulder_yaw_joint"][0] is not None
 
 
+def test_feet_level_as_the_clip_stands_not_as_the_reference():
+    """The T-pose config's robot foot is flat where the clip's feet stand flat: a reference foot
+    10 deg off how the person stands (CMU 143's T-pose feet), or tilted another 15 deg, makes no
+    difference. Feet that never stand still keep the reference."""
+    from scipy.spatial.transform import Rotation
+
+    from retlens.retarget import HumanClip, _canonical_feet
+    from retlens.rotations import matrix_to_quat
+
+    T, up = 60, np.array([0.0, 0.0, 1.0])
+    base = Rotation.from_euler("xyz", [90, 0, 90], degrees=True).as_matrix()  # some joint axis convention
+    stand = Rotation.from_euler("y", 10, degrees=True).as_matrix() @ base  # the feet as they stand in the clip
+    ref = {"Hips": (np.array([0.0, 0.0, 0.95]), np.eye(3)),
+           "LeftUpLeg": (np.array([0.0, 0.1, 0.9]), np.eye(3)), "RightUpLeg": (np.array([0.0, -0.1, 0.9]), np.eye(3)),
+           "LeftFoot": (np.array([0.0, 0.1, 0.08]), base), "RightFoot": (np.array([0.0, -0.1, 0.08]), base)}
+    ankles = np.tile([ref["LeftFoot"][0], ref["RightFoot"][0]], (T, 1, 1))
+    frames = [{f"{s}FootMod": [ankles[t, k], matrix_to_quat(stand)] for k, s in enumerate(("Left", "Right"))}
+              for t in range(T)]
+    clip = HumanClip(frames=frames, fps=30.0, fmt="tpose", info={"_ref_pose": ref, "_feet": ankles,
+                                                                 "_hips_z": np.full(T, 0.95)})
+    feet, report = _canonical_feet(clip)
+    for s in ("Left", "Right"):
+        assert report[s]["used"] == "stance" and report[s]["stance_frames"] == T
+        assert report[s]["reference_vs_stance_deg"]["total"] == pytest.approx(10.0, abs=0.01)
+        # the robot foot's up axis when standing as in the clip (GMR target: R_human @ R_ref'^T @ level robot foot)
+        assert np.allclose(stand @ feet[f"{s}Foot"].T @ up, up, atol=1e-9)
+        assert np.allclose(feet[f"{s}Foot"] @ [1.0, 0.0, 0.0], base @ [1.0, 0.0, 0.0], atol=0.2)  # a tilt, not a turn
+    clip.info["_ref_pose"] = {**ref, "LeftFoot": (ref["LeftFoot"][0],
+                                                  Rotation.from_euler("x", 15, degrees=True).as_matrix() @ base)}
+    feet2, _ = _canonical_feet(clip)
+    assert np.allclose(stand @ feet2["LeftFoot"].T @ up, up, atol=1e-9)
+
+    clip.info["_ref_pose"] = ref
+    clip.info["_feet"] = ankles + np.arange(T)[:, None, None] * np.array([1.0 / 30.0, 0.0, 0.0])  # 1 m/s, never still
+    feet3, report = _canonical_feet(clip)
+    assert report["Left"]["used"].startswith("reference") and np.array_equal(feet3["LeftFoot"], base)
+
+    # standing 1 s each on the heel, the outer edge and the inner edge: no one flat stance -> the reference
+    T = 90
+    tilts = [Rotation.from_euler(ax, d, degrees=True).as_matrix() @ base for ax, d in (("y", -20), ("x", 20), ("x", -20))]
+    ankles = np.tile([ref["LeftFoot"][0], ref["RightFoot"][0]], (T, 1, 1))
+    frames = [{f"{s}FootMod": [ankles[t, k], matrix_to_quat(tilts[t // 30])] for k, s in enumerate(("Left", "Right"))}
+              for t in range(T)]
+    clip = HumanClip(frames=frames, fps=30.0, fmt="tpose", info={"_ref_pose": ref, "_feet": ankles,
+                                                                 "_hips_z": np.full(T, 0.95)})
+    feet4, report = _canonical_feet(clip)
+    assert report["Left"]["used"] == "reference (stance frames disagree)" and np.array_equal(feet4["LeftFoot"], base)
+
+    # on tiptoe (ankles 14 cm up) for most of the clip after a little flat standing: not taken for flat
+    T = 90
+    lift = np.where(np.arange(T) < 20, 0.0, 0.14)
+    ankles = np.tile([ref["LeftFoot"][0], ref["RightFoot"][0]], (T, 1, 1)) + lift[:, None, None] * up
+    toe = Rotation.from_euler("y", 50, degrees=True).as_matrix() @ stand  # heel up 50 deg
+    frames = [{f"{s}FootMod": [ankles[t, k], matrix_to_quat(stand if t < 20 else toe)]
+               for k, s in enumerate(("Left", "Right"))} for t in range(T)]
+    clip = HumanClip(frames=frames, fps=30.0, fmt="tpose", info={"_ref_pose": ref, "_feet": ankles,
+                                                                 "_hips_z": 0.95 + lift})
+    feet5, report = _canonical_feet(clip)
+    assert report["Left"]["stance_frames"] < 25 and np.allclose(stand @ feet5["LeftFoot"].T @ up, up, atol=1e-9)
+
+
+def test_tpose_config_levels_the_robot_foot_as_the_clip_stands(tmp_path):
+    """End to end through derive_tpose_config: a reference foot 10 deg off how the clip's foot
+    stands still gives a level GMR foot target on those frames."""
+    _need_retargeting()
+    from scipy.spatial.transform import Rotation
+
+    from retlens.retarget import derive_tpose_config, load_bvh_tpose
+
+    p = tmp_path / "walk.bvh"
+    p.write_text(walking_bvh_text(seconds=1.0, fps=30))
+    clip = load_bvh_tpose(str(p), fps=30.0)
+    T = 30  # standing still in frame 0's pose for 1 s
+    clip.frames = [dict(clip.frames[0]) for _ in range(T)]
+    clip.info["_feet"] = np.repeat(clip.info["_feet"][:1], T, 0)
+    clip.info["_hips_z"] = np.repeat(clip.info["_hips_z"][:1], T, 0)
+    pos, R = clip.info["_ref_pose"]["RightFoot"]
+    clip.info["_ref_pose"] = {**clip.info["_ref_pose"],
+                              "RightFoot": (pos, Rotation.from_euler("y", 10, degrees=True).as_matrix() @ R)}
+    cfg, _, info = derive_tpose_config("unitree_g1", clip)
+    assert info["foot_reference"]["Right"]["used"] == "stance"
+    assert info["foot_reference"]["Right"]["reference_vs_stance_deg"]["total"] == pytest.approx(10.0, abs=0.5)
+    off = next(e[4] for e in cfg["ik_match_table1"].values() if e[0] == "RightFootMod")
+    target = quat_to_matrix(np.asarray(clip.frames[0]["RightFootMod"][1])) @ quat_to_matrix(np.asarray(off))
+    assert np.degrees(np.arccos(np.clip(target[2, 2], -1, 1))) < 1.0  # level (10 deg off without the levelling)
+
+
 CMU_02_03 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "raw", "cmu_bvh", "02_03.bvh")
 
 

@@ -737,6 +737,125 @@ def _sole_height(model, data, body: str) -> float:
     return float(data.xpos[b][2] - min(lows)) if lows else 0.0
 
 
+# Human feet standing flat (_canonical_feet): ankle slower than this, the foot's up direction
+# turning slower than this (not rolling over heel or toe), ankle this close to the floor (not on
+# tiptoe), pelvis at least this share of its reference height above it (not kneeling or
+# sitting), held this long. The floor is the one tracked under the still ankles, but never more
+# than FOOT_STANCE_FLOOR_DRIFT above the clip's lowest still ankles: clips drift that much (CMU
+# 02_01's floor rises ~4 cm), while stance on tiptoe (ankles 14 cm up) or on a stool rung (31 cm)
+# would otherwise raise the floor with it and pass as standing flat.
+FOOT_STANCE_SPEED = 0.25  # m/s
+FOOT_STANCE_TURN_DEG_S = 40.0
+FOOT_STANCE_HEIGHT = 0.03  # m
+FOOT_STANCE_FLOOR_DRIFT = 0.05  # m
+FOOT_STANCE_HIPS = 0.6
+FOOT_STANCE_HOLD_S = 0.15
+# A foot keeps its reference rotation with less stance than this (a jog); when fewer than
+# FOOT_STANCE_KEEP of its stance frames lie within 15 deg of their median direction, or they
+# spread more than FOOT_STANCE_SPREAD_DEG about it (median), i.e. there is no one flat stance;
+# or when the correction would exceed FOOT_STANCE_MAX_TURN_DEG.
+FOOT_STANCE_MIN_S = 0.4
+FOOT_STANCE_KEEP = 0.5
+FOOT_STANCE_SPREAD_DEG = 10.0
+FOOT_STANCE_MAX_TURN_DEG = 90.0  # references caught mid-step need 60-78 deg; clips standing flat 4-16
+
+
+def _rot_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Smallest rotation matrix taking direction a to direction b (not opposite)."""
+    a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
+    v = np.cross(a, b)
+    s, c = float(np.linalg.norm(v)), float(np.dot(a, b))
+    if s < 1e-12:
+        return np.eye(3)
+    K = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+    return np.eye(3) + K + K @ K * ((1.0 - c) / s ** 2)
+
+
+def _canonical_feet(clip: HumanClip, robot_up: dict | None = None) -> tuple[dict, dict]:
+    """Foot rotations for the reference pose from how the feet stand in the clip itself:
+    ({"LeftFoot": R, "RightFoot": R}, report).
+
+    The robot foot's rotation offset maps the human foot frame of the reference pose onto the
+    robot's T-pose foot, which _robot_tpose levels: the reference foot is what "flat" means.
+    A reference foot tilted against how the person really stands (the T-pose feet of CMU
+    subject 143, toe-up 4-16 deg in every standing frame; a reference frame caught mid-step)
+    tilts every frame's foot target by as much. A foot planted and still on the floor stands
+    flat, so world up in the foot's own axes (R^T e_z, the same whatever the heading) over the
+    clip's stance frames is that foot's own up. Each reference foot gets the smallest world
+    tilt that turns this direction onto the robot T-pose foot's up, ``robot_up``
+    {"Left" / "Right": world direction}, default vertical (an ankle at its limit can leave the
+    T-pose foot tilted when the reference leg is mid-step); its heading (toe-out) stays.
+    Stance and fallbacks: the FOOT_STANCE_* constants."""
+    from .analysis import floor_track
+    from .qc import _sustained
+
+    ref = clip.info["_ref_pose"]
+    face = _facing_frame(ref)
+    fps = clip.fps
+    sides = ("Left", "Right")
+    feet = {f"{s}Foot": np.asarray(ref[f"{s}Foot"][1], dtype=np.float64) for s in sides}
+    P = np.asarray(clip.info["_feet"], dtype=np.float64)  # ankles (T, 2, 3)
+    T = len(P)
+    if T < 3:
+        return feet, {s: {"stance_frames": 0, "used": "reference (too little stance)"} for s in sides}
+    R = np.stack([quat_to_matrix(np.array([fr[f"{s}FootMod"][1] for fr in clip.frames], dtype=np.float64))
+                  for s in sides], 1)
+    up = R[..., 2, :]  # (T, 2, 3)
+    v = np.gradient(P, axis=0) * fps
+    n = min(max(1, int(round(fps / 30.0))), T - 1)  # turn rate over ~1/30 s whatever the frame rate
+    turn = np.degrees(np.arccos(np.clip(np.einsum("tki,tki->tk", up[n:], up[:-n]), -1.0, 1.0))) * fps / n
+    turn = np.concatenate([turn, np.repeat(turn[-1:], n - 1, axis=0)])  # (T - 1, 2)
+    turn = np.maximum(np.concatenate([turn[:1], turn]), np.concatenate([turn, turn[-1:]]))  # either side of a frame
+    hspeed = np.linalg.norm(v[..., :2], axis=-1)
+    still = hspeed < FOOT_STANCE_SPEED
+    lowest = float(np.percentile(P[..., 2][still] if still.any() else P[..., 2], 2))
+    floor = np.minimum(floor_track(P[..., 2], hspeed, fps), lowest + FOOT_STANCE_FLOOR_DRIFT)
+    hips_ref = float(ref["Hips"][0][2] - min(ref["LeftFoot"][0][2], ref["RightFoot"][0][2]))
+    upright = np.asarray(clip.info["_hips_z"]) - floor > FOOT_STANCE_HIPS * hips_ref
+    stance = ((np.linalg.norm(v, axis=-1) < FOOT_STANCE_SPEED) & (turn < FOOT_STANCE_TURN_DEG_S)
+              & (P[..., 2] - floor[:, None] < FOOT_STANCE_HEIGHT) & upright[:, None])
+    hold = max(1, int(round(FOOT_STANCE_HOLD_S * fps)))
+
+    def pitch_roll(d: np.ndarray) -> np.ndarray:
+        d = face.T @ d  # facing axes: x forward, y left
+        return np.degrees([np.arctan2(d[0], d[2]), np.arctan2(d[1], d[2])])
+
+    report = {}
+    for k, s in enumerate(sides):
+        st = _sustained(stance[:, k], hold)
+        r = report[s] = {"stance_frames": int(st.sum())}
+        if st.sum() < max(5, round(FOOT_STANCE_MIN_S * fps)):
+            r["used"] = "reference (too little stance)"
+            continue
+        w = up[st, k]
+        m = np.median(w, axis=0)
+        m /= np.linalg.norm(m)
+        keep = np.degrees(np.arccos(np.clip(w @ m, -1.0, 1.0))) < 15.0  # outliers out, then again
+        if keep.any():
+            m = np.median(w[keep], axis=0)
+            m /= np.linalg.norm(m)
+        spread = np.degrees(np.arccos(np.clip(w @ m, -1.0, 1.0)))  # over every stance frame
+        r["spread_deg"] = {"p50": round(float(np.median(spread)), 2), "p90": round(float(np.percentile(spread, 90)), 2)}
+        r["kept"] = round(float(keep.mean()), 2)
+        a = feet[f"{s}Foot"] @ m  # the stance foot's up placed in the reference foot (world)
+        u = np.asarray((robot_up or {}).get(s, (0.0, 0.0, 1.0)), dtype=np.float64)
+        u = u / np.linalg.norm(u)
+        tilt = float(np.degrees(_angle(a, u)))
+        # how the robot foot would stand with the reference foot as is: + toe_up = toe up,
+        # + roll = left edge up
+        toe_up, roll = pitch_roll(a) - pitch_roll(u)
+        r["reference_vs_stance_deg"] = {"toe_up": round(float(toe_up), 2), "roll": round(float(roll), 2),
+                                        "total": round(tilt, 2)}
+        if r["kept"] < FOOT_STANCE_KEEP or r["spread_deg"]["p50"] > FOOT_STANCE_SPREAD_DEG:
+            r["used"] = "reference (stance frames disagree)"
+        elif tilt > FOOT_STANCE_MAX_TURN_DEG:
+            r["used"] = "reference (correction too large)"
+        else:
+            feet[f"{s}Foot"] = _rot_between(a, u) @ feet[f"{s}Foot"]
+            r["used"] = "stance"
+    return feet, report
+
+
 def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]:
     """GMR IK config for a T-pose BVH clip: (config, ground offset, info).
 
@@ -744,6 +863,8 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
     - rotation offsets: human frame at the reference T-pose -> robot body frame in
       the robot posed the same way (limb directions matched joint by joint, each limb
       twisted so its elbow / knee bends about the human's axis, from the clip's bends);
+      the feet are levelled as the human feet stand flat in the clip (_canonical_feet),
+      not as they happen to be in the reference pose;
     - scale table: robot / human root-to-ankle distance for the legs and root,
       root-to-wrist distance for the torso and arms, in those poses;
     - ground: a constant shift so the scaled feet stand at the robot's ankle
@@ -769,6 +890,11 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
         return data.xpos[b].copy(), data.xmat[b].reshape(3, 3).copy()
 
     robot_of = {e[0]: frame for frame, e in cfg["ik_match_table1"].items()}  # human body -> robot body
+    # the reference feet as the clip's feet stand, onto the robot T-pose feet (_robot_tpose and the
+    # bend axes read no foot rotation, so only the foot offsets below change)
+    feet, foot_report = _canonical_feet(clip, {s: face @ body_pose(robot_of[f"{s}FootMod"])[1][:, 2]
+                                               for s in ("Left", "Right")})
+    ref = {**ref, **{b: (ref[b][0], R) for b, R in feet.items()}}
     root_r = body_pose(cfg["robot_root_name"])[0]
     root_h = ref["Hips"][0]
 
@@ -816,6 +942,7 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
         "base_config": os.path.basename(str(base_path)),
         "robot_tpose": chosen,
         "bend_axes": {k: info for k, (_, info) in bend_axes.items()},  # human elbow / knee axes from the clip
+        "foot_reference": foot_report,  # foot levelling from the clip's stance (_canonical_feet)
         "scales": cfg["human_scale_table"],
         "ground_offset_m": round(ground, 4),
         "robot_ankle_height_m": round(ankle_h, 4),
@@ -1136,35 +1263,53 @@ def ensure_swing_clearance(m: RobotMotion, robot: str = "unitree_g1", clearance:
 
 
 def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float = 0.2, contact: float = 0.03,
-                        min_duration: float = 0.1, max_tilt_deg: float = 25.0,
-                        blend: float = 0.15) -> tuple[RobotMotion, dict]:
-    """Turn the soles of feet standing still parallel to the floor; returns the motion and a summary.
+                        min_duration: float = 0.1, max_tilt_deg: float = 25.0, blend: float = 0.15,
+                        floor_min: float = 0.0, joint_sigma_deg: float = 5.0, root_sigma: float = 0.05,
+                        max_root_drop: float = 0.06, max_root_rise: float = 0.005,
+                        roll_comfort_deg: float = 2.0, iters: int = 12) -> tuple[RobotMotion, dict]:
+    """Stand the feet that stand still flat on the floor with both legs and the pelvis height;
+    returns the motion and a summary.
 
     A foot stands still when every sole contact point moves slower than ``still`` m/s and
     the lowest one is within ``contact`` of the floor tracked through the clip
-    (``analysis.floor_track``), for at least ``min_duration``. On those frames the ankle
-    pitch and roll joints turn the sole plane (through the sole contact points) parallel to
-    that floor, i.e. horizontal, within their joint limits. A foot standing on its forefoot
-    (toe down: heel-off, tiptoe) only has its roll levelled and keeps its pitch. Nothing
-    else changes: other joints, the root, and every frame where the foot moves (rolling
-    onto the toes, swing). The correction fades in and out over ``blend`` s inside each
-    stance, so a foot landing toe-up rolls flat like a heel strike and is back to its own
-    angle when it lifts off. Stance frames tilted more than ``max_tilt_deg`` (kneeling on
-    the toes) are left alone.
+    (``analysis.floor_track``, never below ``floor_min``, the ground the retarget stands on:
+    a foot sinking through it would otherwise drag the other standing foot down with it), for
+    at least ``min_duration``. On those frames its sole is turned parallel to the floor and
+    lowered onto it, keeping the ankle's horizontal position and the foot's heading; a foot
+    sunk below the floor is raised by at most ``max_root_rise`` (more would need knee and
+    ankle changes a deep crouch cannot make: the solver then twisted and slid the foot
+    instead, 12 deg and 1 cm on CMU 143_13). A foot standing on its forefoot (toe down:
+    heel-off, tiptoe) only has its roll levelled and keeps its pitch. Stance frames tilted
+    more than ``max_tilt_deg`` (kneeling on the toes) are left alone. The correction fades in
+    and out over ``blend`` s inside each stance, so a foot landing toe-up rolls flat like a
+    heel strike and is back to its own angle when it lifts off.
 
-    The sole turns about the ankle, so the heel of a toe-up foot comes off the floor by
-    about heel length x sin(tilt) (G1: heel 5 cm behind the ankle, ~1 cm at 12 deg); turning
-    towards flat never moves the lowest sole point down. Reported as ``sole_lift_cm``. A
-    toe-down foot would lift its toe 12 cm x sin(tilt) the same way, hence its pitch is
-    kept. Run it before ensure_swing_clearance, which tracks the floor from the feet
-    standing still: the floor rises with the flattened soles, so swing feet that skimmed
-    the heel height before come closer to it.
+    Per frame a bounded least-squares IK (Gauss-Newton) moves the 12 leg joints and the root
+    height: the stance foot's sole points to their levelled heights on the floor, its ankle
+    xy and heading kept; every other foot kept where it was in the world (a swing foot makes
+    up for the root moving); joints held near their own angles (``joint_sigma_deg``; the
+    root height ``root_sigma`` m costs as much), within their ranges, the root between
+    ``max_root_drop`` below and ``max_root_rise`` above its own height. An ankle roll that
+    would end within ``roll_comfort_deg`` of its limit (G1: +-15 deg) is pulled back, so
+    hip roll, knee and pelvis take the rest. Arms, waist, root xy and orientation are not
+    touched. The changes are smoothed over time.
 
     Why: the retargets of CMU subject 143 (BVH, FBX and AMASS SMPL-X alike) stand with the
-    feet pitched toe-up 4-16 deg (other clips -1 to -4 deg), on the heel edge only. The
-    support polygon then is a line behind the ankles, so standing still reads as unbalanced
-    (static_unbalanced 22-39 %), and the physics replay stands on its heels.
+    feet pitched toe-up 4-16 deg, on the heel edge only. The support polygon then is a line
+    behind the ankles, so standing still reads as unbalanced (static_unbalanced 22-39 %),
+    and the physics replay stands on its heels. Most of that tilt was the T-pose foot
+    reference (_canonical_feet levels it now); what is left changes within a clip (the
+    143 BVH feet read 7-14 deg more toe-up standing upright than crouched). The ankle-only
+    version of this pass levelled the sole about the ankle: the heel came off the floor
+    0.5-1.9 cm, the floor tracked from those soles rose and pulled slow swing feet to it
+    (143_28 swing_low 3.7 -> 17 %), the ankle roll stopped at its limit, and a foot standing
+    higher than the other (FBX 143_13, 2.3-2.9 cm) could not be lowered.
     """
+    import mujoco as mj
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.optimize import lsq_linear
+    from scipy.spatial.transform import Rotation
+
     from .analysis import floor_track, slowest_sole_speed
     from .qc import _sustained
 
@@ -1174,7 +1319,7 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
     fk = _FeetFK(m, robot)
     if not fk.feet or any(len(soles) < 3 for _, soles, _ in fk.feet):
         return m, {}
-    mj, model, data, feet = fk.mj, fk.model, fk.data, fk.feet
+    model, data, feet = fk.model, fk.data, fk.feet
     F = len(feet)
     # sole plane in the foot body frame: normal pointing into the foot, forward axis heel -> toe
     axes = []
@@ -1184,6 +1329,8 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
         normal = vt[2] if vt[2] @ c.mean(0) < 0 else -vt[2]
         fwd = vt[0] if (c @ vt[0]).max() > -(c @ vt[0]).min() else -vt[0]
         axes.append((normal, fwd))
+    sole_pos = [model.geom_pos[soles].copy() for _, soles, _ in feet]
+    sole_rad = [model.geom_size[soles, 0].copy() for _, soles, _ in feet]
 
     def angles(R: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(T, feet) sole tilt from horizontal and pitch (+ toe up), degrees."""
@@ -1193,7 +1340,7 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
 
     P, R = fk.poses(m.dof_pos)
     low = P[..., 2].min(-1)
-    floor = floor_track(low, slowest_sole_speed(P, m.fps), m.fps)
+    floor = np.maximum(floor_track(low, slowest_sole_speed(P, m.fps), m.fps), floor_min)
     fastest = np.linalg.norm(np.diff(P, axis=0), axis=-1).max(-1) * m.fps
     fastest = np.concatenate([fastest[:1], fastest])
     tilt, pitch = angles(R)
@@ -1212,43 +1359,112 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
             d = np.minimum(t - a + 1 if a > 0 else np.inf, b - t if b < T else np.inf)
             w[a:b, k] = np.minimum(1.0, d / (ramp + 1))
 
+    # unknowns: the leg joints (hip -> ankle, per foot), then the root height
+    leg_joints = [j for _, _, joints in feet for j in joints]
+    of_foot = [[leg_joints.index(j) for j in joints] for _, _, joints in feet]
+    cols = [fk.col[j] for j in leg_joints]
+    adr = np.array([model.jnt_qposadr[fk.jid[j]] for j in leg_joints])
+    V = [model.jnt_dofadr[fk.jid[j]] for j in leg_joints] + [2]  # root z: free joint dof 2
+    nJ = len(leg_joints)
+    lo = np.array([fk.rng[j][0] for j in leg_joints])
+    hi = np.array([fk.rng[j][1] for j in leg_joints])
+    margin = np.radians(1.5)
+    sigma = np.concatenate([np.full(nJ, np.radians(joint_sigma_deg)), [root_sigma]])
+    s_pos, s_rot, s_sole, s_yaw = 1e-3, np.radians(0.5), 2e-3, np.radians(1.0)  # task tolerances
+    rolls = [i for i, j in enumerate(leg_joints) if j.endswith("ankle_roll_joint")]
+    comfort, s_comfort = np.radians(roll_comfort_deg), np.radians(1.0)
     up = np.array([0.0, 0.0, 1.0])
-    dof = m.dof_pos.copy()
+
+    delta = np.zeros((T, nJ + 1))
     limited = np.zeros((T, F), dtype=bool)
     jacp, jacr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
-    for k, (body, _, joints) in enumerate(feet):
-        ankle = joints[-2:]
-        cols = [fk.col[j] for j in ankle]
-        dofs = [model.jnt_dofadr[fk.jid[j]] for j in ankle]
-        lo, hi = np.array([fk.rng[j][0] for j in ankle]), np.array([fk.rng[j][1] for j in ankle])
-        for t in np.flatnonzero(w[:, k] > 0):
-            q0 = m.dof_pos[t, cols]
-            q, row = q0.copy(), m.dof_pos[t].copy()
-            for _ in range(6):  # Gauss-Newton on the sole normal's horizontal tilt
-                row[cols] = q
-                fk.set_pose(row, t)
-                mj.mj_kinematics(model, data)
-                mj.mj_comPos(model, data)
-                Rf = data.xmat[body].reshape(3, 3)
-                n, f = Rf @ axes[k][0], Rf @ axes[k][1]
-                target = up if f[2] >= 0 else (up - f[2] * f) / np.linalg.norm(up - f[2] * f)  # toe down: roll only
-                axis = np.cross(n, target)
-                s = np.linalg.norm(axis)
-                if s < 1e-5:
-                    break
+    qvel = np.zeros(model.nv)
+    for t in np.flatnonzero((w > 0).any(1)):
+        fk.set_pose(m.dof_pos[t], t)
+        q0 = data.qpos.copy()
+        mj.mj_kinematics(model, data)
+        targets = []  # per foot: (position, rotation) of the foot body
+        for k, (body, _, _) in enumerate(feet):
+            p0, R0 = data.xpos[body].copy(), data.xmat[body].reshape(3, 3).copy()
+            if w[t, k] <= 0:
+                targets.append((p0, R0))
+                continue
+            f0 = R0 @ axes[k][1]
+            # level: the sole normal up (toe down: only the roll levelled) and the heel -> toe
+            # axis keeping its heading
+            n1 = up if f0[2] >= 0 else (up - f0[2] * f0) / np.linalg.norm(up - f0[2] * f0)
+            f1 = f0 if f0[2] < 0 else f0 - f0[2] * up
+            f1 = f1 - (f1 @ n1) * n1
+            f1 /= np.linalg.norm(f1)
+            nb, fb = axes[k]
+            R1 = np.stack([f1, np.cross(n1, f1), n1], 1) @ np.stack([fb, np.cross(nb, fb), nb], 1).T
+            fz = min(floor[t], low[t, k] + max_root_rise)  # a sunk foot comes up only so far
+            p1 = np.array([p0[0], p0[1], fz - ((sole_pos[k] @ R1.T)[:, 2] - sole_rad[k]).min()])
+            rv = Rotation.from_matrix(R1 @ R0.T).as_rotvec() * w[t, k]
+            targets.append((p0 + w[t, k] * (p1 - p0), Rotation.from_rotvec(rv).as_matrix() @ R0))
+        q = q0.copy()
+        lo_b, hi_b = np.minimum(lo + margin, q0[adr]), np.maximum(hi - margin, q0[adr])  # never pushed into a limit
+        for _ in range(iters):
+            data.qpos[:] = q
+            mj.mj_kinematics(model, data)
+            mj.mj_comPos(model, data)
+            rows, errs = [], []
+            for k, (body, _, _) in enumerate(feet):
                 mj.mj_jacBody(model, data, jacp, jacr, body)
-                J = jacr[:2, dofs]
-                err = (axis / s * np.arctan2(s, n @ target))[:2]
-                q = np.clip(q + np.linalg.solve(J.T @ J + 1e-6 * np.eye(2), J.T @ err), lo, hi)
-            limited[t, k] = bool(np.any((q <= lo + 1e-6) | (q >= hi - 1e-6)))
-            dof[t, cols] = np.clip(q0 + w[t, k] * (q - q0), lo, hi)
+                Jp, Jr = jacp[:, V], jacr[:, V]
+                pb, Rb = data.xpos[body], data.xmat[body].reshape(3, 3)
+                p1, R1 = targets[k]
+                if w[t, k] <= 0:  # any other foot stays where it is
+                    rows += [Jp / s_pos, Jr / s_rot]
+                    errs += [(p1 - pb) / s_pos, _rot_err(R1, Rb) / s_rot]
+                    continue
+                rows += [Jp[:2] / s_pos, Jr[2:3] / s_yaw]  # ankle xy, heading
+                errs += [(p1[:2] - pb[:2]) / s_pos, _rot_err(R1, Rb)[2:3] / s_yaw]
+                z1 = p1[2] + (sole_pos[k] @ R1.T)[:, 2]  # sole point heights of the levelled foot on the floor
+                for g, c in enumerate(sole_pos[k]):
+                    o = Rb @ c
+                    rows.append(((Jp[2] + Jr[0] * o[1] - Jr[1] * o[0]) / s_sole)[None])  # z of (Jp + Jr x o)
+                    errs.append(np.array([(z1[g] - pb[2] - o[2]) / s_sole]))
+            dev = np.concatenate([q[adr] - q0[adr], [q[2] - q0[2]]])
+            rows.append(np.diag(1.0 / sigma))
+            errs.append(-dev / sigma)
+            for i in rolls:  # an ankle roll near its limit hands over to hip, knee and pelvis
+                qc = np.clip(q[adr[i]], lo[i] + comfort, hi[i] - comfort)
+                if abs(q[adr[i]] - qc) > 1e-9:
+                    r = np.zeros(nJ + 1)
+                    r[i] = 1.0 / s_comfort
+                    rows.append(r[None])
+                    errs.append(np.array([(qc - q[adr[i]]) / s_comfort]))
+            lb = np.minimum(np.concatenate([lo_b - q[adr], [-max_root_drop - dev[-1]]]), 0.0)
+            ub = np.maximum(np.concatenate([hi_b - q[adr], [max_root_rise - dev[-1]]]), 0.0)
+            A, free, dx = np.vstack(rows), ub > lb, np.zeros(nJ + 1)  # a column its bounds pin stays put
+            if free.any():
+                dx[free] = lsq_linear(A[:, free], np.concatenate(errs), bounds=(lb[free], ub[free]), method="bvls").x
+            dx = np.clip(dx, -0.1, 0.1)
+            qvel[:] = 0.0
+            qvel[V] = dx
+            mj.mj_integratePos(model, q, qvel, 1.0)
+            if np.abs(dx).max() < 1e-6:
+                break
+        at = (q[adr] <= lo_b + 1e-5) | (q[adr] >= hi_b - 1e-5)
+        limited[t] = [bool(at[i].any()) for i in of_foot]
+        delta[t] = np.concatenate([q[adr] - q0[adr], [q[2] - q0[2]]])
 
-    P1, R1 = fk.poses(dof)
+    delta = gaussian_filter1d(delta, 1.0, axis=0)
+    dof = m.dof_pos.copy()
+    dof[:, cols] = np.where(delta[:, :nJ] != 0.0, np.clip(m.dof_pos[:, cols] + delta[:, :nJ], lo, hi),
+                            m.dof_pos[:, cols])  # frames far from a stance stay exactly as they were
+    root = m.root_pos.copy()
+    root[:, 2] += delta[:, -1]
+    out = RobotMotion(name=m.name, joint_names=list(m.joint_names), root_pos=root,
+                      root_quat=m.root_quat.copy(), dof_pos=dof, fps=m.fps, source=m.source, meta=dict(m.meta))
+
+    P1, R1 = _FeetFK(out, robot).poses(dof)
     tilt1, pitch1 = angles(R1)
     low1 = P1[..., 2].min(-1)
-    ankle_cols = [fk.col[j] for _, _, joints in feet for j in joints[-2:]]
-    change = np.degrees(np.abs(dof[:, ankle_cols] - m.dof_pos[:, ankle_cols]))
+    change = np.degrees(np.abs(dof[:, cols] - m.dof_pos[:, cols]))
     lift = (low1 - low)[w > 0]
+    both = stance.all(1)
     sides = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, body).split("_")[0] for body, _, _ in feet]
 
     def dist(x: np.ndarray) -> dict | None:
@@ -1263,7 +1479,7 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
         "contact_cm": round(100 * contact, 2),
         "max_tilt_deg": max_tilt_deg,
         "blend_s": blend,
-        "frames_changed": int((change > 0.1).any(1).sum()),
+        "frames_changed": int(((change > 0.1).any(1) | (np.abs(delta[:, -1]) > 1e-3)).sum()),
         "stance_pct": {s: round(100 * float(stance[:, k].mean()), 1) for k, s in enumerate(sides)},
         # medians over the stance frames, + = toe up
         "stance_pitch_deg": {s: {"before": median(pitch[stance[:, k], k]), "after": median(pitch1[stance[:, k], k])}
@@ -1271,27 +1487,327 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
         "stance_tilt_deg": {"before": dist(tilt[stance]), "after": dist(tilt1[stance])},
         "too_tilted_frames": int((planted & ~stance).sum()),
         "joint_limit_frames": int(limited.any(1).sum()),
-        "ankle_change_deg": {"rmse": round(float(np.sqrt((change ** 2).mean())), 2), "max": round(float(change.max()), 2)},
+        "leg_change_deg": {"rmse": round(float(np.sqrt((change ** 2).mean())), 2), "max": round(float(change.max()), 2)},
+        # lowest sole point, after - before (the ankle-only pass lifted heels 0.5-1.9 cm)
         "sole_lift_cm": {"mean": round(100 * float(lift.mean()), 2) if len(lift) else 0.0,
                          "max": round(100 * float(lift.max()), 2) if len(lift) else 0.0},
+        "root_drop_cm": {"mean": round(-100 * float(delta[(w > 0).any(1), -1].mean()), 2) if (w > 0).any() else 0.0,
+                         "max": round(max(0.0, -100 * float(delta[:, -1].min())), 2)},
+        # both feet standing: height difference of their lowest sole points
+        "two_feet_height_diff_cm": {"before": dist(100 * np.abs(low[both, 0] - low[both, 1])) if F == 2 else None,
+                                    "after": dist(100 * np.abs(low1[both, 0] - low1[both, 1])) if F == 2 else None},
+    }
+    out.meta = {**m.meta, "foot_flat": info}
+    return out, info
+
+
+# Self-collision repair (separate_self_collisions): bodies whose visual mesh collides there too.
+# The G1 model's hands collide with nothing and its feet only through four 5 mm sole spheres,
+# so a hand inside a thigh or feet through each other went unseen.
+SELF_MESHES = {robot: ("left_rubber_hand", "right_rubber_hand", "left_ankle_roll_link", "right_ankle_roll_link")
+               for robot in ("unitree_g1", "unitree_g1_with_hands")}
+SELF_HANDS = {robot: names[:2] for robot, names in SELF_MESHES.items()}
+# The trunk and a shoulder link: their hulls overlap up to ~2.3 cm in ordinary poses, so an
+# upper arm in the torso counts only deeper than this.
+SELF_SHOULDER_DEPTH = 0.025
+
+
+class _SelfCollisionModel:
+    """GMR's robot model where every robot collision geom collides with every other, the hand and
+    foot meshes (SELF_MESHES) included (MuJoCo collides their convex hulls), posed at the frames
+    of a motion."""
+
+    def __init__(self, m: RobotMotion, robot: str):
+        import mujoco as mj
+
+        self.mj = mj
+        # compiled with those meshes colliding: MuJoCo builds the convex hull of a mesh only
+        # for geoms that collide when the model is compiled
+        spec = mj.MjSpec.from_file(str(_gmr().ROBOT_XML_DICT[robot]))
+        for name in SELF_MESHES.get(robot, ()):
+            body = spec.body(name)
+            for g in body.geoms if body is not None else ():
+                if g.type == mj.mjtGeom.mjGEOM_MESH:
+                    g.contype, g.conaffinity = 1, 1
+        self.model = model = spec.compile()
+        robot_geom = (model.geom_bodyid > 0) & ((model.geom_contype > 0) | (model.geom_conaffinity > 0))
+        model.geom_contype[:] = np.where(robot_geom, 1, 0)
+        model.geom_conaffinity[:] = np.where(robot_geom, 1, 0)
+        self.data = mj.MjData(model)
+        self.m = m
+        self.names = robot_joint_names(model)
+        self.col = {n: i for i, n in enumerate(m.joint_names)}
+        jid = {n: mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in self.names}
+        self.qadr = {n: model.jnt_qposadr[jid[n]] for n in self.names}
+        self.dadr = {n: model.jnt_dofadr[jid[n]] for n in self.names}
+        lo, hi = robot_joint_ranges(model)
+        self.rng = {n: (lo[i], hi[i]) for i, n in enumerate(self.names)}
+        self.body = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, b) for b in range(model.nbody)]
+        of_body = {}
+        for n in self.names:
+            of_body.setdefault(int(model.jnt_bodyid[jid[n]]), []).append(n)
+        self.ancestors, self.chain = [], []  # per body: bodies above it; hinge joints from it to the root
+        for b in range(model.nbody):
+            up, js, x = set(), set(), b
+            while x > 0:
+                js.update(of_body.get(x, ()))
+                x = int(model.body_parentid[x])
+                up.add(x)
+            self.ancestors.append(up)
+            self.chain.append(js)
+
+    def pose(self, dof_row: np.ndarray, t: int) -> None:
+        q = self.model.qpos0.copy()
+        q[:3], q[3:7] = self.m.root_pos[t], self.m.root_quat[t]
+        for n in self.names:
+            if n in self.col:
+                q[self.qadr[n]] = dof_row[self.col[n]]
+        self.data.qpos[:] = q
+        self.mj.mj_kinematics(self.model, self.data)
+
+    def contacts(self, depth: float) -> list:
+        """Robot-robot contacts deeper than ``depth`` at the posed frame, (body 1, body 2, point,
+        normal from 1 to 2, distance). Left out, as they touch by design: siblings, bodies of one
+        limb (a hand and its wrist), the trunk with a hip link, and the trunk with a shoulder link
+        unless deeper than SELF_SHOULDER_DEPTH. The trunk against a forearm, hand, knee or foot counts."""
+        model, data = self.model, self.data
+        self.mj.mj_collision(model, data)
+        out = []
+        for c in data.contact[:data.ncon]:
+            if c.dist > -depth:
+                continue
+            b1, b2 = int(model.geom_bodyid[c.geom1]), int(model.geom_bodyid[c.geom2])
+            if model.body_parentid[b1] == model.body_parentid[b2]:
+                continue
+            if b1 in self.ancestors[b2] or b2 in self.ancestors[b1]:
+                top, low = (b1, b2) if b1 in self.ancestors[b2] else (b2, b1)
+                if self.part(top) != "trunk":
+                    continue
+                if not any(k in self.body[low] for k in ("elbow", "wrist", "hand", "knee", "ankle")) and (
+                        "shoulder" not in self.body[low] or c.dist > -max(depth, SELF_SHOULDER_DEPTH)):
+                    continue
+            out.append((b1, b2, c.pos.copy(), c.frame[:3].copy(), float(c.dist)))
+        return out
+
+    def part(self, b: int) -> str:
+        n = self.body[b]
+        if any(k in n for k in ("shoulder", "elbow", "wrist", "hand")):
+            return "arm"
+        return "leg" if any(k in n for k in ("hip", "knee", "ankle")) else "trunk"
+
+
+def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: float = 0.015,
+                             arm_cap_deg: float = 25.0, leg_cap_deg: float = 10.0, smooth_s: float = 0.1,
+                             spread_s: float = 0.1, leg_fade_s: float = 0.2, rounds: int = 8,
+                             iters: int = 12) -> tuple[RobotMotion, dict]:
+    """Push apart robot parts that go through each other; returns the motion and a summary.
+
+    Every frame is checked with MuJoCo collision on the robot model where all collision
+    geoms collide (as retarget_quality measures self-collision), the hand and foot meshes too
+    (_SelfCollisionModel). For each contact deeper than ``target`` a damped least-squares step
+    moves the two bodies apart along the contact normal, with only the joints allowed for that pair:
+    - an arm (or hand) against anything: that arm's shoulder and elbow joints (both arms when
+      they touch each other); not the wrists, which 23-DoF consumers (GMT's G1) fix, so a
+      separation made with them would be undone there;
+    - leg against leg: hip roll and yaw (ankle roll too for the feet) of a leg whose foot is
+      not standing (slowest sole point slower than 0.3 m/s within 3 cm of the floor);
+    - nothing else moves: not the root, the waist, or a standing foot's leg.
+    Each joint stays within ``arm_cap_deg`` / ``leg_cap_deg`` of its own angle and its range.
+    The changes are spread over +-``spread_s`` (keeping the largest), smoothed over
+    ``smooth_s``, faded out over ``leg_fade_s`` towards a standing foot, then the clip is
+    checked again; frames still too deep get up to ``rounds`` rounds. Afterwards
+    - a moving foot never ends lower than it was or than 2 cm above the floor, whichever is
+      lower (swing clearance runs before this pass): that leg's change is scaled back there;
+    - frames the spreading left deeper than they were (fast, twisted motion) get their own
+      pose back, tapered, and are counted in ``frames_made_deeper``.
+    What stays deeper than the target is reported per pair, in frames (``unresolved_pairs``):
+    knees touching with both feet down, a thigh in the torso, a joint at its cap.
+    ``target`` 1.5 cm leaves the convex hulls touching a little (they are larger than the
+    links); 0 gives a reference physics replays with self-collision on can follow without the
+    limbs pushing on each other.
+
+    Why: hands and wrists went 1-4 cm (up to 7.5) into the hip housings in 80-90 % of
+    colliding frames, real overlaps of the link meshes; in physics with self-collision off (the
+    Isaac replay) the limbs pass through each other, with it on stiff PD tracking jams.
+    """
+    from scipy.ndimage import distance_transform_edt, gaussian_filter1d, maximum_filter1d, minimum_filter1d
+
+    from .analysis import SLIDE_SPEED, floor_track, slowest_sole_speed
+
+    T = m.num_frames
+    if T < 2:
+        return m, {}
+    t0 = time.perf_counter()
+    S = _SelfCollisionModel(m, robot)
+    mj = S.mj
+    legs = [joints for _, joints in SWING_LEGS.get(robot, [])]
+    sides = [joints[0].split("_")[0] for joints in legs]
+    standing = np.zeros((T, len(legs)), dtype=bool)
+    fk = _FeetFK(m, robot)
+    if fk.feet:
+        P = fk.poses(m.dof_pos)[0]
+        low, speed = P[..., 2].min(-1), slowest_sole_speed(P, m.fps)
+        floor = floor_track(low, speed, m.fps)
+        standing = (speed < SLIDE_SPEED) & (low - floor[:, None] < 0.03)
+        lowest_ok = np.minimum(low, floor[:, None] + 0.02)  # a moving foot ends no lower than this
+    nfade = max(1.0, leg_fade_s * m.fps + 1)
+    leg_w = np.stack([np.clip(distance_transform_edt(~standing[:, k]) / nfade, 0, 1) if standing[:, k].any()
+                      else np.ones(T) for k in range(len(legs))], 1)
+    leg_cols = [[S.col[j] for j in joints if j in S.col] for joints in legs]
+    cap = np.array([np.radians(leg_cap_deg if any(k in n for k in ("hip", "knee", "ankle")) else arm_cap_deg)
+                    for n in m.joint_names])
+    lo = np.array([S.rng.get(n, (-np.inf, np.inf))[0] for n in m.joint_names])
+    hi = np.array([S.rng.get(n, (-np.inf, np.inf))[1] for n in m.joint_names])
+    q0, dof = m.dof_pos, m.dof_pos.copy()
+    jacp1, jacp2, jacr = np.zeros((3, S.model.nv)), np.zeros((3, S.model.nv)), np.zeros((3, S.model.nv))
+    spread = int(round(spread_s * m.fps))
+    deep = -target - 5e-4  # deeper than the target (by more than the solver's 0.5 mm landing)
+
+    def allowed(b1: int, b2: int, free: list[str]) -> list[str]:
+        both, out = S.body[b1] + S.body[b2], []
+        for j in S.chain[b1] ^ S.chain[b2]:  # the joints that move one body against the other
+            if j not in S.col:
+                continue
+            if any(k in j for k in ("shoulder", "elbow")):
+                out.append(j)
+            elif S.part(b1) == S.part(b2) == "leg" and j.split("_")[0] in free and (
+                    "hip_roll" in j or "hip_yaw" in j or ("ankle_roll" in j and both.count("ankle") == 2)):
+                out.append(j)
+        return out
+
+    def deepest(d: np.ndarray) -> np.ndarray:
+        out = np.zeros(T)
+        for t in range(T):
+            S.pose(d[t], t)
+            out[t] = min((c[4] for c in S.contacts(0.0)), default=0.0)
+        return out
+
+    def sole_heights(d: np.ndarray, frames: np.ndarray) -> np.ndarray:
+        out = np.empty((len(frames), len(fk.feet)))
+        for i, t in enumerate(frames):
+            fk.set_pose(d[t], t)
+            mj.mj_kinematics(fk.model, fk.data)
+            for k, (_, soles, _) in enumerate(fk.feet):
+                out[i, k] = min(fk.data.geom_xpos[g][2] - fk.model.geom_size[g][0] for g in soles)
+        return out
+
+    worst = before = deepest(dof)
+    done = 0
+    for _ in range(rounds):
+        todo = np.flatnonzero(worst < deep)
+        if not len(todo):
+            break
+        done += 1
+        new = dof.copy()
+        for t in todo:
+            free = [s for k, s in enumerate(sides) if not standing[t, k]]
+            row = dof[t].copy()
+            for _ in range(iters):
+                S.pose(row, t)
+                cs = S.contacts(0.999 * target)
+                if not cs:
+                    break
+                mj.mj_comPos(S.model, S.data)
+                rows, used = [], set()
+                for b1, b2, p, n, dist in cs:
+                    js = allowed(b1, b2, free)
+                    if not js:
+                        continue
+                    mj.mj_jac(S.model, S.data, jacp1, jacr, p, b1)
+                    mj.mj_jac(S.model, S.data, jacp2, jacr, p, b2)
+                    rows.append((n @ (jacp2 - jacp1), -target - dist, set(js)))
+                    used.update(js)
+                if not rows:
+                    break
+                js = sorted(used)
+                A = np.array([[g[S.dadr[j]] if j in ok else 0.0 for j in js] for g, _, ok in rows])
+                e = np.array([x for _, x, _ in rows])
+                dq = np.clip(A.T @ np.linalg.solve(A @ A.T + 1e-3 * np.eye(len(e)), e), -0.05, 0.05)
+                for j, d in zip(js, dq):
+                    c = S.col[j]
+                    row[c] = np.clip(np.clip(row[c] + d, q0[t, c] - cap[c], q0[t, c] + cap[c]), *S.rng[j])
+            new[t] = row
+        delta = new - dof  # spread each change (keeping the largest) so smoothing leaves the peak
+        delta = (maximum_filter1d(np.maximum(delta, 0.0), 2 * spread + 1, axis=0)
+                 + minimum_filter1d(np.minimum(delta, 0.0), 2 * spread + 1, axis=0))
+        delta = gaussian_filter1d(delta, smooth_s * m.fps, axis=0)
+        for k, cols in enumerate(leg_cols):  # never a standing foot's leg, fading in and out around it
+            delta[:, cols] *= leg_w[:, k, None]
+        dof = np.clip(np.clip(dof + delta, q0 - cap, q0 + cap), lo, hi)
+        worst = deepest(dof)
+
+    # a moving foot may not end lower than lowest_ok: scale that leg's change back where it would
+    held = np.zeros(T, dtype=bool)
+    if done and fk.feet:
+        scale = np.ones((T, len(legs)))
+        for k, cols in enumerate(leg_cols):
+            bad = np.flatnonzero(sole_heights(dof, np.arange(T))[:, k] < lowest_ok[:, k] - 1e-3)
+            for s in (0.75, 0.5, 0.25, 0.0):
+                if not len(bad):
+                    break
+                trial = dof.copy()
+                trial[np.ix_(bad, cols)] = q0[np.ix_(bad, cols)] + s * (dof - q0)[np.ix_(bad, cols)]
+                scale[bad, k] = s
+                bad = bad[sole_heights(trial, bad)[:, k] < lowest_ok[bad, k] - 1e-3]
+            scale[:, k] = gaussian_filter1d(minimum_filter1d(scale[:, k], 7), 1.5)
+            held |= scale[:, k] < 1.0 - 1e-6
+            dof[:, cols] = q0[:, cols] + scale[:, k, None] * (dof - q0)[:, cols]
+        if held.any():
+            worst = deepest(dof)
+    # frames the spreading left deeper than they were get their own pose back (tapered)
+    for _ in range(3):
+        worse = (worst < deep) & (worst < np.minimum(before, -target) - 0.01)
+        if not worse.any():
+            break
+        keep = 1.0 - np.clip(2.0 * gaussian_filter1d(maximum_filter1d(worse.astype(float), 2 * spread + 1),
+                                                     smooth_s * m.fps), 0.0, 1.0)
+        dof = q0 + (dof - q0) * keep[:, None]
+        worst = deepest(dof)
+    unresolved: dict = {}  # pairs still deeper than the target, in frames
+    for t in np.flatnonzero(worst < deep):
+        S.pose(dof[t], t)
+        for key in {" / ".join(sorted((S.body[b1], S.body[b2]))) for b1, b2, *_ in S.contacts(-deep)}:
+            unresolved[key] = unresolved.get(key, 0) + 1
+
+    change = np.degrees(np.abs(dof - q0))
+    changed = (change > 0.1).any(1)
+    info = {
+        "target_cm": round(100 * target, 2),
+        "rounds": done,
+        "frames_changed": int(changed.sum()),
+        # frames with robot parts (hands and feet included) deeper in each other than the target / than 3 cm
+        "frames_deeper_than_target": {"before": int((before < deep).sum()), "after": int((worst < deep).sum())},
+        "frames_deeper_than_3cm": {"before": int((before < -0.03).sum()), "after": int((worst < -0.03).sum())},
+        "deepest_cm": {"before": round(max(0.0, -100 * float(before.min())), 2),
+                       "after": round(max(0.0, -100 * float(worst.min())), 2)},
+        "frames_made_deeper": int(((worst < before - 0.01) & (worst < deep)).sum()),
+        "frames_leg_held_by_floor": int(held.sum()),
+        "joint_change_deg": {"max": round(float(change.max()), 2),
+                             "rms_changed_frames": round(float(np.sqrt((change[changed] ** 2).mean())), 2)
+                             if changed.any() else 0.0},
+        "unresolved_pairs": dict(sorted(unresolved.items(), key=lambda kv: -kv[1])[:5]),
+        "seconds": round(time.perf_counter() - t0, 1),
     }
     out = RobotMotion(name=m.name, joint_names=list(m.joint_names), root_pos=m.root_pos.copy(),
                       root_quat=m.root_quat.copy(), dof_pos=dof, fps=m.fps, source=m.source,
-                      meta={**m.meta, "foot_flat": info})
+                      meta={**m.meta, "self_collision": info})
     return out, info
 
 
 def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: float | None = 30.0,
                   up_axis: str = "y", ref: str | int = "auto", smpl_model_dir: str | None = None,
                   velocity_limit: bool = False, smooth_hz: float = 0.0, swing_clearance: float = 0.0,
-                  foot_flat: bool = False, log=print) -> tuple[RobotMotion, dict]:
+                  foot_flat: bool = False, self_collision: bool = False, log=print) -> tuple[RobotMotion, dict]:
     """Retarget one human motion file. Returns the robot motion and a provenance dict.
 
     smooth_hz > 0 low-passes the result (:func:`smooth_motion`); 6 Hz is the tested
-    setting. foot_flat then turns the soles of feet standing still parallel to the floor
-    (:func:`flatten_stance_feet`), and swing_clearance > 0 (meters) lifts swing feet that
-    skim the floor (:func:`ensure_swing_clearance`). velocity_limit is GMR's own option; it
-    caps each IK iteration, not the per-frame change, and left the output unchanged on LAFAN1.
+    setting. foot_flat then stands feet that stand still flat on the floor with the legs and
+    pelvis height (:func:`flatten_stance_feet`), swing_clearance > 0 (meters) lifts swing feet that
+    skim the floor (:func:`ensure_swing_clearance`), and self_collision pushes apart robot parts
+    that go through each other, last (:func:`separate_self_collisions`). velocity_limit is GMR's own option: joint
+    speeds of 3 pi rad/s over each IK iteration's model timestep (2 ms), not over the frame, so
+    the IK falls behind fast motions (CMU 143_11: up to 34 deg, mean 1.1 deg off). It did nothing
+    until 2026-10-28: the vendored GMR passed its limits to mink in the wrong argument.
     """
     log = log or (lambda *_: None)
     fmt = detect_format(path) if fmt == "auto" else fmt
@@ -1342,6 +1858,13 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
             clearance["ik_position_residual_before"] = resid
             resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1),
                                        track)
+    separation = None
+    if self_collision:  # last: it keeps standing legs still and moving feet off the floor, which a later pass could undo
+        motion, separation = separate_self_collisions(motion, robot)
+        if separation:
+            separation["ik_position_residual_before"] = resid
+            resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1),
+                                       track)
     info = {
         "source": os.path.abspath(path),
         "source_format": fmt,
@@ -1356,6 +1879,7 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
         "smoothing": smoothing,
         "foot_flat": flat,
         "swing_clearance": clearance,
+        "self_collision": separation,
         "ik_seconds": round(elapsed, 1),
         "root_quat": "wxyz",
     }

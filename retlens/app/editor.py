@@ -2009,6 +2009,8 @@ class EditorWindow(QMainWindow):
         self.a_swing = act(f"스윙 발 보정 ({self._swing_cm:g} cm)",
                            lambda on: self.set_retarget(swing_clearance_cm=self._swing_cm if on else 0.0),
                            checkable=True, tip=f"{RETARGET_TIPS['swing']}. {RETARGET_NOTE}")
+        self.a_self_collision = act("자기 관통 보정", lambda on: self.set_retarget(self_collision=on), checkable=True,
+                                    tip=f"{RETARGET_TIPS['self_collision']}. {RETARGET_NOTE}")
         self._sync_retarget()
 
         mb = self.menuBar()
@@ -2033,6 +2035,7 @@ class EditorWindow(QMainWindow):
         m.setToolTipsVisible(True)
         m.addAction(self.a_foot_flat)
         m.addAction(self.a_swing)
+        m.addAction(self.a_self_collision)
         m = mb.addMenu("물리(&S)")
         m.addAction(self.a_physics)
         # 균형 제어: what keeps the simulated robot up. A mode whose files are not here yet (GMT before the
@@ -2394,7 +2397,8 @@ class EditorWindow(QMainWindow):
         """리타게팅 menu: the scene's settings for the human motions opened next."""
         r = self.scene.set_retarget(**kw)
         on = [name for name, yes in (("디딤발 평평", r["foot_flat"]),
-                                     (f"스윙 발 {r['swing_clearance_cm']:g} cm", r["swing_clearance_cm"] > 0)) if yes]
+                                     (f"스윙 발 {r['swing_clearance_cm']:g} cm", r["swing_clearance_cm"] > 0),
+                                     ("자기 관통", r["self_collision"])) if yes]
         self.status(f"리타게팅 보정: {', '.join(on) or '끔'}. {RETARGET_NOTE}", 10000)
 
     def _sync_retarget(self) -> None:
@@ -2403,7 +2407,8 @@ class EditorWindow(QMainWindow):
         if o.swing_clearance_cm > 0 and o.swing_clearance_cm != self._swing_cm:
             self._swing_cm = o.swing_clearance_cm
             self.a_swing.setText(f"스윙 발 보정 ({self._swing_cm:g} cm)")
-        for a, on in ((self.a_foot_flat, o.foot_flat), (self.a_swing, o.swing_clearance_cm > 0)):
+        for a, on in ((self.a_foot_flat, o.foot_flat), (self.a_swing, o.swing_clearance_cm > 0),
+                      (self.a_self_collision, o.self_collision)):
             if a.isChecked() != on:
                 a.blockSignals(True)
                 a.setChecked(on)

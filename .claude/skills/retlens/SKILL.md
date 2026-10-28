@@ -27,11 +27,11 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 |---|---|---|
 | `info` | 버전, 파일 위치, 환경 점검 | `locations`, `checks[]`(key, ok, needed_for, hint), `isaac_eula_accepted` |
 | `library [--query Q] [--limit N]` | 모션 폴더의 파일 목록. Q는 파일 이름과 CMU 동작 설명에서 찾음(예: `143_11`, `walk`, `dance`) | `files[]`(path, folder, name, cmu_description) |
-| `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, metrics, retarget_quality, c3d) |
+| `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, foot_reference, self_collision, metrics, retarget_quality, c3d) |
 | `metrics FILE... [--ref N]` | 창의 "분석" 표와 같은 표. 기준(ref, 기본은 첫 파일) 대비 RMSE 포함 | `rows`, `motions[].values`, `row_help` |
 | `compare A B [--tol 3] [--no-heading] [--align]` | 겹쳐 비교: B를 A의 골반에 맞춰 부위별 차이(cm) | `regions[]`(region, mean_cm, max_cm, max_at_s, beyond_tol_pct), `worst_moments[]` |
 | `align REF FILE...` | 기준에 시간 자동 정렬(다리 관절각이 가장 잘 맞는 오프셋) | `offsets_s`, `notes` |
-| `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장 | `out`, `frames`, `fps`, `kind` |
+| `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM] [--self-collision]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장 | `out`, `frames`, `fps`, `kind` |
 | `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이) | 마커 수, `missing_pct`, `most_missing`, `longest_gap_s`, `spike_frames` |
 | `physics FILE [--assist 1]` | Isaac PhysX 물리 검사(짧은 클립 약 1분) | `physics.metrics`(phys_falls, phys_harness_pct, phys_saturated_pct, phys_ok), `physics.falls[]` |
 | `video FILE [--out X.mp4] [--physics]` | Isaac으로 녹화 | `video` 경로 |
@@ -48,7 +48,8 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
   - `--smooth HZ`: 평활화(기본 6, 0 = 끔).
   - `--foot-flat`: 디딤발 평평 보정.
   - `--swing-clearance CM`: 스윙 발 보정(권장 2).
-  - 설정마다 캐시가 따로 있어서 보정 전후를 각각 열 수 있습니다. 어떤 설정으로 만들었는지는 `retarget`(smooth_hz, foot_flat, swing_clearance_cm)에 나옵니다. 디딤발 평평 보정이 바꾼 내용은 `foot_flat`(바뀐 프레임 수, 디딤 중 발 pitch 전→후, 뒤꿈치가 뜬 높이)에 있습니다.
+  - `--self-collision`: 자기 관통 보정. 바꾼 내용은 `self_collision`(바뀐 프레임 수, 3 cm 넘게 파고든 프레임 전→후, 가장 깊은 곳 전→후, 남은 부위 쌍과 그 프레임 수 `unresolved_pairs`)에 있습니다.
+  - 설정마다 캐시가 따로 있어서 보정 전후를 각각 열 수 있습니다. 어떤 설정으로 만들었는지는 `retarget`(smooth_hz, foot_flat, swing_clearance_cm, self_collision)에 나옵니다. 디딤발 평평 보정이 바꾼 내용은 `foot_flat`(바뀐 프레임 수, 디딤 중 발 pitch·기울기 전→후, 골반을 낮춘 높이 `root_drop_cm`, 두 발 높이차 `two_feet_height_diff_cm`)에 있습니다.
 - **C3D:** 마커만으로는 로봇을 움직일 수 없습니다. 같은 이름의 솔버 결과(BVH → FBX → AMASS 순)를 찾아 그것을 리타게팅하고, 마커를 옆에 그립니다. 없으면 오류가 납니다.
 
 ## 3. 로컬 HTTP API (떠 있는 RetLens 창)
@@ -73,7 +74,7 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 | `GET /api/checks` | 환경 점검 |
 | `GET /api/library?query=walk` | 모션 파일 목록 |
 | `POST /api/open {"paths": [...]}` | 열기(창에 나타나고 선택됨) |
-| `POST /api/retarget {"foot_flat"?, "swing_clearance_cm"?}` | 리타게팅 보정(창의 "리타게팅" 메뉴). 다음에 여는 사람 모션부터 적용되고, 이미 연 모션은 그대로입니다. 지금 설정은 `/api/status`의 `retarget` |
+| `POST /api/retarget {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 리타게팅 보정(창의 "리타게팅" 메뉴). 다음에 여는 사람 모션부터 적용되고, 이미 연 모션은 그대로입니다. 지금 설정은 `/api/status`의 `retarget` |
 | `POST /api/remove {"id"}` | 닫기 |
 | `GET /api/motion?id=...` | 모션 하나의 QC·지표·C3D·물리 |
 | `POST /api/item {"id", "visible"?, "offset_s"?, "show_human"?}` | 보이기, 시간 오프셋, 사람 스켈레톤 |
@@ -106,11 +107,13 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
   - 이 네 지표와 발·균형 지표로 `retarget_score`(0–100)를 냅니다. `inspect`·`/api/motion`의 `retarget_quality`에 부위별 각도, 한계에 붙은 관절, 충돌 부위, 감점 내역이 있습니다.
   - 로봇 모션 파일(npz·csv)만 열면 비교할 사람 모션이 없어서 계산하지 않습니다.
   - **로봇끼리 비교 (저장소 실행에서만, 설치판에는 없음):** `python tools\retarget_benchmark.py --robot A --robot B <클립 폴더>`가 같은 클립을 로봇마다 리타게팅해 `reports\retarget_quality\summary.md`에 로봇별 평균 점수·등급 수·지표 중앙값을 씁니다. 리타게팅 설정(`--foot-flat` 등)을 바꿔 돌리면 설정끼리도 비교할 수 있습니다.
-- **리타게팅 보정:** 리타게팅 뒤 발을 고치는 후처리 두 가지입니다. 둘 다 기본은 끔입니다.
-  - **디딤발 평평**(`foot_flat`): 서 있는 발의 발바닥을 바닥과 평평하게 맞춥니다. 발목 pitch·roll만 바꾸고, 움직이는 발은 그대로 둡니다.
-    - CMU 143번처럼 발끝이 들린 채 뒤꿈치로만 서는 리타겟을 고칠 때 씁니다. 이런 클립은 정적 불균형이 22–39%였고, 보정 후 0–8%가 됐습니다.
-    - 뒤꿈치가 0.5–2 cm 뜨므로, 발을 끄는 느린 동작은 스윙 발 바닥 근접이 오를 수 있습니다.
+- **리타게팅 보정:** 리타게팅 뒤에 거는 후처리 세 가지입니다. 모두 기본은 끔입니다.
+  - **디딤발 평평**(`foot_flat`): 서 있는 발의 발바닥을 바닥에 평평하게 붙입니다. 두 다리 관절과 골반 높이로 맞추고, 움직이는 발과 팔·허리는 그대로 둡니다.
+    - CMU 143번처럼 디딤발이 바닥에 평평하지 않아 정적 불균형이 높은 리타겟을 고칠 때 씁니다(143번 BVH·FBX·SMPL-X 0%).
+    - 뒤꿈치는 뜨지 않고, 한쪽 발이 떠 있으면 바닥으로 내립니다. 그만큼 골반이 1–3 cm 내려갈 수 있습니다(`foot_flat.root_drop_cm`).
+  - 보정과 별개로, T-pose 기준 형식(BVH·FBX·SMPL-X)은 로봇 발이 평평한 기준을 클립에서 사람이 딛고 선 자세로 정합니다(`foot_reference`). 기준 자세의 발 기울기 때문에 생기던 발끝 들림은 대부분 여기서 사라집니다.
   - **스윙 발**(`swing_clearance_cm`): 바닥을 스치는 스윙 발을 띄웁니다.
+  - **자기 관통**(`self_collision`): 서로 파고든 로봇 부위를 떼어 놓습니다(손 포함). 팔은 어깨·팔꿈치, 다리는 서 있지 않은 다리의 고관절만 움직이고, 골반·허리·디딤 다리는 그대로입니다. 두 발로 선 채 무릎끼리 닿는 경우는 남고 `self_collision.unresolved_pairs`에 나옵니다.
 - **환경:** Isaac Sim, Blender, SMPL-X 모델은 사용자가 설치하고 "환경 설정"에서 지정합니다. 없으면 그 기능만 안 됩니다(`info`의 `checks`가 무엇이 없는지, 어떻게 고치는지 알려 줌).
 
 ## 5. 지표 읽는 법
@@ -124,7 +127,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | `pose_err_deg` | 자세 재현 오차 (°) | 허벅지·정강이·위팔·아래팔(좌우)과 몸통(골반 → 양 어깨 가운데)이 사람과 다른 방향을 가리키는 각도 평균 | 로봇 크기·비율과 무관. 8° 이하 좋음, 25° 이상 나쁨. 부위별 값은 `retarget_quality.segments_deg` |
 | `contact_mismatch_pct` | 발 접촉 불일치 (%) | 사람과 로봇 중 한쪽 발만 바닥에 닿은 프레임(발마다) | `contact_lost_pct`(사람은 딛는데 로봇 발은 뜸)·`contact_extra_pct`(로봇 발만 붙어 있음)로 나뉨 |
 | `joint_limit_pct` | 관절 한계 걸림 (%) | 어느 관절이든 가동 범위 끝(1° 안)에 붙은 프레임 | 로봇 관절이 동작을 따라갈 만큼 못 돎. 어떤 관절인지는 `retarget_quality.pinned_joints_pct` |
-| `self_collision_pct` | 자기 충돌 (%) | 로봇 몸끼리 3 cm 넘게 파고든 프레임(충돌 형상 기준) | 대개 손이 엉덩이·몸통·다른 손을 뚫음. 부위는 `retarget_quality.collision_pairs_pct` |
+| `self_collision_pct` | 자기 충돌 (%) | 로봇 몸끼리 3 cm 넘게 파고든 프레임(충돌 형상 기준) | 대개 손이 엉덩이·몸통·다른 손을 뚫음. 부위는 `retarget_quality.collision_pairs_pct`. `--self-collision`으로 다시 봄 |
 | `acc_mean` | 관절 가속도 (rad/s²) | 관절 각가속도 크기 평균 | 같은 동작끼리 비교. 클수록 떨림 |
 | `jerk_mean` | 관절 저크 (rad/s³) | 각가속도 변화율 평균 | 떨림에 가장 민감 |
 | `vel_max` | 최대 관절속도 (rad/s) | 가장 빠른 관절 속도 | 모터 한계(대략 20–30 rad/s) 근처면 의심 |
@@ -134,7 +137,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | `swing_low_pct` | 스윙 발 바닥 근접 (%) | 움직이는 발이 바닥 1 cm 안을 지나는 비율 | 높으면 물리에서 발끝이 걸려 넘어지기 쉬움 |
 | `com_out_pct` | CoM 지지 밖 (%) | CoM 투영이 지지다각형 밖인 비율 | 걷기에선 정상 동작도 높음 |
 | `zmp_out_pct` | ZMP 지지 밖 (%) | ZMP가 지지다각형 밖인 비율 | |
-| `static_unbalanced_pct` | 정적 불균형 (%) | 거의 멈춘 채 CoM이 발 밖 2 cm 넘게 0.2 s 이상 | 5% 넘으면 QC WARN, 로봇이 설 수 없는 자세. 뒤꿈치로만 서는 리타겟이면 `--foot-flat`으로 다시 봄 |
+| `static_unbalanced_pct` | 정적 불균형 (%) | 거의 멈춘 채 CoM이 발 밖 2 cm 넘게 0.2 s 이상 | 5% 넘으면 QC WARN, 로봇이 설 수 없는 자세. 디딤발이 평평하지 않은 리타겟이면 `--foot-flat`으로 다시 봄 |
 | (표만) | 기준 대비 다리 / 전체 RMSE (°) | 기준과 겹치는 구간의 관절별 RMSE 중앙값 | 같은 촬영의 다른 소스끼리 몇 도 이내면 일치 |
 | `phys_harness_pct` | 물리: 보조 힘 (체중 %) | 골반 보조 힘 평균(MuJoCo는 0) | 클수록 로봇 혼자 균형 잡기 어려움 |
 | `phys_falls` | 물리: 넘어짐 | 넘어진 횟수 | 0이 목표. `physics.falls[]`에 시각과 1차 원인(MuJoCo는 넘어짐 판정 기준) |
@@ -152,10 +155,10 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
    - 창이 떠 있으면 `/api/open` → `/api/align` → `/api/compare` → `/api/playback {"time_s": <worst>}` → `/api/screenshot`으로 그 순간을 보여 줍니다.
 3. **로봇이 실제로 할 수 있는 동작인지:** `physics FILE`(라이선스 동의 필요, 약 1분) → `phys_ok`, `falls[].cause`(예: 발끝 걸림)를 보고, 원인이 스윙 발이면 `retarget --swing-clearance 2.5`로 다시 만들어 비교합니다.
 4. **서 있는데 균형이 안 맞는 클립(`static_unbalanced_pct`가 높음):**
-   - `inspect FILE`과 `inspect FILE --foot-flat`을 비교합니다. 보정으로 정적 불균형이 내려가고 `foot_flat.stance_pitch_deg`가 크게(예: +10° → 0°) 바뀌면, 원인은 뒤꿈치로만 서던 리타겟입니다. 뒤꿈치가 뜬 높이(`foot_flat.sole_lift_cm`)와 `swing_low_pct` 변화도 함께 보고합니다.
+   - `inspect FILE`과 `inspect FILE --foot-flat`을 비교합니다. 보정으로 정적 불균형이 내려가면, 원인은 디딤발이 바닥에 평평하게 붙지 않던 리타겟입니다. `foot_flat.stance_tilt_deg`(디딤발 기울기 전→후)와 두 발 높이차(`foot_flat.two_feet_height_diff_cm`)로 확인합니다. 기준 자세가 이미 발 pitch를 맞추므로 `stance_pitch_deg`는 크게 바뀌지 않을 수 있습니다. 골반을 낮춘 높이(`foot_flat.root_drop_cm`)와 `swing_low_pct` 변화도 함께 보고합니다.
    - 창이 떠 있으면 `/api/open`(보정 전) → `/api/retarget {"foot_flat": true}` → 같은 파일을 `/api/open`하면 전후가 나란히 보입니다. 끝나면 `/api/retarget {"foot_flat": false}`로 되돌립니다.
 5. **C3D 원본 품질:** `c3d-qc` → 빠짐·공백·튐이 큰 마커를 보고합니다. `inspect file.c3d`면 솔버 스켈레톤과의 정렬 잔차(`c3d.residual_cm`)도 나옵니다.
-6. **결과 파일 만들기:** `retarget FILE --out out.npz`. 권장 설정은 `--swing-clearance 2`이고, 뒤꿈치로만 서는 클립이면 `--foot-flat`도 붙입니다. 그다음 `inspect out.npz`로 확인합니다.
+6. **결과 파일 만들기:** `retarget FILE --out out.npz`. 권장 설정은 `--swing-clearance 2`이고, 정적 불균형이 높고 `--foot-flat`으로 내려가는 클립이면 `--foot-flat`도 붙입니다. 그다음 `inspect out.npz`로 확인합니다.
 
 ## 7. 지킬 것
 

@@ -98,6 +98,7 @@ def test_video_jobs_share_the_queue(tmp_path, fake):
     kin = runner.request_video(m, str(tmp_path / "videos" / "walk_kin.mp4"), human=str(human))
     sim = runner.request_video(m, str(tmp_path / "videos" / "walk_phys.mp4"), human=str(human), physics=True, assist=0.0)
     assert kin.key != sim.key and kin.kind == "video"
+    assert kin.key == runner.video_key(m, str(human)) and sim.key == runner.video_key(m, str(human), True, 0.0)
     for job in (phys, kin, sim):
         _wait(job)
     assert phys.state == kin.state == sim.state == "done"

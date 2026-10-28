@@ -103,6 +103,9 @@ def test_http_api(tmp_path, monkeypatch):
         assert _call(f"{u}/api/status", t)[1]["retarget"]["foot_flat"] is True
         assert _call(f"{u}/api/retarget", t, {"swing_clearance_cm": 50})[0] == 400
         assert _call(f"{u}/api/retarget", t, {"foot_flat": False})[1]["retarget"]["foot_flat"] is False
+        out = _call(f"{u}/api/retarget", t, {"self_collision": True})[1]["retarget"]
+        assert out["self_collision"] is True and out["foot_flat"] is False
+        assert _call(f"{u}/api/retarget", t, {"self_collision": False})[1]["retarget"]["self_collision"] is False
         code, out = _call(f"{u}/api/open", t, {"paths": [SAMPLE, SAMPLE]})
         assert code == 200 and len(out["opened"]) == 2
         assert out["opened"][0]["retarget"] is None  # a robot motion: loaded as it is

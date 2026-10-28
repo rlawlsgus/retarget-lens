@@ -5,7 +5,7 @@
     GET  /api/checks                    환경 점검
     GET  /api/library?query=walk        motion files in the motion folders
     POST /api/open      {"paths": [..]}                      load (retarget when needed), shown in the window
-    POST /api/retarget  {"foot_flat"?, "swing_clearance_cm"?}   리타게팅 보정 for the human motions opened
+    POST /api/retarget  {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}   리타게팅 보정 for the human motions opened
                                                              next (open ones keep theirs: reopen to compare)
     POST /api/remove    {"id": ..}
     GET  /api/motion?id=..              one motion: QC, metrics, C3D QC, physics state
@@ -134,7 +134,8 @@ class ApiBackend:
         try:
             swing = None if q.get("swing_clearance_cm") is None else float(q["swing_clearance_cm"])
             r = self.scene.set_retarget(foot_flat=None if "foot_flat" not in q else bool(q["foot_flat"]),
-                                        swing_clearance_cm=swing)
+                                        swing_clearance_cm=swing,
+                                        self_collision=None if "self_collision" not in q else bool(q["self_collision"]))
         except (TypeError, ValueError) as e:
             raise ApiError(str(e)) from None
         return {"retarget": r, "note": "applies to the human motions opened next; open ones keep theirs"}

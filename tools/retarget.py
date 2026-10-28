@@ -85,12 +85,15 @@ def main() -> int:
     ap.add_argument("--smooth", type=float, default=0.0, metavar="HZ",
                     help="zero-phase low-pass of the result at HZ (recommended 6; default off)")
     ap.add_argument("--foot-flat", action="store_true",
-                    help="turn the soles of feet standing still parallel to the floor (ankle pitch / roll only), "
+                    help="stand feet that stand still flat on the floor (both legs and the pelvis height), "
                          "after smoothing; for retargets that stand on their heels (CMU subject 143). Default off")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
                     help="lift swing feet to at least CM above the floor, after smoothing (recommended 2; default off)")
+    ap.add_argument("--self-collision", action="store_true",
+                    help="push apart robot parts that go through each other (hands into the hips), last. Default off")
     ap.add_argument("--velocity-limit", action="store_true",
-                    help="GMR's IK velocity limit (caps each IK iteration; no effect on LAFAN1 tests)")
+                    help="GMR's IK velocity limit (3 pi rad/s per 2 ms IK iteration: lags fast motions, "
+                         "CMU 143_11 up to 34 deg off; default off)")
     ap.add_argument("--pkl", action="store_true", help="also write GMR's pkl (root_rot xyzw)")
     ap.add_argument("--overwrite", action="store_true", help="redo clips whose npz already exists")
     args = ap.parse_args()
@@ -112,7 +115,8 @@ def main() -> int:
             motion, info = retarget_file(path, robot=args.robot, fmt=args.format, fps=args.fps or None,
                                          up_axis=args.up_axis, ref=ref, smpl_model_dir=args.smpl_model_dir,
                                          velocity_limit=args.velocity_limit, smooth_hz=args.smooth,
-                                         swing_clearance=args.swing_clearance / 100.0, foot_flat=args.foot_flat)
+                                         swing_clearance=args.swing_clearance / 100.0, foot_flat=args.foot_flat,
+                                         self_collision=args.self_collision)
         except Exception as e:  # keep going over a folder; report at the end
             failed += 1
             print(f"[FAIL] {path}: {type(e).__name__}: {e}")
@@ -132,11 +136,15 @@ def main() -> int:
             pitch = " / ".join(f"{s} {p['before']} -> {p['after']}" for s, p in ff["stance_pitch_deg"].items()
                                if p["before"] is not None)
             smooth += (f", stance soles flattened in {ff['frames_changed']} frames"
-                       + (f" (pitch {pitch} deg, heel lift max {ff['sole_lift_cm']['max']} cm)" if pitch else ""))
+                       + (f" (pitch {pitch} deg, pelvis lowered max {ff['root_drop_cm']['max']} cm)" if pitch else ""))
         if info.get("swing_clearance"):
             sc = info["swing_clearance"]
             smooth += (f", moving feet lifted in {sc['frames_changed']} frames (shortfall max {sc['shortfall_cm']['max']}"
                        f" cm, leg joints {sc['leg_joint_change_deg']['rmse']} deg rms)")
+        if info.get("self_collision"):
+            sp = info["self_collision"]
+            smooth += (f", self-collisions pushed apart in {sp['frames_changed']} frames (deeper than 3 cm "
+                       f"{sp['frames_deeper_than_3cm']['before']} -> {sp['frames_deeper_than_3cm']['after']} frames)")
         print(f"[ok]   {base}.npz  {motion.num_frames} frames @ {motion.fps:g} fps, {info['ik_seconds']}s IK{smooth}, "
               f"residual feet {r.get('feet', {}).get('mean_cm', '-')} cm / hands {r.get('hands', {}).get('mean_cm', '-')} cm")
     print(f"done: {len(files) - failed} ok, {failed} failed")

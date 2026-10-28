@@ -28,7 +28,8 @@ data/cache/physics/; Isaac Sim's EULA must be accepted: --isaac-accept-eula), or
 with no controller / the GMT tracking policy (retlens/policy_runner.py, cache
 data/cache/policy/). Missing results are computed in the background, one clip at a time.
 
-리타게팅 보정 (motion tab, or --foot-flat / --swing-clearance): 디딤발 평평 보정 and 스윙 발 보정
+리타게팅 보정 (motion tab, or --foot-flat / --swing-clearance / --self-collision): 디딤발 평평 보정,
+스윙 발 보정 and 자기 관통 보정
 for the human motions added next; motions already shown keep theirs, so adding the same file
 again shows before and after side by side.
 """
@@ -170,6 +171,9 @@ class Viewer:
                 self.swing = gui.add_checkbox(f"스윙 발 보정 ({self._swing_cm:g} cm)", sc.opts.swing_clearance_cm > 0,
                                               hint=f"{RETARGET_TIPS['swing']}. {RETARGET_NOTE}")
                 self.swing.on_update(lambda _: self._on_retarget())
+                self.self_collision = gui.add_checkbox("자기 관통 보정", sc.opts.self_collision,
+                                                       hint=f"{RETARGET_TIPS['self_collision']}. {RETARGET_NOTE}")
+                self.self_collision.on_update(lambda _: self._on_retarget())
             self.status = gui.add_markdown("")
             self.motion_folder = gui.add_folder("목록")
         self._library: dict[str, list[str]] = {}
@@ -318,7 +322,7 @@ class Viewer:
         rows = dict(self.scene.item_facts(item))
         lines = [f"<span style='color:{hexcolor(item.color)}'>■</span> **{item.kind}**",
                  f"{rows['길이']} · QC **{rows['QC']}**"]
-        for k in ("IK 잔차(평균)", "디딤발 평평", "물리 결과", "참고"):
+        for k in ("IK 잔차(평균)", "디딤발 평평", "자기 관통 보정", "물리 결과", "참고"):
             if k in rows:
                 lines.append(f"{k}: {rows[k]}")
         lines.append(f"`{rows['파일']}`")
@@ -354,9 +358,11 @@ class Viewer:
         if getattr(self, "_syncing", False):
             return
         r = self.scene.set_retarget(foot_flat=bool(self.foot_flat.value),
-                                    swing_clearance_cm=self._swing_cm if self.swing.value else 0.0)
+                                    swing_clearance_cm=self._swing_cm if self.swing.value else 0.0,
+                                    self_collision=bool(self.self_collision.value))
         on = [name for name, yes in (("디딤발 평평", r["foot_flat"]),
-                                     (f"스윙 발 {r['swing_clearance_cm']:g} cm", r["swing_clearance_cm"] > 0)) if yes]
+                                     (f"스윙 발 {r['swing_clearance_cm']:g} cm", r["swing_clearance_cm"] > 0),
+                                     ("자기 관통", r["self_collision"])) if yes]
         self.status.content = f"리타게팅 보정: **{', '.join(on) or '끔'}**. {RETARGET_NOTE}"
 
     def _sync_retarget(self) -> None:
@@ -367,7 +373,8 @@ class Viewer:
             self.swing.label = f"스윙 발 보정 ({self._swing_cm:g} cm)"
         self._syncing = True
         try:
-            for box, on in ((self.foot_flat, o.foot_flat), (self.swing, o.swing_clearance_cm > 0)):
+            for box, on in ((self.foot_flat, o.foot_flat), (self.swing, o.swing_clearance_cm > 0),
+                            (self.self_collision, o.self_collision)):
                 if bool(box.value) != on:
                     box.value = on
         finally:

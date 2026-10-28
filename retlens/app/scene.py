@@ -45,10 +45,12 @@ BALANCE_TAG = {"pd": "MuJoCo 제어 없음", "gmt": "GMT"}  # in the robots' lab
 SWING_CLEARANCE_CM = 2.0  # the recommended swing clearance
 RETARGET_NOTE = "다음에 여는 사람 모션부터 적용됩니다. 이미 연 모션은 그대로라, 같은 파일을 다시 열면 보정 전후를 나란히 봅니다"
 RETARGET_TIPS = {
-    "foot_flat": "서 있는 발의 발바닥을 바닥과 평평하게 맞춥니다(발목 pitch·roll만, 움직이는 발은 그대로). CMU 143번처럼 "
-                 "발끝이 들린 채 뒤꿈치로만 서는 리타겟용이고, 뒤꿈치가 0.5–2 cm 뜰 수 있습니다",
+    "foot_flat": "서 있는 발의 발바닥을 바닥에 평평하게 붙입니다. 두 다리와 골반 높이로 맞추고(골반이 1–3 cm 내려갈 수 있음), "
+                 "움직이는 발과 팔·허리는 그대로입니다. CMU 143번처럼 발끝이 들린 채 뒤꿈치로만 서는 리타겟용입니다",
     "swing": f"바닥을 스치는 스윙 발을 바닥에서 {SWING_CLEARANCE_CM:g} cm 이상 띄웁니다(권장 설정). 물리에서 발끝이 걸려 "
              "넘어지는 것을 줄입니다",
+    "self_collision": "서로 파고든 로봇 부위를 떼어 놓습니다. 손·팔이 엉덩이나 몸통에 들어가면 그 팔의 어깨·팔꿈치를, "
+                      "다리끼리 닿으면 서 있지 않은 다리의 고관절을 조금 움직입니다(골반·허리·디딤 다리는 그대로)",
 }
 FALL_RULE_KO = {"tilt": "기울어짐", "low": "골반 낮음", "drop": "원본보다 낮음"}  # policy_replay's fall rules
 PALETTE = [(230, 90, 50), (50, 125, 215), (60, 165, 90), (150, 90, 190), (215, 165, 40), (110, 110, 110),
@@ -216,6 +218,7 @@ class SceneOptions:
     smooth: float = 6.0
     foot_flat: bool = False
     swing_clearance_cm: float = 0.0
+    self_collision: bool = False
     fps: float = 30.0
     csv_fps: float = 30.0
     smpl_model_dir: str | None = None
@@ -234,10 +237,12 @@ def add_scene_arguments(ap) -> None:
     ap.add_argument("--urdf", default=DEFAULT_URDF, help="robot URDF for display")
     ap.add_argument("--smooth", type=float, default=6.0, help="smoothing for retargeted inputs (Hz, 0 = off)")
     ap.add_argument("--foot-flat", action="store_true",
-                    help="retargeted inputs: turn the soles of feet standing still parallel to the floor "
-                         "(for retargets that stand on their heels, CMU subject 143)")
+                    help="retargeted inputs: stand feet that stand still flat on the floor with the legs and "
+                         "pelvis height (for retargets that stand on their heels, CMU subject 143)")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
                     help="lift swing feet of retargeted inputs to at least CM off the floor (0 = off; 2 recommended)")
+    ap.add_argument("--self-collision", action="store_true",
+                    help="retargeted inputs: push apart robot parts that go through each other (hands into hips)")
     ap.add_argument("--fps", type=float, default=30.0, help="retarget output frame rate")
     ap.add_argument("--csv-fps", type=float, default=30.0, help="frame rate of Unitree csv files")
     ap.add_argument("--smpl-model-dir", default=None,
@@ -265,7 +270,8 @@ def scene_options(args) -> SceneOptions:
     s = settings.load()
     smpl = args.smpl_model_dir or settings.find_smpl(s).path or paths.smpl_model_dir()
     return SceneOptions(robot=args.robot, urdf=args.urdf, smooth=args.smooth, foot_flat=getattr(args, "foot_flat", False),
-                        swing_clearance_cm=args.swing_clearance, fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
+                        swing_clearance_cm=args.swing_clearance, self_collision=getattr(args, "self_collision", False),
+                        fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
                         physics_config=args.physics_config, isaac_accept_eula=args.isaac_accept_eula,
                         video_dir=args.video_dir or settings.video_dir(s), library=args.library,
                         balance=getattr(args, "balance", "isaac"))
@@ -379,7 +385,7 @@ class MotionScene:
         o = self.opts
         item = load_item(path, robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps,
                          smpl_model_dir=o.smpl_model_dir, swing_clearance=o.swing_clearance_cm / 100.0,
-                         foot_flat=o.foot_flat, log=self.log)
+                         foot_flat=o.foot_flat, self_collision=o.self_collision, log=self.log)
         compute_metrics(item, self.fk, self.limits)
         with self.lock:
             used = {it.color for it in self.items}
@@ -639,21 +645,26 @@ class MotionScene:
     def retarget_settings(self) -> dict:
         """How human motions opened from now on are retargeted (each motion keeps its own, Item.retarget)."""
         o = self.opts
-        return {"smooth_hz": o.smooth, "foot_flat": o.foot_flat, "swing_clearance_cm": o.swing_clearance_cm}
+        return {"smooth_hz": o.smooth, "foot_flat": o.foot_flat, "swing_clearance_cm": o.swing_clearance_cm,
+                "self_collision": o.self_collision}
 
-    def set_retarget(self, foot_flat: bool | None = None, swing_clearance_cm: float | None = None) -> dict:
-        """리타게팅 보정 for the human motions opened from now on: 디딤발 평평 (foot_flat) and
-        스윙 발 보정 (swing_clearance_cm, 0 = off). Open motions keep how they were made, so opening
-        the same file again shows the two side by side."""
+    def set_retarget(self, foot_flat: bool | None = None, swing_clearance_cm: float | None = None,
+                     self_collision: bool | None = None) -> dict:
+        """리타게팅 보정 for the human motions opened from now on: 디딤발 평평 (foot_flat),
+        스윙 발 보정 (swing_clearance_cm, 0 = off) and 자기 관통 보정 (self_collision). Open motions
+        keep how they were made, so opening the same file again shows the two side by side."""
         if foot_flat is not None:
             self.opts.foot_flat = bool(foot_flat)
         if swing_clearance_cm is not None:
             if not 0.0 <= float(swing_clearance_cm) <= 10.0:
                 raise ValueError("swing_clearance_cm must be 0 (off) to 10")
             self.opts.swing_clearance_cm = float(swing_clearance_cm)
+        if self_collision is not None:
+            self.opts.self_collision = bool(self_collision)
         r = self.retarget_settings()
         self.log(f"retarget settings for motions opened next: foot-flat {'on' if r['foot_flat'] else 'off'}, "
-                 f"swing clearance {r['swing_clearance_cm']:g} cm")
+                 f"swing clearance {r['swing_clearance_cm']:g} cm, "
+                 f"self-collision {'on' if r['self_collision'] else 'off'}")
         self.emit("status")
         return r
 
@@ -1119,11 +1130,14 @@ class MotionScene:
         elif physics:
             mode = what = f"physics_x{self.assist:g}"
         stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", item.label).strip("_") or "motion"
-        path = os.path.join(self.opts.video_dir, f"{stem}_{mode}.mp4")
         human = item.source if item.human is not None else None
         if item.info.get("solved_motion"):  # C3D: Isaac draws a human in its file's own frame, so use the solved skeleton
             human = item.info["solved_motion"]
         motion = replace(robot, name=stem)  # the video caption shows this name, not the cache file's
+        # the name carries what the recording holds: the same clip retargeted with other settings
+        # (or after a pipeline change) is another file, not the old one handed back as done
+        key = self.runner.video_key(motion, human, physics, self.assist)[:6]
+        path = os.path.join(self.opts.video_dir, f"{stem}_{mode}_{key}.mp4")
         job = self.runner.request_video(motion, path, human=human, physics=physics, assist=self.assist,
                                         smpl_model_dir=self.opts.smpl_model_dir,
                                         on_done=lambda j, it=item: self._video_done(it, j))
@@ -1182,9 +1196,17 @@ class MotionScene:
             pitch = ", ".join(f"{side.get(s, s)} {p['before']:g}° → {p['after']:g}°"
                               for s, p in ff.get("stance_pitch_deg", {}).items() if p.get("before") is not None)
             n = ff.get("frames_changed", 0)
+            drop = ff.get("root_drop_cm")  # results made before the leg + pelvis version have none
             rows.append(("디딤발 평평", "켬 · 바뀐 프레임 없음" if not n else
                          f"{n}프레임 고침" + (f" · 디딤 중 발 pitch {pitch}" if pitch else "")
-                         + f" · 뒤꿈치 뜸 평균 {ff['sole_lift_cm']['mean']:g} / 최대 {ff['sole_lift_cm']['max']:g} cm"))
+                         + (f" · 골반 낮춤 평균 {drop['mean']:g} / 최대 {drop['max']:g} cm" if drop else
+                            f" · 뒤꿈치 뜸 평균 {ff['sole_lift_cm']['mean']:g} / 최대 {ff['sole_lift_cm']['max']:g} cm")))
+        sc = item.info.get("self_collision")
+        if sc:  # retargeted with 자기 관통 보정 (retlens.retarget.separate_self_collisions)
+            deep, worst = sc["frames_deeper_than_3cm"], sc["deepest_cm"]
+            rows.append(("자기 관통 보정", "켬 · 바뀐 프레임 없음" if not sc["frames_changed"] else
+                         f"{sc['frames_changed']}프레임 고침 · 3 cm 넘게 파고든 프레임 {deep['before']} → {deep['after']}"
+                         f" · 가장 깊은 곳 {worst['before']:g} → {worst['after']:g} cm (손 포함)"))
         c3d = item.info.get("c3d")
         if c3d:  # raw markers drawn on the robot of the same take's solved skeleton
             extra = (f" (파일에는 Vicon 모델 계산값까지 점 {c3d['points']}개)" if c3d["points"] != c3d["markers"] else "")

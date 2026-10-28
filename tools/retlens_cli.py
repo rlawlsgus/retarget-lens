@@ -8,7 +8,8 @@ JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"
     retlens-cli compare A B [--tol 3] [--no-heading] [--align]   # 겹쳐 비교 numbers
     retlens-cli align REF FILE [FILE ...]   # 기준에 시간 자동 정렬
     retlens-cli retarget FILE --out OUT.npz # save the robot motion (+ .json)
-      (commands that open motions take --smooth HZ, --foot-flat and --swing-clearance CM for human ones)
+      (commands that open motions take --smooth HZ, --foot-flat, --swing-clearance CM and --self-collision
+       for human ones)
     retlens-cli c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
     retlens-cli physics FILE [--assist 1]   # Isaac PhysX check (needs the EULA accepted)
     retlens-cli video FILE --out X.mp4 [--physics]
@@ -44,7 +45,7 @@ def _scene(args):
     if not 0.0 <= args.swing_clearance <= 10.0:
         raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
     return api_core.headless_scene(log=_log, smooth=args.smooth, foot_flat=args.foot_flat,
-                                   swing_clearance_cm=args.swing_clearance)
+                                   swing_clearance_cm=args.swing_clearance, self_collision=args.self_collision)
 
 
 def _open(scene, files: list[str]):
@@ -115,7 +116,7 @@ def run(args) -> dict:
         from retlens.compare import load_item
 
         item = load_item(args.file, smooth=args.smooth, swing_clearance=args.swing_clearance / 100.0,
-                         foot_flat=args.foot_flat, smpl_model_dir=_smpl(), log=_log)
+                         foot_flat=args.foot_flat, self_collision=args.self_collision, smpl_model_dir=_smpl(), log=_log)
         item.robot.save_npz(args.out)
         with open(os.path.splitext(args.out)[0] + ".json", "w", encoding="utf-8") as f:
             json.dump(api_core.jsonable(item.info), f, ensure_ascii=False, indent=1)
@@ -178,9 +179,12 @@ def _retarget_options(p) -> None:
     """How human motions are retargeted (as RetLens's 리타게팅 menu; robot motions load as they are)."""
     p.add_argument("--smooth", type=float, default=6.0, metavar="HZ", help="smoothing (0 = off; default 6)")
     p.add_argument("--foot-flat", action="store_true",
-                   help="디딤발 평평 보정: soles of feet standing still parallel to the floor (heel-standing retargets)")
+                   help="디딤발 평평 보정: feet standing still flat on the floor, through legs and pelvis height "
+                        "(heel-standing retargets)")
     p.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
                    help="스윙 발 보정: swing feet at least CM off the floor (0 = off; 2 recommended)")
+    p.add_argument("--self-collision", action="store_true",
+                   help="자기 관통 보정: robot parts that go through each other pushed apart (hands into hips)")
 
 
 def parser() -> argparse.ArgumentParser:

@@ -2,7 +2,10 @@
 
 Source: github.com/YanjieZe/GMR @ bb1bbe40774794fceb2a7c579a3464a28e68c844 (MIT, LICENSE in
 this folder; Yanjie Ze et al.):
-- motion_retarget.py: the per-frame differential IK (mink on MuJoCo), unchanged;
+- motion_retarget.py: the per-frame differential IK (mink on MuJoCo), unchanged except that
+  solve_ik gets the IK limits as ``limits=`` (GMR passed them 6th, which mink >= 1.x takes as
+  safety_break: mink rebuilt the configuration limit on every solve and dropped the velocity
+  limit; same output, IK 22-39 % faster);
 - params.py: robot model and IK-config tables, Unitree G1 only, asset path from retlens.paths;
 - ik_configs/*_to_g1.json: the G1 IK configs, unchanged.
 

@@ -204,16 +204,22 @@ class PhysicsRunner:
                     "--snapshots", "0", *self._robot_args()]
         return self._submit(job, motion, on_done)
 
+    def video_key(self, motion: RobotMotion, human: str | None = None, physics: bool = False,
+                  assist: float = 1.0) -> str:
+        """Content hash of what a recording depends on: the motion, the human file, and the
+        physics config and harness (physics) or the robot asset."""
+        cfg = self._config_text() if physics else self._usd_text()
+        return hashlib.sha1(json.dumps([motion_key(motion, assist if physics else -1.0, cfg), _file_id(human),
+                                        "video", physics]).encode()).hexdigest()[:12]
+
     def request_video(self, motion: RobotMotion, video: str, human: str | None = None, physics: bool = False,
                       assist: float = 1.0, smpl_model_dir: str | None = None,
                       on_done: Callable[[PhysicsJob], None] | None = None) -> PhysicsJob:
         """Record the motion (with the human file next to it, if given) like
         `isaac_replay.py --human ... --robot-motion ... --video` (--physics: as simulated).
         video: the .mp4 to write (a .gif next to it when ffmpeg is missing); returned as is
-        when it already exists."""
-        cfg = self._config_text() if physics else self._usd_text()
-        key = hashlib.sha1(json.dumps([motion_key(motion, assist if physics else -1.0, cfg), _file_id(human),
-                                       "video", physics]).encode()).hexdigest()[:12]
+        when it already exists, so a path should name what it holds (video_key)."""
+        key = self.video_key(motion, human, physics, assist)
         name = _safe(motion.name)
         out_dir = os.path.join(self.cache_dir, f"video_{name}_{key}")
         base = os.path.splitext(os.path.abspath(video))[0]
