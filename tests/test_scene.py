@@ -78,6 +78,46 @@ def test_add_play_measure_remove(scene):
     assert scene.items == [] and scene.robots.handles == []
 
 
+def test_labels_are_optional(scene, tmp_path):
+    """A motion opens with or without a label file next to it; a broken one is kept with its error;
+    labels can be put on, taken off and read again (inspector, timeline menu, /api/labels)."""
+    import shutil
+
+    from retlens.app import api_core
+
+    src = shutil.copy(SAMPLE, tmp_path / "walk.npz")
+    plain = scene.add(src)
+    assert plain.labels is None and api_core.item_info(scene, plain)["labels"] is None
+    (tmp_path / "walk.labels.csv").write_text("label,start_s,end_s\nidle,0,0.5\nwalk,0.5,99\n", encoding="utf-8")
+    labelled = scene.add(src)
+    try:
+        lab = labelled.labels
+        assert [s.label for s in lab.segments] == ["idle", "walk"] and lab.segments[-1].end == labelled.robot.duration
+        scene.set_offset(labelled, 1.0)
+        scene.seek(1.2)  # 0.2 s into the motion
+        info = api_core.item_info(scene, labelled)["labels"]
+        assert info["now"] == [{"track": "", "label": "idle"}] and info["count"] == 2 and len(info["segments"]) == 2
+        assert "segments" not in api_core.status(scene)["motions"][1]["labels"]  # the overview stays short
+        scene.tick(0.0)  # the 3D view: the label being played under the robot's name tag
+        assert labelled.handles["now_visible"] and labelled.handles["now_text"] == "idle"
+        assert plain.handles["now_visible"] is False  # no labels: nothing over that robot
+        scene.view.show_label_now = False
+        scene.tick(0.0)
+        assert labelled.handles["now_visible"] is False
+        scene.view.show_label_now = True
+        scene.set_labels(labelled, None)
+        scene.tick(0.0)
+        assert labelled.labels is None and labelled.handles["now_visible"] is False
+        scene.reload_labels(labelled)  # looks next to the motion again
+        assert len(labelled.labels.segments) == 2
+        bad = tmp_path / "other.csv"
+        bad.write_text("label\nwalk\n", encoding="utf-8")
+        assert "시간 열" in scene.set_labels(plain, str(bad)).error and not plain.labels.segments
+    finally:
+        scene.remove(plain)
+        scene.remove(labelled)
+
+
 def test_videos_are_named_by_what_they_record(scene, monkeypatch):
     """The same clip retargeted another way is recorded to its own file: an existing file is
     handed back as done (physics_runner), so the old recording must not sit at the new one's path."""

@@ -76,8 +76,9 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 | `POST /api/open {"paths": [...]}` | 열기(창에 나타나고 선택됨) |
 | `POST /api/retarget {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 리타게팅 보정(창의 "리타게팅" 메뉴). 다음에 여는 사람 모션부터 적용되고, 이미 연 모션은 그대로입니다. 지금 설정은 `/api/status`의 `retarget` |
 | `POST /api/remove {"id"}` | 닫기 |
-| `GET /api/motion?id=...` | 모션 하나의 QC·지표·C3D·물리 |
+| `GET /api/motion?id=...` | 모션 하나의 QC·지표·C3D·물리·구간 라벨 |
 | `POST /api/item {"id", "visible"?, "offset_s"?, "show_human"?}` | 보이기, 시간 오프셋, 사람 스켈레톤 |
+| `POST /api/labels {"id", "path"?}` | 구간 라벨: `path` 파일을 붙임 / `"path": null`이면 뺌 / `path`가 없으면 라벨 파일을 다시 읽음 |
 | `POST /api/playback {"play"?, "time_s"?, "speed"?, "loop"?}` | 재생/정지, 시각 이동 |
 | `GET /api/metrics?ref=...` | 분석 표 |
 | `POST /api/align {"ref"}` | 시간 자동 정렬 |
@@ -92,6 +93,9 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 
 ## 4. 알아야 할 개념
 
+- **구간 라벨:** 모션에 라벨 파일이 있을 수도 없을 수도 있습니다. 열 때 모션 옆의 `<이름>.labels.csv`·`.labels.json`·`_labels.csv`·`_subtask.csv`, 또는 폴더의 `labels.csv`(`seq` 열이 그 모션인 행)를 찾습니다. CSV 열은 `label`(필수), `start_s`·`end_s`(초, 끝 제외) 또는 `start_frame`·`end_frame`(끝 포함, `fps` 열 또는 모션 fps), 선택 `track`·`name`·`object`·`note`·`color`·`seq`입니다.
+  - `inspect`·`/api/motion`의 `labels`가 `null`이면 라벨 파일이 없는 것입니다. 있으면 `file`, `tracks`, `segments[]`(label, start_s, end_s, track), `now`(지금 시각의 라벨), `error`(쓸 수 없는 파일의 이유), `notes`(뺀 행, 잘린 구간)가 나옵니다. `/api/status`에는 `segments`를 뺀 요약만 나옵니다.
+  - 라벨 시각은 모션의 첫 프레임 기준입니다. 타임라인 시각은 거기에 시간 오프셋을 더한 값입니다. 어떤 라벨 구간을 보여 주려면 `/api/playback {"time_s": offset_s + start_s}`를 씁니다.
 - **시간 오프셋:** 모션마다 타임라인에서 시작 시각을 옮길 수 있습니다. 비교·RMSE는 겹치는 구간만 봅니다. 같은 촬영의 다른 소스(BVH vs SMPL-X 등)를 비교할 때는 먼저 `align`(또는 `compare --align`)으로 맞추세요.
 - **겹쳐 비교:**
   - B를 A의 골반 위치(기본: 골반 방향까지)로 옮겨 자세 차이만 남깁니다. A는 회색 반투명, B는 허용 오차(기본 3 cm)를 넘는 부위만 노랑(1배)→주황(2배)→빨강(3배 이상)으로 칠합니다.

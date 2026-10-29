@@ -10,6 +10,8 @@
     POST /api/remove    {"id": ..}
     GET  /api/motion?id=..              one motion: QC, metrics, C3D QC, physics state
     POST /api/item      {"id", "visible"?, "offset_s"?, "show_human"?}
+    POST /api/labels    {"id", "path"?}  labelled segments on the timeline: load this file / "path": null takes
+                                         them off / no "path" reads the motion's label file again
     POST /api/playback  {"play"?, "time_s"?, "speed"?, "loop"?}
     GET  /api/metrics?ref=..            the 분석 table (RMSE against ref)
     POST /api/align     {"ref"}         기준에 시간 자동 정렬
@@ -95,7 +97,8 @@ class ApiBackend:
             (g, "/api/library"): lambda q: api_core.library(q.get("query"), int(q.get("limit", 200))),
             (p, "/api/open"): self.open, (p, "/api/retarget"): self.retarget, (p, "/api/remove"): self.remove,
             (g, "/api/motion"): self.motion,
-            (p, "/api/item"): self.item, (p, "/api/playback"): self.playback, (g, "/api/metrics"): self.metrics,
+            (p, "/api/item"): self.item, (p, "/api/labels"): self.labels, (p, "/api/playback"): self.playback,
+            (g, "/api/metrics"): self.metrics,
             (p, "/api/align"): self.align, (p, "/api/compare"): self.compare, (p, "/api/physics"): self.physics,
             (p, "/api/video"): self.video, (g, "/api/jobs"): self.jobs, (p, "/api/camera"): self.camera,
             (p, "/api/screenshot"): self.screenshot,
@@ -157,6 +160,16 @@ class ApiBackend:
         if "show_human" in q:
             self.scene.set_show_human(item, bool(q["show_human"]))
         return api_core.item_info(self.scene, item, metrics=False)
+
+    def labels(self, q: dict) -> dict:
+        item = self._item(q.get("id"))
+        if "path" not in q:
+            self.scene.reload_labels(item)
+        elif q["path"] and not os.path.isfile(q["path"]):
+            raise ApiError(f"no such file: {q['path']}", 404)
+        else:
+            self.scene.set_labels(item, q["path"] or None)
+        return {"id": item.label, "labels": api_core.item_info(self.scene, item)["labels"]}
 
     def playback(self, q: dict) -> dict:
         sc = self.scene

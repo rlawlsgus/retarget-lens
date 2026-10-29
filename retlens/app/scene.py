@@ -24,7 +24,7 @@ from typing import Callable
 
 import numpy as np
 
-from .. import analysis, paths, policy_runner, settings
+from .. import analysis, motion_labels, paths, policy_runner, settings
 from ..compare import Item, compute_metrics, load_item
 from ..diagnosis import CAUSE_KO
 from ..io import urdf_joint_limits
@@ -288,6 +288,7 @@ class ViewSettings:
     body_mesh: bool = False  # SMPL-X inputs as a body surface instead of sticks
     robot_translucent: bool = False
     show_labels: bool = True
+    show_label_now: bool = True  # the labelled segment being played, under each robot's name tag (motion_labels)
     show_balance: bool = True
     speed: float = 1.0
     loop: bool = True
@@ -387,6 +388,7 @@ class MotionScene:
                          smpl_model_dir=o.smpl_model_dir, swing_clearance=o.swing_clearance_cm / 100.0,
                          foot_flat=o.foot_flat, self_collision=o.self_collision, log=self.log)
         compute_metrics(item, self.fk, self.limits)
+        self._find_labels(item)
         with self.lock:
             used = {it.color for it in self.items}
             item.color = next((c for c in PALETTE if c not in used), PALETTE[len(self.items) % len(PALETTE)])
@@ -432,6 +434,40 @@ class MotionScene:
     def set_offset(self, item: Item, value: float) -> None:
         item.offset = float(value)
         self.emit("item", item)
+
+    # ---------------------------------------------------------------- labels (retlens.motion_labels)
+    def _find_labels(self, item: Item) -> None:
+        """The label file next to the motion, if there is one. A broken one is kept with its error
+        (shown in the inspector); it never stops the motion from opening."""
+        try:
+            item.labels = motion_labels.load_for(item.source, item.robot.fps, item.robot.duration,
+                                                 also=[item.info.get("solved_motion")])
+        except Exception as e:
+            item.labels = motion_labels.MotionLabels(path="", error=f"{type(e).__name__}: {e}")
+        self._log_labels(item)
+
+    def _log_labels(self, item: Item) -> None:
+        lab = item.labels
+        if lab is not None:
+            self.log(f"  {item.label}: labels {rel(lab.path) if lab.path else '-'}: "
+                     + (lab.error or f"{len(lab.segments)} segments in {len(lab.tracks)} track(s)")
+                     + "".join(f"; {n}" for n in lab.notes))
+
+    def set_labels(self, item: Item, path: str | None):
+        """Show this label file's segments on the motion (None: no labels; files are never changed)."""
+        item.labels = None if not path else motion_labels.load(path, item.source, item.robot.fps,
+                                                               item.robot.duration)
+        self._log_labels(item)
+        self.emit("item", item)
+        return item.labels
+
+    def reload_labels(self, item: Item):
+        """Read the motion's label file again (after editing it), or look for one next to it."""
+        if item.labels is not None and item.labels.path:
+            return self.set_labels(item, item.labels.path)
+        self._find_labels(item)
+        self.emit("item", item)
+        return item.labels
 
     def set_visible(self, item: Item, value: bool) -> None:
         item.visible = bool(value)
@@ -593,6 +629,9 @@ class MotionScene:
             self.log(f"  {item.label}: {len(missing)} robot joints not in the motion, held at 0")
         item.handles["label"] = s.scene.add_label(f"{node}/label", item.label, font_screen_scale=0.9,
                                                   anchor="bottom-center")
+        # the segment label being played: hangs from the name tag's point, so the two never overlap at any zoom
+        item.handles["now"] = s.scene.add_label(f"{node}/now", "", font_screen_scale=1.1, anchor="top-center")
+        self._set_visible(item, "now", False)
         if item.human is not None:  # drawn by the shared skeleton node (OverlayBatch)
             hm = item.human
             item.handles["scale"] = human_scale(item)
@@ -779,6 +818,7 @@ class MotionScene:
         self._set_visible(item, "mesh", show_h and mesh is not None)
         self._set_visible(item, "markers", show_h)
         if not visible:
+            self._set_visible(item, "now", False)
             return None
         src = self.shown(item)  # the physics result in physics mode
         robot = src.robot
@@ -796,7 +836,8 @@ class MotionScene:
         T_base[:3, 3] = p
         jmap = src.handles.get("map", h["map"])
         cfg = np.array([dof[i] if i is not None else 0.0 for i in jmap])
-        h["label"].position = p + np.array([0.0, 0.0, 0.85])
+        tag = p + np.array([0.0, 0.0, 0.85])
+        h["label"].position = tag
         text = item.label if inside else f"{item.label} (범위 밖)"
         if self.is_physics_result(item):
             note = self.fall_note(item, local)
@@ -817,6 +858,12 @@ class MotionScene:
             text += " · 비교 기준 (반투명)" if role == "A" else " · 비교 대상 (벗어난 부위만 색칠)"
         if h.get("label_text") != text:  # one message less per robot per frame
             h["label"].text = h["label_text"] = text
+        now = item.labels.text_at(local) if item.labels is not None and inside and v.show_label_now else ""
+        self._set_visible(item, "now", bool(now))  # hidden where nothing is labelled
+        if now:
+            h["now"].position = tag
+            if h.get("now_text") != now:
+                h["now"].text = h["now_text"] = now
         balance = self._pose_balance(item, src.balance, local, R, shift) if role is None else None
         sticks = None
         if "bones" in h and show_h:

@@ -11,7 +11,7 @@ the layout is remembered; 보기 > 레이아웃 초기화 restores this one):
     |         scene view (3D, viser)      +---------------------+
     |                                     | 인스펙터 | 씬 설정    |
     +-------------------------------------+                     |
-    | 타임라인 (transport, one track per motion, falls)          |
+    | 타임라인 (transport, one track per motion, labels, falls)  |
     | 프로젝트 (data folders) | 분석 | 콘솔                       |
     +-- status bar: physics mode, Isaac jobs, time ------------+
 
@@ -29,8 +29,8 @@ from html import escape
 
 import numpy as np
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter,
-                           QPalette, QPen, QPixmap)
+from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QFontMetrics, QIcon,
+                           QKeySequence, QPainter, QPalette, QPen, QPixmap)
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QStyle, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import cmu_labels
+from .. import cmu_labels, motion_labels
 from .. import paths as app_paths  # "paths" is a common local name here
 from .. import settings
 from ..compare import MOTION_EXT, Item, library_files
@@ -308,6 +308,8 @@ class HierarchyPanel(QTreeWidget):
             m.addAction("저장된 동영상 열기", lambda: self.win.open_path(self.win.scene.video_file(it)))
         m.addAction("파일 위치 열기", lambda: self.win.open_path(os.path.dirname(it.source)))
         m.addSeparator()
+        self.win.add_label_actions(m, it)
+        m.addSeparator()
         m.addAction("겹쳐 비교: 기준(A)으로", lambda: self.win.start_compare(ref=it))
         m.addAction("겹쳐 비교: 대상(B)으로", lambda: self.win.start_compare(item=it))
         m.addSeparator()
@@ -322,6 +324,7 @@ class InspectorPanel(QScrollArea):
         self.win = win
         self.setWidgetResizable(True)
         self.item: Item | None = None
+        self._labels_shown = None
         self._build_empty()
 
     def _clear(self) -> QVBoxLayout:
@@ -391,6 +394,9 @@ class InspectorPanel(QScrollArea):
         row.addWidget(self.offset)
         lay.addLayout(row)
 
+        lay.addWidget(self._section("라벨"))
+        self._build_labels(lay, item)
+
         lay.addWidget(self._section("물리"))
         self.phys = QLabel()
         self.phys.setWordWrap(True)
@@ -430,6 +436,56 @@ class InspectorPanel(QScrollArea):
         lay.addWidget(rm)
         self.refresh()
 
+    def _build_labels(self, lay: QVBoxLayout, item: Item) -> None:
+        """Where the motion's labels come from (or why there are none), load / reload / remove, and
+        its segments (a click goes to the segment's start)."""
+        self._labels_shown = item.labels  # refresh() rebuilds when they change (menu, API, drop)
+        info = QLabel(labels_text(item))
+        info.setWordWrap(True)
+        info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if item.labels is None or item.labels.error:
+            info.setStyleSheet("color: gray" if item.labels is None else "color: rgb(230,150,60)")
+        lay.addWidget(info)
+        row = QHBoxLayout()
+        for text, tip, fn, on in (
+                ("불러오기...", "CSV·JSON 라벨 파일을 골라 이 모션에 붙입니다(파일은 바꾸지 않음)",
+                 lambda: self.win.load_labels_dialog(item), True),
+                ("다시 읽기", "라벨 파일을 고친 뒤 다시 읽습니다. 붙은 파일이 없으면 모션 옆에서 다시 찾습니다",
+                 lambda: self.win.scene.reload_labels(item), True),
+                ("빼기", "이 모션에서 라벨을 뺍니다(파일은 그대로)", lambda: self.win.scene.set_labels(item, None),
+                 item.labels is not None)):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setEnabled(on)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        segs = item.labels.segments if item.labels is not None else []
+        if not segs:
+            return
+        multi = len(item.labels.tracks) > 1 or bool(item.labels.tracks[0])
+        heads = (["트랙"] if multi else []) + ["라벨", "시작 (s)", "끝 (s)"]
+        table = QTableWidget(len(segs), len(heads))
+        table.setHorizontalHeaderLabels(heads)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(len(heads) - 3, QHeaderView.Stretch)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setMinimumHeight(min(220, 26 + 22 * len(segs)))
+        for r, s in enumerate(segs):
+            cells = ([s.track] if multi else []) + [s.label, f"{s.start:.2f}", f"{s.end:.2f}"]
+            for c, v in enumerate(cells):
+                cell = QTableWidgetItem(v)
+                cell.setToolTip(segment_text(item, s))
+                if c == len(cells) - 3:
+                    cell.setIcon(color_icon(motion_labels.color_for(s)))
+                if c >= len(cells) - 2:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(r, c, cell)
+        table.cellClicked.connect(lambda r, _c: (self.win.scene.set_playing(False),
+                                                 self.win.scene.seek(item.offset + segs[r].start)))
+        lay.addWidget(table)
+
     @staticmethod
     def _section(text: str) -> QLabel:
         lab = QLabel(text)
@@ -443,6 +499,9 @@ class InspectorPanel(QScrollArea):
         """metrics=False: only the status lines (job progress), not the metric table."""
         it, sc = self.item, self.win.scene
         if it is None or it not in sc.items:
+            return
+        if it.labels is not self._labels_shown:  # loaded, reloaded or removed (menu, API, a dropped file)
+            self.show_item(it)
             return
         if sc.is_sim_result(it):
             text = sc.job_text(it)
@@ -523,6 +582,9 @@ class SceneSettingsPanel(QScrollArea):
         form.addRow("로봇 표시", combo(["불투명", "반투명"], "반투명" if v.robot_translucent else "불투명",
                                    lambda t: self._set(robot_translucent=t == "반투명")))
         form.addRow(check("이름표", v.show_labels, lambda on: setattr(v, "show_labels", on)))
+        now = check("지금 구간 라벨 (이름표 아래)", v.show_label_now, lambda on: setattr(v, "show_label_now", on))
+        now.setToolTip("라벨 파일이 있는 모션은 재생 중인 구간의 라벨을 로봇 위에 띄웁니다(라벨이 없는 시간에는 안 보임)")
+        form.addRow(now)
         form.addRow(check("균형 표시 (지지다각형·CoM·ZMP)", v.show_balance, lambda on: setattr(v, "show_balance", on)))
         cam = QPushButton("카메라 맞추기")
         cam.clicked.connect(sc.fit_camera)
@@ -537,8 +599,10 @@ class SceneSettingsPanel(QScrollArea):
 
 # ------------------------------------------------------------------------------ timeline
 class TimelineTracks(QWidget):
-    """Ruler, one bar per motion (its offset and length, falls in red) and the playhead."""
-    NAME_W, RULER_H, ROW_H = 150, 22, 20
+    """Ruler, one bar per motion (its offset and length, falls in red), its labelled segments in
+    lanes under the bar (one lane per label track, retlens.motion_labels) and the playhead. A
+    motion without labels is the plain bar."""
+    NAME_W, RULER_H, ROW_H, LANE_H = 150, 22, 20, 18
 
     def __init__(self, win: "EditorWindow"):
         super().__init__()
@@ -550,7 +614,40 @@ class TimelineTracks(QWidget):
     def sizeHint(self):
         from PySide6.QtCore import QSize
 
-        return QSize(600, self.RULER_H + self.ROW_H * max(1, len(self.win.scene.items)) + 4)
+        rows = self._rows()
+        return QSize(600, (rows[-1][1] + rows[-1][2] if rows else self.RULER_H + self.ROW_H) + 4)
+
+    def _rows(self) -> list[tuple[Item, int, int, list[str]]]:
+        """(motion, top, height, label tracks) per row: a motion with labels is taller by its lanes."""
+        out, y = [], self.RULER_H
+        for it in list(self.win.scene.items):
+            tracks = it.labels.tracks if it.labels is not None else []
+            h = self.ROW_H + self.LANE_H * len(tracks)
+            out.append((it, y, h, tracks))
+            y += h
+        return out
+
+    def _row_at(self, y: float):
+        return next((r for r in self._rows() if r[1] <= y < r[1] + r[2]), None)
+
+    def _segments(self, it: Item, y: int, tracks: list[str]):
+        """(segment, rect) of a motion's labels as drawn: clipped to what plays (its physics result may be shorter)."""
+        dur = self.win.scene.shown(it).robot.duration
+        for s in it.labels.segments:
+            if s.start >= dur:
+                continue
+            x0, x1 = self._x(it.offset + s.start), self._x(it.offset + min(s.end, dur))
+            yield s, QRectF(x0, y + self.ROW_H - 1 + tracks.index(s.track) * self.LANE_H, max(1.0, x1 - x0),
+                            self.LANE_H - 3)
+
+    def segment_at(self, pos):
+        """(motion, segment) under the mouse, or None."""
+        row = self._row_at(pos.y())
+        if row is None or not row[3]:
+            return None
+        it, y, _h, tracks = row
+        hit = [s for s, r in self._segments(it, y, tracks) if r.adjusted(-1, 0, 1, 0).contains(pos)]
+        return (it, hit[-1]) if hit else None  # the one drawn on top
 
     def _span(self) -> tuple[float, float]:
         lo, hi = self.win.scene.time_range()
@@ -587,12 +684,13 @@ class TimelineTracks(QWidget):
             p.drawText(int(x) + 3, self.RULER_H - 8, f"{t:g}s")
             t += step
         sc, sel = self.win.scene, self.win.selected
-        for i, it in enumerate(list(sc.items)):
-            y = self.RULER_H + i * self.ROW_H
+        for it, y, h, tracks in self._rows():
             if it is sel:
-                p.fillRect(0, y, self.width(), self.ROW_H, pal.color(QPalette.Highlight).darker(250))
-            p.setPen(text)
-            p.drawText(QRectF(6, y, self.NAME_W - 10, self.ROW_H), Qt.AlignVCenter | Qt.AlignLeft, it.label)
+                p.fillRect(0, y, self.width(), h, pal.color(QPalette.Highlight).darker(250))
+            broken = it.labels is not None and bool(it.labels.error)  # its label file could not be used: say so
+            p.setPen(QColor(230, 150, 60) if broken else text)
+            p.drawText(QRectF(6, y, self.NAME_W - 10, self.ROW_H), Qt.AlignVCenter | Qt.AlignLeft,
+                       f"⚠ {it.label}" if broken else it.label)
             dur = sc.shown(it).robot.duration
             c = QColor(*it.color)
             c.setAlpha(200 if it.visible else 70)
@@ -600,6 +698,9 @@ class TimelineTracks(QWidget):
             p.setBrush(c)
             p.drawRoundedRect(QRectF(self._x(it.offset), y + 4, max(2.0, self._x(it.offset + dur) - self._x(it.offset)),
                                      self.ROW_H - 8), 3, 3)
+            if tracks:
+                self._paint_labels(p, it, y, tracks, small)
+            p.setPen(Qt.NoPen)
             p.setBrush(QColor(230, 40, 40))
             for ft, _cause in sc.falls(it):
                 x = self._x(it.offset + ft)
@@ -608,33 +709,84 @@ class TimelineTracks(QWidget):
         p.setPen(QPen(QColor(255, 150, 40), 2))
         p.drawLine(int(x), 0, int(x), self.height())
 
+    def _paint_labels(self, p: QPainter, it: Item, y: int, tracks: list[str], font: QFont) -> None:
+        """The motion's segments, one lane per track: label colors, the label written in when it
+        fits, the segment under the playhead outlined."""
+        pal = self.palette()
+        if len(tracks) > 1 or tracks[0]:  # track names under the motion's name
+            p.setPen(pal.color(QPalette.PlaceholderText))
+            for k, tr in enumerate(tracks):
+                p.drawText(QRectF(16, y + self.ROW_H - 1 + k * self.LANE_H, self.NAME_W - 20, self.LANE_H - 3),
+                           Qt.AlignVCenter | Qt.AlignLeft, tr or "-")
+        fm = QFontMetrics(font)
+        local = self.win.scene.t - it.offset
+        for s, r in self._segments(it, y, tracks):
+            c = QColor(*motion_labels.color_for(s))
+            c.setAlpha(230 if it.visible else 80)
+            p.setPen(QPen(pal.color(QPalette.Base), 1))  # a thin gap between neighbouring segments
+            p.setBrush(c)
+            p.drawRect(r)
+            if s.start <= local < s.end:
+                p.setPen(QPen(pal.color(QPalette.Text), 1.5))
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(r.adjusted(1, 1, -1, -1))
+            if r.width() > 18:
+                light = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue() > 140
+                p.setPen(QColor(25, 25, 25) if light else QColor(245, 245, 245))
+                p.drawText(r.adjusted(4, 0, -2, 0), Qt.AlignVCenter | Qt.AlignLeft,
+                           fm.elidedText(s.label, Qt.ElideRight, int(r.width()) - 6))
+
     def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton:  # the right button opens the menu (contextMenuEvent)
+            return
         if e.position().x() < self.NAME_W:  # click a name: select that motion
-            i = int((e.position().y() - self.RULER_H) // self.ROW_H)
-            items = self.win.scene.items
-            if 0 <= i < len(items):
-                self.win.select(items[i])
+            row = self._row_at(e.position().y())
+            if row is not None:
+                self.win.select(row[0])
             return
         self._drag = True
         self.win.scene.set_playing(False)
         self.win.scene.seek(self._t(e.position().x()))
 
+    def mouseDoubleClickEvent(self, e):
+        hit = self.segment_at(e.position())
+        if hit is not None:  # to the segment's start
+            self.win.scene.set_playing(False)
+            self.win.scene.seek(hit[0].offset + hit[1].start)
+
     def mouseMoveEvent(self, e):
         if self._drag:
             self.win.scene.seek(self._t(e.position().x()))
         else:
-            ft = self._fall_at(e.position())
-            self.setToolTip(ft or "")
+            self.setToolTip(self._fall_at(e.position()) or self._label_tip(e.position()))
 
     def mouseReleaseEvent(self, _):
         self._drag = False
 
+    def contextMenuEvent(self, e):
+        row = self._row_at(e.pos().y())
+        if row is None:
+            return
+        it = row[0]
+        self.win.select(it)
+        m = QMenu(self)
+        self.win.add_label_actions(m, it)
+        m.exec(e.globalPos())
+
+    def _label_tip(self, pos) -> str:
+        hit = self.segment_at(pos)
+        if hit is not None:
+            return segment_text(*hit)
+        row = self._row_at(pos.y())
+        if row is not None and pos.x() < self.NAME_W and row[0].labels is not None and row[0].labels.error:
+            return f"라벨 파일을 쓰지 못함: {row[0].labels.error}"
+        return ""
+
     def _fall_at(self, pos) -> str:
-        i = int((pos.y() - self.RULER_H) // self.ROW_H)
-        items = self.win.scene.items
-        if not 0 <= i < len(items):
+        row = self._row_at(pos.y())
+        if row is None or pos.y() > row[1] + self.ROW_H:  # falls are marked on the motion's bar
             return ""
-        it, sc = items[i], self.win.scene
+        it, sc = row[0], self.win.scene
         why = "판정" if sc.is_policy_result(sc.shown(it)) else "1차 원인"  # MuJoCo: the fall rule, not a diagnosis
         for ft, cause in sc.falls(it):
             if abs(self._x(it.offset + ft) - pos.x()) < 6:
@@ -668,7 +820,10 @@ class TimelinePanel(QWidget):
         self.time = QLabel()
         self.time.setMinimumWidth(190)
         bar.addWidget(self.time)
-        bar.addStretch(1)
+        self.now = QLabel()  # the selected motion's label(s) at the playhead
+        self.now.setToolTip("고른 모션의 지금 구간 라벨")
+        self.now.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        bar.addWidget(self.now, 1)
         bar.addWidget(QLabel("속도"))
         speed = QDoubleSpinBox()
         speed.setRange(0.05, 4.0)
@@ -691,6 +846,11 @@ class TimelinePanel(QWidget):
         lo, hi = sc.time_range()
         fps = 30.0
         self.time.setText(f"{sc.t:6.2f} / {hi:.2f} s   (frame {int(round(sc.t * fps))})")
+        it, now = self.win.selected, ""
+        if it is not None and it.labels is not None and it.labels.segments:
+            now = it.labels.text_at(sc.t - it.offset) or "(라벨 없는 구간)"
+        if self.now.text() != now:
+            self.now.setText(now)
         self.play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if sc.playing else QStyle.SP_MediaPlay))
         self.tracks.update()
 
@@ -1345,6 +1505,30 @@ def help_button(text: str, html: str) -> QToolButton:
     return b
 
 
+def segment_text(it: Item, s: motion_labels.Segment) -> str:
+    """Hover text of a labelled segment: its label, time and frames (at the motion's fps), track and note."""
+    f0, f1 = int(round(s.start * it.robot.fps)), int(round(s.end * it.robot.fps)) - 1
+    lines = [s.label + (f" · {s.name}" if s.name else ""),
+             f"{s.start:.2f} – {s.end:.2f} s ({s.duration:.2f} s) · 프레임 {f0} – {max(f0, f1)}"]
+    extra = " · ".join(x for x in (f"트랙 {s.track}" if s.track else "", s.note) if x)
+    return "\n".join(lines + ([extra] if extra else []))
+
+
+def labels_text(it: Item) -> str:
+    """The inspector's line about a motion's labels: where they come from, or why there are none."""
+    lab = it.labels
+    if lab is None:
+        stem = os.path.splitext(os.path.basename(it.source))[0]
+        return (f"라벨 파일이 없습니다. 모션 옆에 {stem}.labels.csv 같은 파일을 두면 열 때 붙고, 아래 '불러오기'나 "
+                "타임라인 우클릭으로 아무 라벨 파일이나 붙일 수 있습니다.")
+    head = rel(lab.path).replace("\\", "/") if lab.path else "라벨"
+    if lab.error:
+        return f"{head}\n라벨 파일을 쓰지 못함: {lab.error}"
+    tracks = [t for t in lab.tracks if t]
+    text = f"{head}\n구간 {len(lab.segments)}개" + (f" · 트랙 {len(tracks)}개 ({', '.join(tracks)})" if tracks else "")
+    return text + "".join(f"\n· {n}" for n in lab.notes)
+
+
 def short_text(v: str, limit: int = 18) -> str:
     """'넘어짐 1회; 보조 힘 > 체중 20%: 프레임 62.8%; ...' -> '넘어짐 1회 외 2' for narrow table cells."""
     parts = [p.strip() for p in v.split(";") if p.strip()]
@@ -1861,6 +2045,7 @@ class EditorWindow(QMainWindow):
         self._eula = accept_eula or self.settings.value("isaac/eula_accepted", False, type=bool)
         scene.runner.accept_eula = self._eula
         self._loading = 0
+        self._pending_labels: dict[str, str] = {}  # label files dropped with their motion, by motion name
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.setDockOptions(QMainWindow.AnimatedDocks | QMainWindow.AllowTabbedDocks | QMainWindow.AllowNestedDocks)
@@ -2285,6 +2470,44 @@ class EditorWindow(QMainWindow):
         for it in list(self.scene.items):
             self.scene.remove(it)
 
+    # ---------------------------------------------------------------- labels (retlens.motion_labels)
+    def add_label_actions(self, m: QMenu, it: Item) -> None:
+        """라벨 entries of a motion's menus (timeline, hierarchy)."""
+        sc, lab = self.scene, it.labels
+        m.addAction("라벨 불러오기...", lambda: self.load_labels_dialog(it))
+        if lab is not None and lab.path:
+            m.addAction("라벨 다시 읽기", lambda: sc.reload_labels(it))
+            m.addAction("라벨 파일 열기", lambda: self.open_path(lab.path))
+        if lab is not None:
+            m.addAction("라벨 빼기", lambda: sc.set_labels(it, None))
+
+    def load_labels_dialog(self, it: Item) -> None:
+        start = os.path.dirname(it.labels.path if it.labels is not None and it.labels.path else it.source)
+        path, _ = QFileDialog.getOpenFileName(self, f"라벨 파일 - {it.label}", start,
+                                              "라벨 파일 (*.csv *.json);;모든 파일 (*)")
+        if path:
+            self._show_labels_result(it, self.scene.set_labels(it, path))
+
+    def attach_label_files(self, files: list[str]) -> None:
+        """Dropped label files: each onto the open motion it is named after (02_01.labels.csv ->
+        02_01), else onto the selected motion."""
+        for f in files:
+            stem = motion_labels.stem_of(f).lower()
+            it = next((x for x in self.scene.items
+                       if os.path.splitext(os.path.basename(x.source))[0].lower() == stem), self.selected)
+            if it is None:
+                self.status(f"라벨을 붙일 모션이 없습니다: {os.path.basename(f)} (모션을 먼저 열거나 고르세요)", 10000)
+                continue
+            self._show_labels_result(it, self.scene.set_labels(it, f))
+
+    def _show_labels_result(self, it: Item, lab) -> None:
+        self.select(it)
+        if lab is not None and lab.error:
+            QMessageBox.warning(self, "라벨", f"{os.path.basename(lab.path)}을(를) {it.label}에 붙이지 못했습니다.\n\n"
+                                            f"{lab.error}\n\n열 이름과 형식은 사용 설명서의 '구간 라벨'에 있습니다.")
+        elif lab is not None:
+            self.status(f"라벨: {it.label}에 구간 {len(lab.segments)}개 ({os.path.basename(lab.path)})", 8000)
+
     def add_paths(self, paths: list[str]) -> None:
         """Load motion files in the background (retargeting can take tens of seconds)."""
         paths = [p for p in paths if p]
@@ -2310,6 +2533,9 @@ class EditorWindow(QMainWindow):
         if isinstance(result, Item):
             self.status(f"추가됨: {result.label}", 5000)
             self.select(result)
+            pending = self._pending_labels.pop(os.path.splitext(os.path.basename(result.source))[0].lower(), None)
+            if pending:
+                self.attach_label_files([pending])
             if len(self.scene.items) == 1 or self._loading == 0:
                 self.scene.fit_camera()
         else:
@@ -2344,7 +2570,14 @@ class EditorWindow(QMainWindow):
 
     def dropEvent(self, e):
         if e.mimeData().hasUrls():
-            paths = [u.toLocalFile() for u in e.mimeData().urls() if u.toLocalFile().lower().endswith(MOTION_EXT)]
+            files = [u.toLocalFile() for u in e.mimeData().urls() if u.toLocalFile()]
+            labels = [f for f in files if motion_labels.is_label_file(f)]  # before motions: a label table is a .csv
+            paths = [f for f in files if f not in labels and f.lower().endswith(MOTION_EXT)]
+            stems = {os.path.splitext(os.path.basename(p))[0].lower() for p in paths}
+            for f in labels:  # dropped with its motion: attached once that has loaded (_on_added)
+                if motion_labels.stem_of(f).lower() in stems:
+                    self._pending_labels[motion_labels.stem_of(f).lower()] = f
+            self.attach_label_files([f for f in labels if motion_labels.stem_of(f).lower() not in stems])
         else:  # rows dragged from the project panel
             paths = [self.project.files.item(i.row(), 0).data(Qt.UserRole) for i in self.project.files.selectedIndexes()
                      if i.column() == 0]
@@ -2477,6 +2710,8 @@ class EditorWindow(QMainWindow):
             self.timeline.relayout()
             self.refresh_analysis()
         elif event in ("item", "status"):
+            if event == "item":
+                self.timeline.relayout()  # labels may have added or removed lanes
             self.hierarchy.refresh()
             self.inspector.refresh()
             self.refresh_analysis()

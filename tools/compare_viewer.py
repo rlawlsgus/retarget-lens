@@ -139,6 +139,9 @@ class Viewer:
             self.robot_look.on_update(lambda _: self._set_view(robot_translucent=self.robot_look.value == "반투명"))
             self.show_labels = gui.add_checkbox("이름표", v.show_labels)
             self.show_labels.on_update(lambda _: setattr(v, "show_labels", bool(self.show_labels.value)))
+            self.show_label_now = gui.add_checkbox("지금 구간 라벨", v.show_label_now,
+                                                   hint="라벨 파일이 있는 모션은 재생 중인 구간의 라벨을 이름표 아래에 띄웁니다")
+            self.show_label_now.on_update(lambda _: setattr(v, "show_label_now", bool(self.show_label_now.value)))
             self.show_balance = gui.add_checkbox(
                 "균형 표시", v.show_balance, hint="바닥에 지지다각형(초록, 발이 닿은 발바닥 점), 질량중심 투영(파랑), ZMP(빨강)")
             self.show_balance.on_update(lambda _: setattr(v, "show_balance", bool(self.show_balance.value)))

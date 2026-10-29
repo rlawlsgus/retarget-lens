@@ -24,7 +24,9 @@ def test_motion_files_are_listed_by_folder(tmp_path, monkeypatch):
             _touch(tmp_path / "reports/physics/smooth6/02_01_g1_sim.npz")]
     skip = [_touch(tmp_path / "data/raw/amass/CMU/02/neutral_stagei.npz"),  # body shape, not a motion
             _touch(tmp_path / "data/raw/cmu_bvh/SOURCE.md"), _touch(tmp_path / "data/retargeted/smooth6/02_01_g1.json"),
-            _touch(tmp_path / "data/retargeted/cache/old_g1.npz"), _touch(tmp_path / "reports/qc_real.csv")]
+            _touch(tmp_path / "data/retargeted/cache/old_g1.npz"), _touch(tmp_path / "reports/qc_real.csv"),
+            _touch(tmp_path / "data/raw/cmu_bvh/02_01.labels.csv"),  # labels of 02_01, not a Unitree csv motion
+            _touch(tmp_path / "data/raw/unitree/walk_subtask.csv"), _touch(tmp_path / "data/raw/unitree/labels.csv")]
     for p in keep:
         assert is_motion_file(p), p
     for p in skip:

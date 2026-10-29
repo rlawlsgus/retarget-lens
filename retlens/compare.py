@@ -21,6 +21,7 @@ from .io.bvh import load_bvh
 from .io.fbx import load_fbx
 from .io.smpl import load_amass_npz
 from .motion import RobotMotion, SkeletonMotion
+from .motion_labels import is_label_name
 from .qc import QCConfig, add_balance_flags, check_robot
 
 ROOT = paths.REPO_ROOT
@@ -40,11 +41,13 @@ UPLOADS = paths.uploads_dir()
 
 def is_motion_file(path: str) -> bool:
     """A file the viewer can open: motion extensions, minus AMASS body-shape files
-    (*_stagei.npz), anything under a cache folder, and report tables (only the
-    physics results *_sim.npz count under the repository's reports/)."""
+    (*_stagei.npz), label files (*.labels.csv, retlens.motion_labels), anything under a cache
+    folder, and report tables (only the physics results *_sim.npz count under the repository's
+    reports/)."""
     rel = paths.rel(path, ROOT).replace(os.sep, "/").lower()
     name = os.path.basename(rel)
-    if not name.endswith(MOTION_EXT) or name.endswith("_stagei.npz") or "/cache/" in f"/{rel}":
+    if (not name.endswith(MOTION_EXT) or name.endswith("_stagei.npz") or is_label_name(name)
+            or "/cache/" in f"/{rel}"):
         return False
     return not rel.startswith("reports/") or name.endswith("_sim.npz")
 
@@ -97,6 +100,7 @@ class Item:
     balance: object = None  # retlens.stability.BalanceTrack (CoM / ZMP / support), set by compute_metrics
     handles: dict = field(default_factory=dict)  # viewer state
     retarget: dict = field(default_factory=dict)  # human inputs: the settings it was retargeted with
+    labels: object = None  # retlens.motion_labels.MotionLabels: labelled time segments; None = no label file
 
 
 def human_format(path: str) -> str | None:
