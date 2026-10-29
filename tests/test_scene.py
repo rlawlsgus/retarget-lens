@@ -113,9 +113,62 @@ def test_labels_are_optional(scene, tmp_path):
         bad = tmp_path / "other.csv"
         bad.write_text("label\nwalk\n", encoding="utf-8")
         assert "시간 열" in scene.set_labels(plain, str(bad)).error and not plain.labels.segments
+        typed = tmp_path / "typed.csv"  # more values than columns: read, not an exception (window, API)
+        typed.write_text("label,start_s,end_s\nidle,0,0.5,\nwalk,0.5,1,oops\n", encoding="utf-8")
+        assert [s.label for s in scene.set_labels(plain, str(typed)).segments] == ["idle", "walk"]
+
+        # overlay comparison: B is drawn on A, and its segment label goes with it, in its name tag
+        scene.set_compare(on=True, ref=plain, item=labelled)
+        scene.seek(1.2)
+        scene.tick(0.0)
+        h = labelled.handles
+        assert scene.compare_role(labelled) == "B" and h["now_visible"] is False
+        assert h["label_text"].endswith("비교 대상 (벗어난 부위만 색칠)\nidle")
+        assert np.allclose(h["label"].position, plain.handles["pos"] + np.array([0.0, 0.0, 1.05]))
+        scene.view.show_labels = False  # names hidden: the segment label alone, moved there too
+        scene.tick(0.0)
+        assert h["now_visible"] and h["now_text"] == "idle" and np.allclose(h["now"].position, h["label"].position)
+        scene.view.show_labels = True
+        scene.set_compare(on=False)
+        scene.tick(0.0)
+        assert h["now_visible"] and "비교 대상" not in h["label_text"]
     finally:
         scene.remove(plain)
         scene.remove(labelled)
+
+
+def test_auto_labels_by_a_rule_file(scene, tmp_path):
+    """자동 라벨: a human motion gets its rule file's labels, made again by 다시 읽기 after the rules change;
+    a robot motion (no skeleton) says why it gets none."""
+    from retlens.app import api_core
+    from retlens.synthetic import walking_bvh_text
+
+    bvh = tmp_path / "walk.bvh"
+    bvh.write_text(walking_bvh_text(seconds=3.0))
+    rules = tmp_path / "r.yaml"
+    rules.write_text("name: 시험\nrules:\n  - {label: 서기}\n", encoding="utf-8")
+    human, robot = scene.add(str(bvh)), scene.add(SAMPLE)
+    try:
+        lab = scene.auto_label(human, str(rules))
+        assert lab.auto == "시험" and not lab.error and [s.label for s in lab.segments] == ["서기"]
+        assert lab.segments[0].start == 0 and lab.segments[-1].end <= human.robot.duration + 1e-9
+        assert api_core.item_info(scene, human)["labels"]["auto"] == "시험"
+        rules.write_text("name: 시험\nrules:\n  - {label: 다시}\n", encoding="utf-8")
+        assert [s.label for s in scene.reload_labels(human).segments] == ["다시"]
+        # when it cannot be done, the motion keeps the labels it has
+        kept = human.labels
+        rules.write_text("rules:\n  - {label: x, when: {이동: [걷기\n", encoding="utf-8")  # broken now
+        failed = scene.reload_labels(human)
+        assert failed.error.startswith("읽지 못함") and human.labels is kept
+        hand = tmp_path / "hand.csv"
+        hand.write_text("label,start_s,end_s\nstand,0,1\n", encoding="utf-8")
+        scene.set_labels(robot, str(hand))
+        assert "로봇 모션" in scene.auto_label(robot, str(rules)).error
+        assert [s.label for s in robot.labels.segments] == ["stand"] and not scene.has_skeleton(robot)
+        assert scene.has_skeleton(human)
+    finally:
+        scene.remove(human)
+        scene.remove(robot)
 
 
 def test_videos_are_named_by_what_they_record(scene, monkeypatch):

@@ -11,7 +11,7 @@ _MEIPASS). To try an installed layout from the repository without packaging:
     python tools\\editor.py
 
 Contents:
-    configs/            physics.yaml, qc.yaml
+    configs/            physics.yaml, qc.yaml, label_rules_example.yaml (자동 라벨 예시 규칙)
     assets/unitree_g1/  G1 URDF (display), MJCF (retargeting), meshes, LICENSE (BSD-3, Unitree)
     assets/gmt_g1/      g1.xml: GMT's 23-DoF G1 MuJoCo model on those meshes (physics mode "없음 (MuJoCo)"),
                         when GMT is installed (scripts\\install_gmt.ps1); its tracking policy is not staged
@@ -97,7 +97,7 @@ def stage(out: str, samples: bool = False, assets_from: str | None = None, gmt_f
     if os.path.isdir(out):
         shutil.rmtree(out)
     done: list[str] = []
-    for name in ("physics.yaml", "qc.yaml"):
+    for name in ("physics.yaml", "qc.yaml", "label_rules_example.yaml"):
         _copy(os.path.join(ROOT, "configs", name), os.path.join(out, "configs", name), done)
     src = os.path.join(assets_from or os.path.join(os.path.dirname(ROOT), "GMR", "assets"), ROBOT)
     missing = [f for f in ROBOT_FILES if not os.path.isfile(os.path.join(src, f))]

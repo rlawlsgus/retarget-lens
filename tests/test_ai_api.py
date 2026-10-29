@@ -112,6 +112,23 @@ def test_http_api(tmp_path, monkeypatch):
         a, b = (m["id"] for m in out["opened"])
         assert a != b  # labels stay unique
         assert _call(f"{u}/api/open", t, {"paths": [str(tmp_path / "x.bvh")]})[0] == 404
+        # labels: a hand-written table with more values than columns is read, not a 500
+        typed = tmp_path / "typed.csv"
+        typed.write_text("label,start_s,end_s,note\nidle,0,0.5,\nwalk,0.5,1,left, then right\n", encoding="utf-8")
+        code, out = _call(f"{u}/api/labels", t, {"id": a, "path": str(typed)})
+        assert code == 200 and [s["label"] for s in out["labels"]["segments"]] == ["idle", "walk"]
+        assert out["labels"]["segments"][1]["note"] == "left, then right" and out["labels"]["notes"]
+        assert _call(f"{u}/api/labels", t, {"id": a, "path": 5})[0] == 400
+        assert _call(f"{u}/api/labels", t, {"id": a, "path": str(tmp_path / "none.csv")})[0] == 404
+        rules = tmp_path / "rules.yaml"
+        rules.write_text("rules:\n  - {label: x}\n", encoding="utf-8")
+        code, out = _call(f"{u}/api/labels", t, {"id": a, "auto": True, "rules": str(rules)})
+        assert code == 422 and "로봇 모션" in out["error"]  # no skeleton: said, and its labels stay
+        assert [s["label"] for s in _call(f"{u}/api/motion?id={a}", t)[1]["labels"]["segments"]] == ["idle", "walk"]
+        assert _call(f"{u}/api/labels", t, {"id": a, "auto": "false"})[0] == 400
+        assert _call(f"{u}/api/labels", t, {"id": a, "auto": True, "path": str(typed)})[0] == 400
+        assert _call(f"{u}/api/labels", t, {"id": a, "rules": str(rules)})[0] == 400
+        assert _call(f"{u}/api/labels", t, {"id": a, "path": None})[1]["labels"] is None
         code, out = _call(f"{u}/api/item", t, {"id": b, "offset_s": 0.25, "visible": False})
         assert code == 200 and out["offset_s"] == 0.25 and out["visible"] is False
         code, out = _call(f"{u}/api/playback", t, {"time_s": 0.5, "play": False})

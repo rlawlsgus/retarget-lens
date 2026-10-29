@@ -12,6 +12,9 @@
     POST /api/item      {"id", "visible"?, "offset_s"?, "show_human"?}
     POST /api/labels    {"id", "path"?}  labelled segments on the timeline: load this file / "path": null takes
                                          them off / no "path" reads the motion's label file again
+                        {"id", "auto": true, "rules"?}  label the motion by a rule file (the 자동 라벨 setting
+                                         when "rules" is left out; retlens.autolabel). 422 when it cannot
+                                         (robot motion, broken rules): the motion keeps its labels
     POST /api/playback  {"play"?, "time_s"?, "speed"?, "loop"?}
     GET  /api/metrics?ref=..            the 분석 table (RMSE against ref)
     POST /api/align     {"ref"}         기준에 시간 자동 정렬
@@ -163,12 +166,28 @@ class ApiBackend:
 
     def labels(self, q: dict) -> dict:
         item = self._item(q.get("id"))
-        if "path" not in q:
-            self.scene.reload_labels(item)
+        for key in ("path", "rules"):
+            if q.get(key) is not None and not isinstance(q[key], str):
+                raise ApiError(f"'{key}' must be a file path (string) or null", 400)
+        auto = q.get("auto", False)
+        if not isinstance(auto, bool):
+            raise ApiError("'auto' must be true or false", 400)
+        if auto and "path" in q:
+            raise ApiError("give \"auto\": true (labels by a rule file) or 'path' (a label file), not both", 400)
+        if "rules" in q and not auto:
+            raise ApiError("'rules' goes with \"auto\": true", 400)
+        if auto:
+            if q.get("rules") and not os.path.isfile(q["rules"]):
+                raise ApiError(f"no such file: {q['rules']}", 404)
+            lab = self.scene.auto_label(item, q.get("rules") or None)
+        elif "path" not in q:
+            lab = self.scene.reload_labels(item)
         elif q["path"] and not os.path.isfile(q["path"]):
             raise ApiError(f"no such file: {q['path']}", 404)
         else:
-            self.scene.set_labels(item, q["path"] or None)
+            lab = self.scene.set_labels(item, q["path"] or None)
+        if lab is not None and lab.auto and lab.error and lab is not item.labels:  # not put on: the motion kept its labels
+            raise ApiError(f"자동 라벨을 붙이지 못했습니다 (라벨은 그대로): {lab.error}", 422)
         return {"id": item.label, "labels": api_core.item_info(self.scene, item)["labels"]}
 
     def playback(self, q: dict) -> dict:

@@ -10,6 +10,7 @@ JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"
     retlens-cli retarget FILE --out OUT.npz # save the robot motion (+ .json)
       (commands that open motions take --smooth HZ, --foot-flat, --swing-clearance CM and --self-collision
        for human ones)
+    retlens-cli autolabel FILE [FILE ...] [--rules R.yaml] [--out DIR]   # 자동 라벨 by a rule file (no retargeting)
     retlens-cli c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
     retlens-cli physics FILE [--assist 1]   # Isaac PhysX check (needs the EULA accepted)
     retlens-cli video FILE --out X.mp4 [--physics]
@@ -112,6 +113,8 @@ def run(args) -> dict:
         from retlens.markers import marker_qc
 
         return api_core.jsonable({os.path.basename(f): marker_qc(load_c3d(f)) for f in args.files})
+    if c == "autolabel":
+        return autolabel(args)
     if c == "retarget":
         from retlens.compare import load_item
 
@@ -175,6 +178,65 @@ def _smpl():
     return settings.find_smpl().path or paths.smpl_model_dir()
 
 
+def autolabel(args) -> dict:
+    """자동 라벨 of human motions by a rule file, from their skeletons alone (no retargeting); with --out
+    each motion's segments also go to <out>/<stem>.labels.csv (put one next to its motion and RetLens shows it)."""
+    from retlens import autolabel as al
+    from retlens import motion_labels
+    from retlens.compare import find_take, load_skeleton
+
+    rules = args.rules or al.rules_file()
+    if not rules:
+        raise ValueError(f"no rule file: pass --rules, set 자동 라벨 규칙 in RetLens or ${al.ENV} "
+                         f"(an example: {al.EXAMPLE})")
+    al.check_rules(rules)  # a broken rule file stops here, not once per motion
+    csv_for = _label_csv_names(args.files, args.out) if args.out else {}
+    out = []
+    for f in args.files:
+        _log(f"labelling {f}")
+        row = {"file": os.path.abspath(f)}
+        try:
+            src = f
+            if f.lower().endswith(".c3d"):
+                src = find_take(f)
+                if src is None:
+                    raise ValueError("C3D에는 마커만 있습니다. 같은 촬영의 BVH·FBX·AMASS가 같은 폴더에 있어야 합니다")
+                row["solved_motion"] = src
+            lab = al.label_motion(load_skeleton(src, smpl_model_dir=_smpl()), rules)
+        except Exception as e:
+            lab = motion_labels.MotionLabels(path=rules, error=f"{type(e).__name__}: {e}", auto="error")
+        row["labels"] = lab.summary(segments=not args.summary)
+        if args.out and lab.segments:
+            path = csv_for[f]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            row["csv"] = motion_labels.save_csv(lab, path)
+        out.append(row)
+    return {"rules": os.path.abspath(rules), "motions": out}
+
+
+def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
+    """<out>/<stem>.labels.csv per motion. Motions of the same name (AMASS: 0000_treadmill_norm_stageii in
+    every subject's folder) keep their folders below <out>, from where their paths part; the same name in
+    the same folder (X.c3d and X.bvh) gets the extension too, so no file is written over another."""
+    by: dict[str, list[str]] = {}
+    for f in dict.fromkeys(files):
+        by.setdefault(os.path.splitext(os.path.basename(f))[0].lower(), []).append(f)
+    names = {}
+    for group in by.values():
+        dirs = [os.path.dirname(os.path.abspath(f)) for f in group]
+        try:
+            base = os.path.commonpath(dirs) if len(group) > 1 else ""
+        except ValueError:  # on different drives: C\..., D\...
+            base = None
+        for f, d in zip(group, dirs):
+            stem, ext = os.path.splitext(os.path.basename(f))
+            sub = d.replace(":", "") if base is None else os.path.relpath(d, base) if base else "."
+            same_folder = sum(x == d for x in dirs) > 1
+            name = f"{stem}{ext}.labels.csv" if same_folder else f"{stem}.labels.csv"
+            names[f] = os.path.abspath(os.path.join(out, sub, name))
+    return names
+
+
 def _retarget_options(p) -> None:
     """How human motions are retargeted (as RetLens's 리타게팅 menu; robot motions load as they are)."""
     p.add_argument("--smooth", type=float, default=6.0, metavar="HZ", help="smoothing (0 = off; default 6)")
@@ -217,6 +279,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("file")
     p.add_argument("--out", required=True)
     _retarget_options(p)
+    p = sub.add_parser("autolabel", help="자동 라벨: label human motions by a rule file (no retargeting)")
+    p.add_argument("files", nargs="+")
+    p.add_argument("--rules", default=None, help="rule file (default: the 자동 라벨 규칙 setting / $RETLENS_LABEL_RULES)")
+    p.add_argument("--out", default=None, help="folder for <stem>.labels.csv of each motion (same names: their folders below it)")
+    p.add_argument("--summary", action="store_true", help="counts and tracks only, not every segment")
     p = sub.add_parser("c3d-qc", help="raw marker QC of C3D files")
     p.add_argument("files", nargs="+")
     for name in ("physics", "video"):

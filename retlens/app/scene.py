@@ -25,7 +25,7 @@ from typing import Callable
 import numpy as np
 
 from .. import analysis, motion_labels, paths, policy_runner, settings
-from ..compare import Item, compute_metrics, load_item
+from ..compare import Item, compute_metrics, load_item, load_skeleton
 from ..diagnosis import CAUSE_KO
 from ..io import urdf_joint_limits
 from ..physics_runner import PHYSICS_CONFIG, PhysicsJob, PhysicsRunner
@@ -449,25 +449,67 @@ class MotionScene:
     def _log_labels(self, item: Item) -> None:
         lab = item.labels
         if lab is not None:
-            self.log(f"  {item.label}: labels {rel(lab.path) if lab.path else '-'}: "
+            self.log(f"  {item.label}: {'auto labels by' if lab.auto else 'labels'} {rel(lab.path) if lab.path else '-'}: "
                      + (lab.error or f"{len(lab.segments)} segments in {len(lab.tracks)} track(s)")
                      + "".join(f"; {n}" for n in lab.notes))
 
     def set_labels(self, item: Item, path: str | None):
         """Show this label file's segments on the motion (None: no labels; files are never changed)."""
-        item.labels = None if not path else motion_labels.load(path, item.source, item.robot.fps,
-                                                               item.robot.duration)
+        solved = item.info.get("solved_motion")  # a C3D goes by its solved motion's name in seq too
+        item.labels = None if not path else motion_labels.load(path, item.source, item.robot.fps, item.robot.duration,
+                                                               also=[solved] if solved else ())
         self._log_labels(item)
         self.emit("item", item)
         return item.labels
 
     def reload_labels(self, item: Item):
-        """Read the motion's label file again (after editing it), or look for one next to it."""
+        """Read the motion's label file again (after editing it), or look for one next to it;
+        automatic labels are made again with their rule file (kept as they were if that fails: the
+        labels returned then carry the error)."""
+        if item.labels is not None and item.labels.auto:
+            return self.auto_label(item, item.labels.path or None)
         if item.labels is not None and item.labels.path:
             return self.set_labels(item, item.labels.path)
         self._find_labels(item)
         self.emit("item", item)
         return item.labels
+
+    def auto_label(self, item: Item, rules: str | None = None):
+        """Label the motion by a rule file (retlens.autolabel): rules, else the 자동 라벨 규칙 setting.
+        When that cannot be done (no human skeleton, no rule file or a broken one, too short) the
+        motion keeps the labels it had: the labels returned carry the error and are not put on it."""
+        from .. import autolabel
+
+        rules = rules or autolabel.rules_file()
+        try:
+            if not rules:
+                raise ValueError("자동 라벨 규칙 파일이 정해지지 않았습니다 (인스펙터 > 라벨 > 규칙 파일...)")
+            lab = autolabel.label_motion(self._skeleton(item), rules, duration=item.robot.duration)
+        except Exception as e:
+            lab = motion_labels.MotionLabels(path=rules or "", error=str(e) or type(e).__name__,
+                                             auto=os.path.splitext(os.path.basename(rules or ""))[0] or "규칙")
+        if lab.error:
+            self.log(f"  {item.label}: no auto labels ({lab.error}); its labels stay as they were")
+            return lab
+        item.labels = lab
+        self._log_labels(item)
+        self.emit("item", item)
+        return lab
+
+    def has_skeleton(self, item: Item) -> bool:
+        """A human skeleton to label: its own, or for C3D markers the solved take's (not a robot motion)."""
+        h = item.human
+        return (h is not None and h.kind == "skeleton") or bool(item.info.get("solved_motion"))
+
+    def _skeleton(self, item: Item):
+        """The motion's human skeleton: its own, or for C3D markers the solved take's."""
+        h = item.human
+        if h is not None and h.kind == "skeleton":
+            return h
+        solved = item.info.get("solved_motion")
+        if solved:
+            return load_skeleton(solved, smpl_model_dir=self.opts.smpl_model_dir)
+        raise ValueError("사람 골격이 없는 로봇 모션입니다. 자동 라벨은 BVH·FBX·AMASS 모션에 붙습니다")
 
     def set_visible(self, item: Item, value: bool) -> None:
         item.visible = bool(value)
@@ -554,9 +596,11 @@ class MotionScene:
         worst = max(regions, key=regions.get) if regions else None
         self.compare_now = {"mean": float(dev.mean()), "regions": regions, "worst": worst,
                             "over": int((dev > c.tol_cm).sum()), "parts": K}
-        lab = self.items[b].handles.get("label")
-        if lab is not None:  # above A's label, where B is drawn
-            lab.position = T_base[a][:3, 3] + np.array([0.0, 0.0, 1.05])
+        tag = T_base[a][:3, 3] + np.array([0.0, 0.0, 1.05])  # above A's label, where B is drawn
+        for key in ("label", "now"):  # B's segment label is in its name tag (_pose), or with names hidden here
+            h = self.items[b].handles.get(key)
+            if h is not None:
+                h.position = tag
 
     def _poses_at(self, item: Item, src: Item, local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Base transforms (F, 4, 4) in display space and robot-model joint values (F, joints)
@@ -856,9 +900,12 @@ class MotionScene:
                 text += self._result_tag(src) + (f" · {note}" if note else "")
         if role is not None:
             text += " · 비교 기준 (반투명)" if role == "A" else " · 비교 대상 (벗어난 부위만 색칠)"
+        # one track per line: tags of robots side by side stay narrow
+        now = item.labels.text_at(local, "\n") if item.labels is not None and inside and v.show_label_now else ""
+        if role == "B" and now and v.show_labels:  # B is drawn on A, between A's tags: one tag for B
+            text, now = f"{text}\n{now}", ""
         if h.get("label_text") != text:  # one message less per robot per frame
             h["label"].text = h["label_text"] = text
-        now = item.labels.text_at(local) if item.labels is not None and inside and v.show_label_now else ""
         self._set_visible(item, "now", bool(now))  # hidden where nothing is labelled
         if now:
             h["now"].position = tag

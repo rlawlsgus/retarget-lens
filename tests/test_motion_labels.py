@@ -152,3 +152,90 @@ def test_each_label_keeps_its_own_color(monkeypatch):
 @pytest.mark.parametrize("name", ["02_01.labels.csv", "02_01_labels.json", "02_01_subtask.csv", "labels.csv"])
 def test_label_names(name):
     assert ml.is_label_name(f"C:/data/{name}")
+
+
+def test_rows_with_more_values_than_columns(tmp_path):
+    """A trailing comma or a comma in a note without quotes: read, not an exception (window / API)."""
+    src = _motion(tmp_path)
+    p = _write(tmp_path / "a.csv", "label,start_s,end_s,note\nwalk,0,1,\nturn,1,2,left, then right\nback,2,3,x,\n")
+    lab = ml.load(p, src, FPS, DUR)
+    assert not lab.error and [(s.label, s.note) for s in lab.segments] == [
+        ("walk", ""), ("turn", "left, then right"), ("back", "x")]  # an empty extra value is no extra
+    assert any("마지막 열(note)에 이어 붙였습니다" in n for n in lab.notes)
+    p = _write(tmp_path / "b.csv", "label,start_s,end_s\nwalk,0,1,,\nturn,1,2,9\n")  # no text column last: left out
+    lab = ml.load(p, src, FPS, DUR)
+    assert [(s.label, s.end) for s in lab.segments] == [("walk", 1.0), ("turn", 2.0)]
+    assert any("1개: 넘친 값은 버렸습니다" in n for n in lab.notes)
+    p = _write(tmp_path / "c.csv", "label,start_frame,end_frame\nwalk,0,inf\nturn,nan,3\nrun,-30,29\nlate,-60,-31\n")
+    lab = ml.load(p, src, FPS, DUR)  # inf frames used to raise OverflowError
+    assert [(s.label, s.start, s.end) for s in lab.segments] == [("run", 0.0, 1.0)]
+    assert any("2개는 뺐습니다" in n for n in lab.notes) and any("1개 뺌, 1개 앞을 자름" in n for n in lab.notes)
+
+
+def test_folder_tables_need_seq_and_say_when_broken(tmp_path):
+    src = _motion(tmp_path)
+    _motion(tmp_path, "02_02.bvh")
+    table = _write(tmp_path / "motions" / "labels.csv", "label,start_s,end_s\nwalk,0,1\n")  # no seq: whose rows?
+    lab = ml.load_for(src, FPS, DUR)
+    assert lab is not None and "seq 열이 없습니다" in lab.error and not lab.segments  # ⚠ on the motion, not silence
+    _write(table, "seq,start_s,end_s\n02_01,0,1\n")  # broken: no label column
+    assert "label 열이 없습니다" in ml.load_for(src, FPS, DUR).error
+    _write(table, "seq,label,start_s,end_s\n02_02,walk,0,1\n")  # fine, but not this motion's
+    assert ml.load_for(src, FPS, DUR) is None
+    assert ml.load(table, src, FPS, DUR, table=True) is None
+
+
+def test_a_file_of_another_motion_is_not_taken_whole(tmp_path):
+    src = _motion(tmp_path)
+    other = _write(tmp_path / "x.csv", "seq,label,start_s,end_s\nCMU/02/02_03_stageii.npz,walk,0,1\n")
+    lab = ml.load(other, src, FPS, DUR)
+    assert "이 모션(02_01)의 행이 없습니다" in lab.error and not lab.segments
+    same = _write(tmp_path / "y.csv", "seq,label,start_s,end_s\nCMU/02/02_01_stageii.npz,walk,0,1\n,turn,1,2\n")
+    lab = ml.load(same, src, FPS, DUR)  # the AMASS fit of the same take; rows without seq belong to it too
+    assert not lab.error and [s.label for s in lab.segments] == ["walk", "turn"]
+    _write(tmp_path / "motions" / "labels.csv", "seq,label,start_s,end_s\nCMU/02/02_01_stageii.npz,walk,0,1\n")
+    assert [s.label for s in ml.load_for(src, FPS, DUR).segments] == ["walk"]  # a labeller's table next to BVHs
+
+
+def test_a_c3d_finds_its_solved_motions_folder_table(tmp_path):
+    solved = _write(tmp_path / "solved" / "take1.bvh", "HIERARCHY")
+    c3d = _write(tmp_path / "markers" / "take1.c3d", "x")
+    _write(tmp_path / "solved" / "labels.csv", "seq,label,start_s,end_s\ntake1,reach,0,1\ntake2,walk,0,1\n")
+    assert ml.load_for(c3d, FPS, DUR) is None
+    lab = ml.load_for(c3d, FPS, DUR, also=[solved])
+    assert [s.label for s in lab.segments] == ["reach"]
+    # a C3D named unlike its solved motion: its rows are found by the solved motion's name
+    other = _write(tmp_path / "markers" / "session3_take1.c3d", "x")
+    assert [s.label for s in ml.load_for(other, FPS, DUR, also=[solved]).segments] == ["reach"]
+    table = str(tmp_path / "solved" / "labels.csv")
+    assert "이 모션(session3_take1)의 행이 없습니다" in ml.load(table, other, FPS, DUR).error  # picked by hand
+    assert [s.label for s in ml.load(table, other, FPS, DUR, also=[solved]).segments] == ["reach"]
+
+
+def test_at_matches_a_plain_scan(monkeypatch):
+    """at() looks segments up by start (every frame, every motion); the same answer as looking at all of them."""
+    import random
+
+    rnd = random.Random(1)
+    segs = []
+    for track in ("이동", "왼손", ""):
+        t = 0.0
+        for _ in range(300):
+            a = t + rnd.choice([0.0, 0.0, 0.2, -0.3])  # gaps and overlaps
+            b = a + rnd.uniform(0.05, 1.5)
+            segs.append(ml.Segment(rnd.choice("abc"), max(0.0, a), b, track=track))
+            t = b
+    segs.sort(key=lambda s: (s.track, s.start))
+    lab = ml.MotionLabels(path="", segments=segs)
+
+    def scan(t):
+        now = {}
+        for s in sorted(segs, key=lambda s: s.start):
+            if s.start <= t < s.end:
+                now[s.track] = s
+        return [now[k] for k in lab.tracks if k in now]
+
+    for t in [rnd.uniform(-1, 400) for _ in range(2000)] + [s.start for s in segs[:50]] + [s.end for s in segs[:50]]:
+        assert lab.at(t) == scan(t), t
+    lab.segments = segs[:10]  # a new list: looked up again
+    assert lab.tracks == [segs[0].track]

@@ -190,12 +190,7 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
         with open(cached[:-4] + ".json", "w", encoding="utf-8") as f:
             json.dump(info, f, indent=1, ensure_ascii=False, default=float)
         m = load_motion(cached)
-    if fmt == "smplx":
-        human = load_amass_npz(path, model_dir=smpl_model_dir or os.environ.get("SMPL_MODEL_DIR"), body_only=True)
-    elif fmt == "fbx":
-        human = load_fbx(path)
-    else:
-        human = load_bvh(path)
+    human = load_skeleton(path, fmt, smpl_model_dir)
     label_fmt = {"tpose": "BVH", "fbx": "FBX", "lafan1": "BVH LAFAN1", "nokov": "BVH Nokov", "smplx": "SMPL-X"}[fmt]
     smooth_txt = f", smooth {smooth:g} Hz" if smooth else ""
     if foot_flat:
@@ -208,6 +203,18 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
                 human=human, info=info, retarget={"smooth_hz": smooth, "foot_flat": bool(foot_flat),
                                                   "swing_clearance_cm": round(100 * swing_clearance, 3),
                                                   "self_collision": bool(self_collision)})
+
+
+def load_skeleton(path: str, fmt: str | None = None, smpl_model_dir: str | None = None) -> SkeletonMotion:
+    """The human skeleton of a BVH / FBX / AMASS SMPL-X file, as drawn next to its robot."""
+    fmt = fmt or human_format(path)
+    if fmt == "smplx":
+        return load_amass_npz(path, model_dir=smpl_model_dir or os.environ.get("SMPL_MODEL_DIR"), body_only=True)
+    if fmt == "fbx":
+        return load_fbx(path)
+    if fmt is None:
+        raise ValueError(f"{os.path.basename(path)}: 사람 모션 파일이 아닙니다")
+    return load_bvh(path)
 
 
 def find_take(path: str, files: list[str] | None = None) -> str | None:

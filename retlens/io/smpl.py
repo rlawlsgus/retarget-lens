@@ -112,7 +112,8 @@ def load_amass_npz(
             "SMPL body-model files are required to compute joints from AMASS npz. "
             "Pass --smpl-model-dir or set SMPL_MODEL_DIR (see retlens/io/smpl.py)."
         )
-    rest, parents = _rest_joints(_find_model_file(model_dir, model_type, gender), betas)
+    model_path = _find_model_file(model_dir, model_type, gender)
+    rest, parents = _rest_joints(model_path, betas)
 
     n_j = min(len(parents), poses.shape[1] // 3)
     rest, parents = rest[:n_j], parents[:n_j]
@@ -133,7 +134,9 @@ def load_amass_npz(
     if body_only:
         g_pos, g_rot, rest, parents, names = g_pos[:, :22], g_rot[:, :22], rest[:22], parents[:22], names[:22]
 
-    meta = {"format": "amass_npz", "model_type": model_type, "gender": gender}
+    # model_path / betas: body sizes for the movement tracks (retlens.autolabel.body)
+    meta = {"format": "amass_npz", "model_type": model_type, "gender": gender, "model_path": model_path,
+            "betas": betas.tolist()}
     if with_rotations:
         n = len(names)
         meta["rest_pose"] = ((rest - rest[0]) @ Y_UP_TO_Z_UP.T, np.broadcast_to(Y_UP_TO_Z_UP, (n, 3, 3)).copy())

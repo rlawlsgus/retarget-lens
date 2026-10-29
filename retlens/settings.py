@@ -63,6 +63,7 @@ class Settings:
     gmt_dir: str = ""  # GMT folder (assets\pretrained_checkpoints\pretrained.pt); empty = the usual places
     api_enabled: bool = True  # the window's local HTTP API for AI agents (127.0.0.1 + token, retlens/app/api_server.py)
     api_port: int = 8765
+    label_rules: str = ""  # 자동 라벨 rule file (retlens.autolabel); empty = $RETLENS_LABEL_RULES
 
 
 def settings_path() -> str:
