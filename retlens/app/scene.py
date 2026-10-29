@@ -466,10 +466,11 @@ class MotionScene:
         """Read the motion's label file again (after editing it), or look for one next to it;
         automatic labels are made again with their rule file (kept as they were if that fails: the
         labels returned then carry the error)."""
-        if item.labels is not None and item.labels.auto:
-            return self.auto_label(item, item.labels.path or None)
-        if item.labels is not None and item.labels.path:
-            return self.set_labels(item, item.labels.path)
+        lab = item.labels
+        if lab is not None and lab.auto:
+            return self.auto_label(item, lab.path or None)
+        if lab is not None and lab.path:
+            return self.set_labels(item, lab.path)
         self._find_labels(item)
         self.emit("item", item)
         return item.labels
@@ -901,7 +902,8 @@ class MotionScene:
         if role is not None:
             text += " · 비교 기준 (반투명)" if role == "A" else " · 비교 대상 (벗어난 부위만 색칠)"
         # one track per line: tags of robots side by side stay narrow
-        now = item.labels.text_at(local, "\n") if item.labels is not None and inside and v.show_label_now else ""
+        labels = item.labels  # read once: opening and the API replace it from other threads
+        now = labels.text_at(local, "\n") if labels is not None and inside and v.show_label_now else ""
         if role == "B" and now and v.show_labels:  # B is drawn on A, between A's tags: one tag for B
             text, now = f"{text}\n{now}", ""
         if h.get("label_text") != text:  # one message less per robot per frame

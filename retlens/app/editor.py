@@ -440,14 +440,15 @@ class InspectorPanel(QScrollArea):
     def _build_labels(self, lay: QVBoxLayout, item: Item) -> None:
         """Where the motion's labels come from (or why there are none), load / reload / remove, and
         its segments (a click goes to the segment's start)."""
-        self._labels_shown = item.labels  # refresh() rebuilds when they change (menu, API, drop)
-        info = QLabel(labels_text(item))
+        # read once (other threads replace them); refresh() rebuilds when they change (menu, API, drop)
+        self._labels_shown = lab = item.labels
+        info = QLabel(labels_text(item, lab))
         info.setWordWrap(True)
         info.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        if item.labels is None or item.labels.error:
-            info.setStyleSheet("color: gray" if item.labels is None else "color: rgb(230,150,60)")
+        if lab is None or lab.error:
+            info.setStyleSheet("color: gray" if lab is None else "color: rgb(230,150,60)")
         lay.addWidget(info)
-        segs = item.labels.segments if item.labels is not None else []
+        segs = lab.segments if lab is not None else []
         rules = autolabel.rules_file()
         for buttons in (
                 (("불러오기...", "CSV·JSON 라벨 파일을 골라 이 모션에 붙입니다(파일은 바꾸지 않음)",
@@ -456,7 +457,7 @@ class InspectorPanel(QScrollArea):
                                "붙은 파일이 없으면 모션 옆에서 다시 찾습니다",
                   lambda: self.win.reload_labels(item), True),
                  ("빼기", "이 모션에서 라벨을 뺍니다(파일은 그대로)", lambda: self.win.scene.set_labels(item, None),
-                  item.labels is not None)),
+                  lab is not None)),
                 (("자동 라벨", ("규칙 파일대로 이 모션의 사람 동작을 보고 라벨을 붙입니다"
                                 + (f"\n규칙: {rules}" if rules else "\n(규칙 파일을 먼저 고릅니다)"))
                   if self.win.scene.has_skeleton(item) else "사람 골격이 없는 로봇 모션에는 붙지 않습니다",
@@ -475,9 +476,9 @@ class InspectorPanel(QScrollArea):
             lay.addLayout(row)
         if not segs:
             return
-        multi = len(item.labels.tracks) > 1 or bool(item.labels.tracks[0])
+        multi = len(lab.tracks) > 1 or bool(lab.tracks[0])
         table = QTableView()
-        model = SegmentModel(item, multi, table)  # rows are made as they scroll into view: a long take has thousands
+        model = SegmentModel(item, segs, multi, table)  # rows are made as they scroll into view: a long take has thousands
         table.setModel(model)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(22)
@@ -623,13 +624,16 @@ class TimelineTracks(QWidget):
         rows = self._rows()
         return QSize(600, (rows[-1][1] + rows[-1][2] if rows else self.RULER_H + self.ROW_H) + 4)
 
-    def _rows(self) -> list[tuple[Item, int, int, list[str]]]:
-        """(motion, top, height, label tracks) per row: a motion with labels is taller by its lanes."""
+    def _rows(self) -> list[tuple]:
+        """(motion, top, height, label tracks, labels) per row: a motion with labels is taller by its
+        lanes. The labels are the ones the row was laid out with: motions get new labels from other
+        threads (opening, the API) while this draws, so everything after reads them from here."""
         out, y = [], self.RULER_H
         for it in list(self.win.scene.items):
-            tracks = it.labels.tracks if it.labels is not None else []
+            labels = it.labels
+            tracks = labels.tracks if labels is not None else []
             h = self.ROW_H + self.LANE_H * len(tracks)
-            out.append((it, y, h, tracks))
+            out.append((it, y, h, tracks, labels))
             y += h
         return out
 
@@ -637,18 +641,20 @@ class TimelineTracks(QWidget):
         return next((r for r in self._rows() if r[1] <= y < r[1] + r[2]), None)
 
     def _seg_rect(self, it: Item, y: int, lane: dict, s, span, dur: float) -> QRectF | None:
-        """Where a segment is drawn: clipped to what plays (a physics result may be shorter); None past its end."""
-        if s.start >= dur:
+        """Where a segment is drawn: clipped to what plays (a physics result may be shorter); None past
+        its end or in no lane of the row."""
+        k = lane.get(s.track)
+        if s.start >= dur or k is None:
             return None
         x0, x1 = self._x(it.offset + s.start, span), self._x(it.offset + min(s.end, dur), span)
-        return QRectF(x0, y + self.ROW_H - 1 + lane[s.track] * self.LANE_H, max(1.0, x1 - x0), self.LANE_H - 3)
+        return QRectF(x0, y + self.ROW_H - 1 + k * self.LANE_H, max(1.0, x1 - x0), self.LANE_H - 3)
 
-    def _segments(self, it: Item, y: int, tracks: list[str], span=None):
+    def _segments(self, it: Item, labels, y: int, tracks: list[str], span=None):
         """(segment, rect) of a motion's labels as drawn."""
         span = span or self._span()
         dur = self.win.scene.shown(it).robot.duration
         lane = {t: k for k, t in enumerate(tracks)}
-        for s in it.labels.segments:
+        for s in labels.segments:
             r = self._seg_rect(it, y, lane, s, span, dur)
             if r is not None:
                 yield s, r
@@ -659,7 +665,7 @@ class TimelineTracks(QWidget):
         row = self._row_at(pos.y())
         if row is None or not row[3] or pos.x() < self.NAME_W:
             return None
-        it, y, _h, tracks = row
+        it, y, _h, tracks, labels = row
         k = int((pos.y() - (y + self.ROW_H - 1)) // self.LANE_H)
         if not 0 <= k < len(tracks):
             return None
@@ -669,7 +675,7 @@ class TimelineTracks(QWidget):
         t = self._t(pos.x()) - it.offset
         for local in (t, t - px, t + px):
             if 0.0 <= local < dur:
-                hit = next((s for s in it.labels.at(local) if s.track == tracks[k]), None)
+                hit = next((s for s in labels.at(local) if s.track == tracks[k]), None)
                 if hit is not None:
                     return it, hit
         return None
@@ -716,10 +722,10 @@ class TimelineTracks(QWidget):
         sc, span = self.win.scene, key[3]
         p.setPen(QPen(self.palette().color(QPalette.Text), 1.5))
         p.setBrush(Qt.NoBrush)
-        for it, y, _h, tracks in self._rows():  # the segment being played in each lane: outlined
+        for it, y, _h, tracks, labels in self._rows():  # the segment being played in each lane: outlined
             if tracks:
                 lane, dur = {t: k for k, t in enumerate(tracks)}, sc.shown(it).robot.duration
-                for s in it.labels.at(sc.t - it.offset):
+                for s in labels.at(sc.t - it.offset):
                     r = self._seg_rect(it, y, lane, s, span, dur)
                     if r is not None:
                         p.drawRect(r.adjusted(1, 1, -1, -1))
@@ -747,10 +753,10 @@ class TimelineTracks(QWidget):
             p.drawText(int(x) + 3, self.RULER_H - 8, f"{t:g}s")
             t += step
         sc, sel = self.win.scene, self.win.selected
-        for it, y, h, tracks in self._rows():
+        for it, y, h, tracks, labels in self._rows():
             if it is sel:
                 p.fillRect(0, y, self.width(), h, pal.color(QPalette.Highlight).darker(250))
-            broken = it.labels is not None and bool(it.labels.error)  # its label file could not be used: say so
+            broken = labels is not None and bool(labels.error)  # its label file could not be used: say so
             p.setPen(QColor(230, 150, 60) if broken else text)
             p.drawText(QRectF(6, y, self.NAME_W - 10, self.ROW_H), Qt.AlignVCenter | Qt.AlignLeft,
                        f"⚠ {it.label}" if broken else it.label)
@@ -762,14 +768,14 @@ class TimelineTracks(QWidget):
             x0, x1 = self._x(it.offset, span), self._x(it.offset + dur, span)
             p.drawRoundedRect(QRectF(x0, y + 4, max(2.0, x1 - x0), self.ROW_H - 8), 3, 3)
             if tracks:
-                self._paint_labels(p, it, y, tracks, small, span)
+                self._paint_labels(p, it, labels, y, tracks, small, span)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(230, 40, 40))
             for ft, _cause in sc.falls(it):
                 x = self._x(it.offset + ft, span)
                 p.drawPolygon([QPointF(x - 4, y + 2), QPointF(x + 4, y + 2), QPointF(x, y + 9)])
 
-    def _paint_labels(self, p: QPainter, it: Item, y: int, tracks: list[str], font: QFont, span) -> None:
+    def _paint_labels(self, p: QPainter, it: Item, labels, y: int, tracks: list[str], font: QFont, span) -> None:
         """The motion's segments, one lane per track: label colors, the label written in when it fits
         (the segment being played is outlined over this by paintEvent)."""
         pal = self.palette()
@@ -780,7 +786,7 @@ class TimelineTracks(QWidget):
                            Qt.AlignVCenter | Qt.AlignLeft, tr or "-")
         fm = QFontMetrics(font)
         gap = QPen(pal.color(QPalette.Base), 1)  # a thin gap between neighbouring segments
-        for s, r in self._segments(it, y, tracks, span):
+        for s, r in self._segments(it, labels, y, tracks, span):
             c = QColor(*motion_labels.color_for(s))
             c.setAlpha(230 if it.visible else 80)
             p.setPen(gap)
@@ -834,8 +840,9 @@ class TimelineTracks(QWidget):
         if hit is not None:
             return segment_text(*hit)
         row = self._row_at(pos.y())
-        if row is not None and pos.x() < self.NAME_W and row[0].labels is not None and row[0].labels.error:
-            return f"라벨 파일을 쓰지 못함: {row[0].labels.error}"
+        labels = row[4] if row is not None else None
+        if pos.x() < self.NAME_W and labels is not None and labels.error:
+            return f"라벨 파일을 쓰지 못함: {labels.error}"
         return ""
 
     def _fall_at(self, pos) -> str:
@@ -914,10 +921,11 @@ class TimelinePanel(QWidget):
         if self.time.text() != text:
             self.time.setText(text)
         it, now = self.win.selected, ""
-        if it is not None and it.labels is not None and it.labels.segments:
+        labels = it.labels if it is not None else None  # read once: other threads replace it
+        if labels is not None and labels.segments:
             local = sc.t - it.offset
             now = ("(범위 밖)" if not 0.0 <= local <= sc.shown(it).robot.duration else
-                   it.labels.text_at(local) or "(라벨 없는 구간)")
+                   labels.text_at(local) or "(라벨 없는 구간)")
         if self.now.text() != now:
             self.now.setText(now)
         if self._playing != sc.playing:  # setIcon repaints the button and lays out the bar again
@@ -1582,9 +1590,9 @@ def help_button(text: str, html: str) -> QToolButton:
 class SegmentModel(QAbstractTableModel):
     """The inspector's list of a motion's segments: track (with several), label, start, end."""
 
-    def __init__(self, it: Item, multi: bool, parent=None):
+    def __init__(self, it: Item, segs: list, multi: bool, parent=None):
         super().__init__(parent)
-        self.it, self.segs, self.multi = it, it.labels.segments, multi
+        self.it, self.segs, self.multi = it, segs, multi
         self.heads = (["트랙"] if multi else []) + ["라벨", "시작 (s)", "끝 (s)"]
         self._icons: dict[tuple, QIcon] = {}
 
@@ -1640,9 +1648,8 @@ def _motion_for_label(label: str, motions: list[str], prefer: str | None = None)
     return pick[0] if pick else None
 
 
-def labels_text(it: Item) -> str:
-    """The inspector's line about a motion's labels: where they come from, or why there are none."""
-    lab = it.labels
+def labels_text(it: Item, lab=None) -> str:
+    """The inspector's line about a motion's labels (lab: as read once by the caller; None: none)."""
     if lab is None:
         stem = os.path.splitext(os.path.basename(it.source))[0]
         return (f"라벨 파일이 없습니다. 모션 옆에 {stem}.labels.csv 같은 파일을 두면 열 때 붙고, 아래 '불러오기'나 "

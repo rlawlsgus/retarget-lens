@@ -146,7 +146,7 @@ def test_the_timeline_repaints_on_change_and_scrolls(monkeypatch):
     from PySide6.QtCore import QPointF
 
     tr = panel.tracks
-    it, y, _h, tracks = tr._rows()[1]
+    it, y, _h, tracks, _labels = tr._rows()[1]
     lane_y = y + tr.ROW_H - 1 + tracks.index("왼손") * tr.LANE_H + 5
     hit = tr.segment_at(QPointF(tr._x(it.offset + 10.1), lane_y))
     assert hit is not None and hit[0] is it and hit[1].track == "왼손" and hit[1].start == 10.0
@@ -154,11 +154,49 @@ def test_the_timeline_repaints_on_change_and_scrolls(monkeypatch):
     assert tr.segment_at(QPointF(20, lane_y)) is None  # the names column
 
 
+class _Swapping:
+    """A motion whose labels another thread replaces between any two reads (opening, the API): each
+    read gets the other label set, with other tracks."""
+
+    def __init__(self, a, b):
+        self._labs, self._n = (a, b), 0
+        self.label, self.source, self.offset, self.visible, self.color = "swap", "swap.bvh", 0.0, True, (90, 90, 90)
+        self.robot = _Robot(240.0)
+
+    @property
+    def labels(self):
+        self._n += 1
+        return self._labs[self._n % 2]
+
+
+def test_labels_replaced_while_the_timeline_draws():
+    """It used to read a motion's labels several times per paint: lanes from one set, segments from the
+    next -> KeyError in paintEvent (seen when the API put automatic labels on while the window drew)."""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QPainter, QPixmap
+
+    file_labels, auto_labels = _item("a", [""]).labels, _item("b", ["동작", "이동"]).labels
+    swap = _Swapping(file_labels, auto_labels)
+    win = types.SimpleNamespace(scene=_Scene([swap]), selected=swap)
+    panel = editor.TimelinePanel(win)
+    panel.resize(1200, 200)
+    tr = panel.tracks
+    for _ in range(4):  # both orders
+        pm = QPixmap(1200, 200)
+        p = QPainter(pm)
+        tr._paint_layer(p, tr._span())
+        p.end()
+        panel.refresh()
+        for y in range(tr.RULER_H, 120, 5):
+            tr.segment_at(QPointF(400, y))
+            tr._label_tip(QPointF(20, y))
+
+
 def test_the_inspectors_segment_list_is_made_as_it_is_shown():
     from PySide6.QtCore import Qt
 
     it = _item("long", ["이동", "왼손"])
-    m = editor.SegmentModel(it, multi=True)
+    m = editor.SegmentModel(it, it.labels.segments, multi=True)
     assert m.rowCount() == 1920 and m.columnCount() == 4 and m.heads[0] == "트랙"
     idx = m.index(961, 0)
     assert m.data(idx) == "왼손" and m.data(m.index(961, 1)) == "b" and m.data(m.index(961, 3)) == "0.50"

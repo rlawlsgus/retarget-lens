@@ -107,7 +107,8 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
         out["c3d"] = item.info["c3d"]
         out["solved_motion"] = item.info.get("solved_motion")
     # labelled time segments (retlens.motion_labels): None = no label file; "now" at the scene's time
-    out["labels"] = item.labels.summary(scene.t - item.offset, segments=metrics) if item.labels is not None else None
+    labels = item.labels  # read once: the window's threads may replace it meanwhile
+    out["labels"] = labels.summary(scene.t - item.offset, segments=metrics) if labels is not None else None
     if metrics:
         out["metrics"] = {k: v for k, v in m.items() if not k.startswith("_") and k not in ("qc", "qc_notes")}
     if scene.physics_on or item.handles.get("phys"):
