@@ -25,7 +25,8 @@ relabels the last n steps of a from-stretch that runs into a to-stretch (walking
 
 A single lane may also be written with rules (and min_seg, approach) at the top instead of tracks.
 Track names and values are checked against segment.VALUES, so a misspelt one is an error, not a
-rule that never holds.
+rule that never holds; so is a key written twice (the second would silently replace the first).
+min_seg joins short labelled pieces to a labelled neighbour; frames no rule labels stay unlabelled.
 """
 
 from __future__ import annotations
@@ -41,10 +42,48 @@ from . import segment
 
 RULE_KEYS = {"label", "name", "color", "when", "then", "within"}
 TRACK_KEYS = {"track", "rules", "min_seg", "approach", "axis", "skip"}
+MAX_NUMBER = 1e5  # s or steps: no time in a rule file is longer than a day (bigger ones overflow frame counts)
+# YAML errors by kind, with no text of the file (PyYAML's own message quotes it)
+YAML_KINDS = {"ScannerError": "들여쓰기·따옴표·특수 문자", "ParserError": "목록·표의 구조",
+              "ComposerError": "목록·표의 구조", "ConstructorError": "쓸 수 없는 태그나 별칭"}
 
 
 class RuleError(ValueError):
     pass
+
+
+def _no_repeats(pairs):
+    """A JSON object whose keys are all different."""
+    seen = {}
+    for k, v in pairs:
+        if k in seen:
+            raise RuleError(f"읽지 못함: 같은 항목 '{k}'이(가) 한 표에 두 번 있습니다")
+        seen[k] = v
+    return seen
+
+
+def _yaml_loader():
+    """yaml.SafeLoader that refuses a key written twice in one mapping."""
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def mapping(loader, node, deep=False):
+        seen = set()
+        for k, _ in node.value:
+            key = loader.construct_object(k, deep=deep)
+            try:
+                repeat = key in seen
+                seen.add(key)
+            except TypeError:  # a list or table as a key: SafeLoader says so
+                continue
+            if repeat:
+                raise RuleError(f"읽지 못함: 같은 항목 '{key}'이(가) 한 표에 두 번 있습니다 ({k.start_mark.line + 1}행)")
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    return Loader
 
 
 def load(path: str) -> dict:
@@ -62,26 +101,26 @@ def load(path: str) -> dict:
             raise RuleError("읽지 못함: UTF-8도 CP949도 아닌 글자가 있습니다") from None
     if os.path.splitext(path)[1].lower() == ".json":
         try:
-            data = json.loads(text)
+            data = json.loads(text, object_pairs_hook=_no_repeats)
         except json.JSONDecodeError as e:
             raise RuleError(f"읽지 못함: JSON 형식 오류 ({e.lineno}행 {e.colno}열)") from None
     else:
         import yaml
 
         try:
-            data = yaml.safe_load(text)
+            data = yaml.load(text, Loader=_yaml_loader())
         except yaml.YAMLError as e:
             mark = getattr(e, "problem_mark", None)
             where = f" ({mark.line + 1}행 {mark.column + 1}열)" if mark is not None else ""
-            raise RuleError(f"읽지 못함: YAML 형식 오류{where}: {getattr(e, 'problem', None) or '형식이 맞지 않음'}") from None
+            raise RuleError(f"읽지 못함: YAML 형식 오류{where}: {YAML_KINDS.get(type(e).__name__, '형식이 맞지 않음')}") from None
     return check(data)
 
 
 def _num(v, where: str, lo: float = 0.0, integer: bool = False) -> float:
-    """A number the rules give (seconds, steps): finite and at least lo; RuleError otherwise."""
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < lo or \
+    """A number the rules give (seconds, steps): finite, at least lo and at most MAX_NUMBER; RuleError otherwise."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo <= v <= MAX_NUMBER or \
             (integer and v != int(v)):
-        raise RuleError(f"{where}: {lo:g} 이상의 {'정수' if integer else '숫자'}여야 합니다 (받은 값: {v!r})")
+        raise RuleError(f"{where}: {lo:g} 이상 {MAX_NUMBER:g} 이하의 {'정수' if integer else '숫자'}여야 합니다 (받은 값: {v!r})")
     return int(v) if integer else float(v)
 
 
@@ -101,8 +140,9 @@ def check(data) -> dict:
     unknown = set(data) - {"name", "params", "tracks"} - TRACK_KEYS
     if unknown:
         raise RuleError(f"모르는 항목: {', '.join(sorted(map(str, unknown)))}")
-    if "tracks" in data and ("rules" in data or "axis" in data):
-        raise RuleError("tracks와 rules를 함께 쓸 수 없습니다 (레인 하나면 rules만, 여럿이면 tracks)")
+    top = sorted(TRACK_KEYS & set(data))
+    if "tracks" in data and top:  # they would belong to no lane and do nothing
+        raise RuleError(f"tracks가 있으면 맨 위에 {', '.join(top)}를 쓸 수 없습니다 (레인 하나면 tracks 없이, 여럿이면 각 레인 안에)")
     tracks = data.get("tracks")
     if tracks is None:
         tracks = [{k: data[k] for k in TRACK_KEYS if k in data}]
@@ -112,6 +152,10 @@ def check(data) -> dict:
         params = segment.params(data.get("params"))
     except ValueError as e:
         raise RuleError(str(e)) from e
+    for group, vals in (data.get("params") or {}).items():
+        for k, v in vals.items():
+            if v > MAX_NUMBER:
+                raise RuleError(f"params.{group}.{k}: {MAX_NUMBER:g} 이하여야 합니다 (받은 값: {v!r})")
     out = {"name": str(data.get("name") or ""), "params": params, "tracks": []}
     for i, t in enumerate(tracks):
         where = f"tracks[{i}]"
@@ -152,7 +196,8 @@ def check(data) -> dict:
 
 
 def _rule(r, where) -> dict:
-    if not isinstance(r, dict) or not str(r.get("label") or "").strip() or isinstance(r.get("label"), (list, dict)):
+    label = r.get("label") if isinstance(r, dict) else None
+    if label is None or isinstance(label, (bool, list, dict)) or not str(label).strip():
         raise RuleError(f"{where}: label이 있어야 합니다")
     bad = set(r) - RULE_KEYS
     if bad:
@@ -194,7 +239,7 @@ def _values(axis, vals, where) -> list[str]:
         ok = v in segment.VALUES[axis]
         if axis == "자세" and "→" in v:
             a, _, b = v.partition("→")
-            ok = a in segment.POSTURE_RANK and b in segment.POSTURE_RANK
+            ok = a in segment.POSTURE_RANK and b in segment.POSTURE_RANK and a != b  # A→A never happens
         if not ok:
             raise RuleError(f"{where}: {axis}에 '{v}' 값은 없습니다 (있는 것: {', '.join(segment.VALUES[axis])}"
                             + (", 그리고 'A→B' 꼴의 전환" if axis == "자세" else "") + ")")
@@ -237,22 +282,24 @@ def apply(rules: dict, tr: dict, steps: list) -> list[tuple[str, str, int, int, 
     labels are left out. name and color belong to the label: the first given by any of its rules."""
     T = len(tr["이동"])
     out = []
+    meta = {}  # per label, in every lane (axis lanes too): the first name and the first color any of its rules gives
+    for t in rules["tracks"]:
+        for r in t.get("rules", []):
+            m_ = meta.setdefault(r["label"], {"name": "", "color": None})
+            m_["name"] = m_["name"] or r["name"]
+            m_["color"] = m_["color"] or r["color"]
     for t in rules["tracks"]:
         if "axis" in t:
             for lab, s, e in segment.labels_to_segments(tr[t["axis"]]):
                 if lab not in t["skip"]:
-                    out.append((t["track"], str(lab), s, e, {}))
+                    out.append((t["track"], str(lab), s, e, meta.get(str(lab), {})))
             continue
         lab = np.full(T, None, dtype=object)
         done = np.zeros(T, dtype=bool)
-        meta = {}  # per label: the first name and the first color any of its rules gives
         for r in t["rules"]:
-            m_ = meta.setdefault(r["label"], {"name": "", "color": None})
-            m_["name"] = m_["name"] or r["name"]
-            m_["color"] = m_["color"] or r["color"]
             m = _holds(r["when"], tr, T)
-            if "then" in r:
-                then, gap = _holds(r["then"], tr, T), segment.sec(r["within"])
+            if "then" in r:  # within 0: then while when holds, not a frame after
+                then, gap = _holds(r["then"], tr, T), int(round(r["within"] * segment.FPS))
                 hit = np.zeros(T, dtype=bool)
                 for a, b in segment.runs(m):
                     if then[a:min(T, b + gap)].any():
@@ -262,7 +309,7 @@ def apply(rules: dict, tr: dict, steps: list) -> list[tuple[str, str, int, int, 
             lab[m] = r["label"]
             done |= m
         if t["min_seg"]:
-            lab = segment.smooth_labels(lab, t["min_seg"])
+            lab = _smooth_labelled(lab, t["min_seg"])
         if t.get("approach"):
             _approach_steps(lab, t["approach"], steps)
             meta.setdefault(t["approach"]["label"], {"name": "", "color": None})
@@ -270,6 +317,15 @@ def apply(rules: dict, tr: dict, steps: list) -> list[tuple[str, str, int, int, 
             if name is not None:
                 out.append((t["track"], name, s, e, meta[name]))
     return out
+
+
+def _smooth_labelled(lab, min_seg: float):
+    """min_seg within each stretch of labelled frames: a short piece joins its longer labelled
+    neighbour. Unlabelled frames are not a label: they take no piece over and are not filled."""
+    lab = lab.copy()
+    for a, b in segment.runs(np.array([x is not None for x in lab], dtype=bool)):
+        lab[a:b] = segment.smooth_labels(lab[a:b], min_seg)
+    return lab
 
 
 def _approach_steps(lab, ap, steps) -> None:

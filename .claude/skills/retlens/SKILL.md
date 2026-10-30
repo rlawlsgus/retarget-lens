@@ -32,7 +32,7 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 | `compare A B [--tol 3] [--no-heading] [--align]` | 겹쳐 비교: B를 A의 골반에 맞춰 부위별 차이(cm) | `regions[]`(region, mean_cm, max_cm, max_at_s, beyond_tol_pct), `worst_moments[]` |
 | `align REF FILE...` | 기준에 시간 자동 정렬(다리 관절각이 가장 잘 맞는 오프셋) | `offsets_s`, `notes` |
 | `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM] [--self-collision]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장 | `out`, `frames`, `fps`, `kind` |
-| `autolabel FILE... [--rules R.yaml] [--out DIR] [--summary]` | 자동 라벨: 규칙 파일대로 사람 동작을 보고 구간 라벨(리타게팅 없이). `--out`이면 모션마다 `<이름>.labels.csv`(이름이 겹치면 원래 폴더 구조를 그 아래에 둠) | `rules`, `motions[]`(file, labels{auto, tracks, segments[], notes, error}, csv) |
+| `autolabel FILE... [--rules R.yaml] [--out DIR] [--summary]` | 자동 라벨: 규칙 파일대로 사람 동작을 보고 구간 라벨(리타게팅 없이). `--out`이면 라벨을 붙인 모션마다 그 폴더 안에 `<이름>.labels.csv`(구간이 없으면 열 이름만). 이름이 겹치면 원래 폴더 구조를 그 아래에, 같은 폴더의 `X.c3d`·`X.bvh`는 `c3d\`·`bvh\` 아래에 둠. 실패한 모션은 지난 실행의 CSV를 지움. 종료 코드 1 = 모두 실패, 2 = 일부 실패 | `rules`, `motions[]`(file, labels{auto, tracks, segments[], notes, error}, csv, csv_removed) |
 | `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이) | 마커 수, `missing_pct`, `most_missing`, `longest_gap_s`, `spike_frames` |
 | `physics FILE [--assist 1]` | Isaac PhysX 물리 검사(짧은 클립 약 1분) | `physics.metrics`(phys_falls, phys_harness_pct, phys_saturated_pct, phys_ok), `physics.falls[]` |
 | `video FILE [--out X.mp4] [--physics]` | Isaac으로 녹화 | `video` 경로 |
@@ -79,7 +79,7 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 | `POST /api/remove {"id"}` | 닫기 |
 | `GET /api/motion?id=...` | 모션 하나의 QC·지표·C3D·물리·구간 라벨 |
 | `POST /api/item {"id", "visible"?, "offset_s"?, "show_human"?}` | 보이기, 시간 오프셋, 사람 스켈레톤 |
-| `POST /api/labels {"id", "path"?}` | 구간 라벨: `path` 파일을 붙임 / `"path": null`이면 뺌 / `path`가 없으면 라벨 파일을 다시 읽음 |
+| `POST /api/labels {"id", "path"?}` | 구간 라벨: `path` 파일을 붙임 / `"path": null`이면 뺌 / `path`가 없으면 다시 읽음(모션 옆에서 찾은 라벨은 열 때처럼 다시 찾고, 고른 파일은 그 파일을) |
 | `POST /api/labels {"id", "auto": true, "rules"?}` | 자동 라벨: 규칙 파일(`rules`, 없으면 사용자가 고른 설정)대로 붙임. 붙일 수 없으면(로봇 모션, 깨진 규칙) 422이고 라벨은 그대로 |
 | `POST /api/playback {"play"?, "time_s"?, "speed"?, "loop"?}` | 재생/정지, 시각 이동 |
 | `GET /api/metrics?ref=...` | 분석 표 |
@@ -98,8 +98,8 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 - **구간 라벨:** 모션에 라벨 파일이 있을 수도 없을 수도 있습니다. 열 때 모션 옆의 `<이름>.labels.csv`·`.labels.json`·`_labels.csv`·`_subtask.csv`, 또는 폴더의 `labels.csv`(`seq` 열이 그 모션인 행. 이름이 다르면 같은 촬영 `02_01_stageii` = `02_01`. 이 표에 `seq` 열이 없으면 오류)를 찾습니다. C3D는 솔버 결과 폴더의 라벨도 찾습니다. CSV 열은 `label`(필수), `start_s`·`end_s`(초, 끝 제외) 또는 `start_frame`·`end_frame`(끝 포함, `fps` 열이 없으면 RetLens에 보이는 fps: 리타게팅한 사람 모션은 보통 30이라 원본 프레임 번호면 `fps` 열 필요), 선택 `track`·`name`·`object`·`note`·`color`·`seq`입니다.
   - `inspect`·`/api/motion`의 `labels`가 `null`이면 라벨 파일이 없는 것입니다. 있으면 `file`, `tracks`, `segments[]`(label, start_s, end_s, track), `now`(지금 시각의 라벨), `error`(쓸 수 없는 파일의 이유), `notes`(뺀 행, 잘린 구간)가 나옵니다. `/api/status`에는 `segments`를 뺀 요약만 나옵니다.
   - 라벨 시각은 모션의 첫 프레임 기준입니다. 타임라인 시각은 거기에 시간 오프셋을 더한 값입니다. 어떤 라벨 구간을 보여 주려면 `/api/playback {"time_s": offset_s + start_s}`를 씁니다.
-  - **자동 라벨:** 라벨 파일 대신 규칙 파일(YAML·JSON)대로 사람 골격의 동작 트랙(이동·자세·자세전환·왼손·오른손·손·양손·걸음)을 라벨로 바꿉니다. 결과의 `labels.auto`에 규칙 이름이, `file`에 규칙 파일이 나옵니다. 규칙 형식과 트랙 값은 사용 설명서 "자동 라벨"과 `retlens/autolabel/rules.py` 머리말에 있습니다. 예시는 `configs/label_rules_example.yaml`입니다.
-  - 사용자의 규칙 파일은 프로젝트의 라벨 정의라 비공개일 수 있습니다. 그 내용을 저장소에 넣거나 밖으로 옮기지 마세요. 로봇 모션(사람 골격 없음)에는 붙지 않습니다. BVH·FBX는 체형을 뼈 길이로 추정해 AMASS SMPL-X보다 덜 정확합니다(`notes`).
+  - **자동 라벨:** 라벨 파일 대신 규칙 파일(YAML·JSON)대로 사람 골격의 동작 트랙(이동·회전·자세·자세전환·왼손·오른손·손·양손·걸음)을 라벨로 바꿉니다. 결과의 `labels.auto`에 규칙 이름이, `file`에 규칙 파일이 나옵니다. 규칙 형식은 사용 설명서 "자동 라벨"과 `retlens/autolabel/rules.py` 머리말에, 트랙 값은 사용 설명서와 `retlens/autolabel/segment.py` 머리말에 있습니다. 예시는 `configs/label_rules_example.yaml`(설치판은 `_internal\configs\`)입니다. 한 표에 같은 항목이 두 번 있거나 `tracks` 옆 맨 위에 레인 항목이 있으면 규칙 오류입니다.
+  - 사용자의 규칙 파일은 프로젝트의 라벨 정의라 비공개일 수 있습니다. 그 내용을 저장소에 넣거나 밖으로 옮기지 마세요. 로봇 모션(사람 골격 없음)에는 붙지 않습니다. BVH·FBX는 체형을 뼈 길이로 추정해 AMASS SMPL-X보다 덜 정확하고, 발끝 관절이 없는 골격(CMU FBX의 Daz)은 발끝을 추정합니다(`notes`). 트레드밀로 본 구간도 `notes`에 나옵니다.
 - **시간 오프셋:** 모션마다 타임라인에서 시작 시각을 옮길 수 있습니다. 비교·RMSE는 겹치는 구간만 봅니다. 같은 촬영의 다른 소스(BVH vs SMPL-X 등)를 비교할 때는 먼저 `align`(또는 `compare --align`)으로 맞추세요.
 - **겹쳐 비교:**
   - B를 A의 골반 위치(기본: 골반 방향까지)로 옮겨 자세 차이만 남깁니다. A는 회색 반투명, B는 허용 오차(기본 3 cm)를 넘는 부위만 노랑(1배)→주황(2배)→빨강(3배 이상)으로 칠합니다.

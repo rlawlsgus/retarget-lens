@@ -64,12 +64,14 @@ class Segment:
 class MotionLabels:
     """The segments of one motion from one file. error: the file could not be used (the motion
     opens anyway); notes: what was skipped or clipped. auto: made by retlens.autolabel with the
-    rule file at path (the rules' name), '' for labels read from a label file."""
+    rule file at path (the rules' name), '' for labels read from a label file. found: found next
+    to the motion (load_for), not picked: reading them again looks again."""
     path: str
     segments: list[Segment] = field(default_factory=list)
     error: str = ""
     notes: list[str] = field(default_factory=list)
     auto: str = ""
+    found: bool = False
 
     @property
     def tracks(self) -> list[str]:
@@ -137,19 +139,30 @@ def is_label_name(path: str) -> bool:
 
 def is_label_file(path: str) -> bool:
     """A label file by its name, or a .csv whose header has a label column, or a .json of segments."""
-    if is_label_name(path):
-        return True
+    return is_label_name(path) or _looks_like_labels(path, ("label",))
+
+
+TABLE_COLUMNS = ("label", "seq", "start_s", "end_s", "start_frame", "end_frame")
+
+
+def _looks_like_labels(path: str, columns=TABLE_COLUMNS) -> bool:
+    """A .csv whose header, or a .json whose (first) segment, has one of these columns. A folder's
+    labels.csv / labels.json can be another tool's file: only one that looks like a label table is
+    read (and its faults shown)."""
     ext = os.path.splitext(path)[1].lower()
     try:
         if ext == ".csv":
             with open(path, "rb") as f:
                 head = _decode(f.readline())
-            return "label" in [c.strip().lower() for c in next(csv.reader([head]), [])]
+            return any(c.strip().lower() in columns for c in next(csv.reader([head]), []))
         if ext == ".json":
             with open(path, "rb") as f:
                 d = json.loads(_decode(f.read()))
+            if isinstance(d, dict) and "segments" in d and columns is TABLE_COLUMNS:
+                return True
             segs = d.get("segments") if isinstance(d, dict) else d
-            return isinstance(segs, list) and bool(segs) and isinstance(segs[0], dict) and "label" in segs[0]
+            return isinstance(segs, list) and bool(segs) and isinstance(segs[0], dict) and \
+                any(str(k).strip().lower() in columns for k in segs[0])
     except (OSError, ValueError):
         pass
     return False
@@ -175,14 +188,18 @@ def candidates(source: str, also=()) -> list[str]:
 
 def load_for(source: str, fps: float, duration: float | None = None, also=()) -> MotionLabels | None:
     """The labels of a motion from the first label file next to it; None when there is none. A
-    folder table counts when it has rows for this motion, or when it cannot be used at all (the
-    motion then shows why, instead of looking unlabelled)."""
+    folder table counts when it has rows for this motion, or when it is a label table that cannot
+    be used at all (the motion then shows why, instead of looking unlabelled); a labels.csv /
+    labels.json of another kind is passed over."""
     for p in candidates(source, also):
         if not os.path.isfile(p):
             continue
         table = os.path.basename(p).lower() in FOLDER_TABLES
+        if table and not _looks_like_labels(p):
+            continue
         lab = load(p, source, fps, duration, table=table, also=[a for a in also if a])
         if lab is not None:
+            lab.found = True
             return lab
     return None
 
@@ -307,7 +324,8 @@ def _load(path: str, sources: list[str], fps: float, duration: float | None, tab
     rows, file_fps, lab.notes = _read(path)
     keys = set().union(*rows) if rows else set()
     if "label" not in keys:
-        lab.error = "label 열이 없습니다" + (f" (열: {', '.join(sorted(keys))})" if keys else " (빈 파일)")
+        empty = " (segments 목록이 없거나 비었음)" if path.lower().endswith(".json") else " (빈 파일)"
+        lab.error = "label 열이 없습니다" + (f" (열: {', '.join(sorted(keys))})" if keys else empty)
         return lab
     by_s, by_f = {"start_s", "end_s"} <= keys, {"start_frame", "end_frame"} <= keys
     if not (by_s or by_f):
@@ -372,11 +390,13 @@ def _load(path: str, sources: list[str], fps: float, duration: float | None, tab
 
 
 def save_csv(lab: MotionLabels, path: str) -> str:
-    """Write the segments as a label file (UTF-8 with BOM, so Excel reads the Korean); it reads back with load."""
+    """Write the segments as a label file (UTF-8 with BOM, so Excel reads the Korean); it reads back
+    with load to the same segments. Times are written in full: rounded, a boundary on frame k/30
+    (2.2666...) could read back after its frame (2.2667) and move it to the neighbour."""
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["track", "label", "name", "start_s", "end_s", "note", "color"])
         for s in lab.segments:
-            w.writerow([s.track, s.label, s.name, round(s.start, 4), round(s.end, 4), s.note,
+            w.writerow([s.track, s.label, s.name, repr(float(s.start)), repr(float(s.end)), s.note,
                         "#%02x%02x%02x" % s.color if s.color else ""])
     return path

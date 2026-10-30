@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
+
 from .. import motion_labels, paths
 from ..motion import SkeletonMotion
 from . import body, rules, segment, signals
@@ -56,8 +58,10 @@ def label_motion(human: SkeletonMotion, rule_file: str | dict, duration: float |
 def _label(human, rs: dict, path: str, stem: str, duration: float | None) -> motion_labels.MotionLabels:
     P, dims, notes = body.prepare(human)
     f, _, belt = signals.from_joints(P, dims)
-    if belt.any():
-        notes.append(f"움직이는 바닥(트레드밀, {(belt ** 2).sum() ** 0.5:.2f} m/s) 위로 보고 계산함")
+    on = np.flatnonzero(np.linalg.norm(belt, axis=1))  # frames on a moving support
+    if len(on):
+        notes.append(f"움직이는 바닥(트레드밀, {np.median(np.linalg.norm(belt[on], axis=1)):.2f} m/s) 위로 보고 계산함 "
+                     f"({on[0] / segment.FPS:.1f}-{(on[-1] + 1) / segment.FPS:.1f} s)")
     tracks, steps = segment.tracks(f, dims, rs["params"])
     segs = []
     for lane, label, s, e, rule in rules.apply(rs, tracks, steps):

@@ -343,6 +343,7 @@ class MotionScene:
         self.assist = 1.0
         self.balance = self.opts.balance if self.opts.balance in BALANCE else "isaac"
         self._phys_errors: dict = {}  # per phys_key: why its runs cannot start
+        self._solved_skeletons: dict = {}  # C3D solved takes' skeletons for 자동 라벨 (_skeleton), the last few
         self._version = 0  # bumped by every event; with the time and settings it decides redraws
         self._drawn_key, self._drawn_at = None, 0.0
         self._listeners: list[Callable[[str, object], None]] = []
@@ -465,11 +466,13 @@ class MotionScene:
     def reload_labels(self, item: Item):
         """Read the motion's label file again (after editing it), or look for one next to it;
         automatic labels are made again with their rule file (kept as they were if that fails: the
-        labels returned then carry the error)."""
+        labels returned then carry the error). A file picked by hand is read again as it is; labels
+        found next to the motion are looked for again the way opening does (the file may have been
+        renamed, or a folder table given its seq column)."""
         lab = item.labels
         if lab is not None and lab.auto:
             return self.auto_label(item, lab.path or None)
-        if lab is not None and lab.path:
+        if lab is not None and lab.path and not lab.found:
             return self.set_labels(item, lab.path)
         self._find_labels(item)
         self.emit("item", item)
@@ -479,16 +482,24 @@ class MotionScene:
         """Label the motion by a rule file (retlens.autolabel): rules, else the 자동 라벨 규칙 setting.
         When that cannot be done (no human skeleton, no rule file or a broken one, too short) the
         motion keeps the labels it had: the labels returned carry the error and are not put on it."""
+        return self.put_auto_labels(item, self.make_auto_labels(item, rules))
+
+    def make_auto_labels(self, item: Item, rules: str | None = None):
+        """The motion's automatic labels, not yet put on it (any thread: the window computes them
+        off its own); a failure is the labels' error, never an exception."""
         from .. import autolabel
 
         rules = rules or autolabel.rules_file()
         try:
             if not rules:
                 raise ValueError("자동 라벨 규칙 파일이 정해지지 않았습니다 (인스펙터 > 라벨 > 규칙 파일...)")
-            lab = autolabel.label_motion(self._skeleton(item), rules, duration=item.robot.duration)
+            return autolabel.label_motion(self._skeleton(item), rules, duration=item.robot.duration)
         except Exception as e:
-            lab = motion_labels.MotionLabels(path=rules or "", error=str(e) or type(e).__name__,
-                                             auto=os.path.splitext(os.path.basename(rules or ""))[0] or "규칙")
+            return motion_labels.MotionLabels(path=rules or "", error=str(e) or type(e).__name__,
+                                              auto=os.path.splitext(os.path.basename(rules or ""))[0] or "규칙")
+
+    def put_auto_labels(self, item: Item, lab):
+        """Put labels from make_auto_labels on the motion; with an error it keeps the ones it had."""
         if lab.error:
             self.log(f"  {item.label}: no auto labels ({lab.error}); its labels stay as they were")
             return lab
@@ -503,13 +514,21 @@ class MotionScene:
         return (h is not None and h.kind == "skeleton") or bool(item.info.get("solved_motion"))
 
     def _skeleton(self, item: Item):
-        """The motion's human skeleton: its own, or for C3D markers the solved take's."""
+        """The motion's human skeleton: its own, or for C3D markers the solved take's (loaded once:
+        the last few are kept, so labelling a C3D again does not read its take again)."""
         h = item.human
         if h is not None and h.kind == "skeleton":
             return h
         solved = item.info.get("solved_motion")
         if solved:
-            return load_skeleton(solved, smpl_model_dir=self.opts.smpl_model_dir)
+            key = os.path.normcase(os.path.abspath(solved))
+            sk = self._solved_skeletons.pop(key, None)  # popped and put back: the newest stays last
+            if sk is None:
+                sk = load_skeleton(solved, smpl_model_dir=self.opts.smpl_model_dir)
+            self._solved_skeletons[key] = sk
+            while len(self._solved_skeletons) > 4:
+                self._solved_skeletons.pop(next(iter(self._solved_skeletons)))
+            return sk
         raise ValueError("사람 골격이 없는 로봇 모션입니다. 자동 라벨은 BVH·FBX·AMASS 모션에 붙습니다")
 
     def set_visible(self, item: Item, value: bool) -> None:

@@ -137,6 +137,31 @@ def test_labels_are_optional(scene, tmp_path):
         scene.remove(labelled)
 
 
+def test_reading_found_labels_again_looks_again(scene, tmp_path):
+    """다시 읽기 of labels found next to the motion looks again as opening does: a folder table without
+    seq stays an error (not put on the motion whole), and renamed to the motion's own label file it is
+    found; a file picked by hand is read again as it is."""
+    import shutil
+
+    src = shutil.copy(SAMPLE, tmp_path / "walk.npz")
+    table = tmp_path / "labels.csv"
+    table.write_text("label,start_s,end_s\nidle,0,0.5\nwalk,0.5,1.0\n", encoding="utf-8")  # no seq
+    it = scene.add(src)
+    try:
+        assert it.labels.error and "seq" in it.labels.error and it.labels.found
+        assert scene.reload_labels(it).error and not it.labels.segments
+        os.replace(table, tmp_path / "walk.labels.csv")  # as the error says
+        lab = scene.reload_labels(it)
+        assert not lab.error and [s.label for s in lab.segments] == ["idle", "walk"]
+        hand = tmp_path / "picked.csv"
+        hand.write_text("label,start_s,end_s\nstand,0,1\n", encoding="utf-8")
+        assert not scene.set_labels(it, str(hand)).found
+        hand.write_text("label,start_s,end_s\nsit,0,1\n", encoding="utf-8")
+        assert [s.label for s in scene.reload_labels(it).segments] == ["sit"]  # that file, not walk.labels.csv
+    finally:
+        scene.remove(it)
+
+
 def test_auto_labels_by_a_rule_file(scene, tmp_path):
     """자동 라벨: a human motion gets its rule file's labels, made again by 다시 읽기 after the rules change;
     a robot motion (no skeleton) says why it gets none."""

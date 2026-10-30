@@ -185,6 +185,33 @@ def test_folder_tables_need_seq_and_say_when_broken(tmp_path):
     assert ml.load(table, src, FPS, DUR, table=True) is None
 
 
+def test_another_tools_labels_file_in_the_folder_is_passed_over(tmp_path):
+    """labels.csv / labels.json are common names: one that is not a label table at all gives no ⚠."""
+    src = _motion(tmp_path)
+    foreign = _write(tmp_path / "motions" / "labels.csv", "name,age\nkim,3\n")
+    assert ml.load_for(src, FPS, DUR) is None
+    os.remove(foreign)
+    _write(tmp_path / "motions" / "labels.json", json.dumps({"classes": ["walk", "run"], "version": 2}))
+    assert ml.load_for(src, FPS, DUR) is None
+    _write(tmp_path / "motions" / "labels.json", json.dumps({"segments": []}))  # a label table, empty: said
+    assert "segments" in ml.load_for(src, FPS, DUR).error
+    _write(tmp_path / "motions" / "02_01.labels.csv", "label,start_s,end_s\nwalk,0,1\n")
+    lab = ml.load_for(src, FPS, DUR)
+    assert lab.found and not ml.load(lab.path, src, FPS, DUR).found  # found next to it / picked
+
+
+def test_saved_csv_reads_back_the_same(tmp_path):
+    """Times are written in full: a boundary on frame k/30 rounded up would move that frame to the
+    neighbouring segment when read back."""
+    src = _motion(tmp_path)
+    segs = [ml.Segment("ab"[k % 2], k / 30, (k + 1) / 30, track="이동", name="이름, 쉼표", note='따옴표 "x"',
+                       color=(255, 0, 16)) for k in range(0, 119)]
+    p = ml.save_csv(ml.MotionLabels(path="", segments=segs), str(tmp_path / "out.labels.csv"))
+    back = ml.load(p, src, FPS, DUR).segments
+    assert [(s.label, s.start, s.end, s.track, s.name, s.note, s.color) for s in back] == \
+        [(s.label, s.start, s.end, s.track, s.name, s.note, s.color) for s in segs]
+
+
 def test_a_file_of_another_motion_is_not_taken_whole(tmp_path):
     src = _motion(tmp_path)
     other = _write(tmp_path / "x.csv", "seq,label,start_s,end_s\nCMU/02/02_03_stageii.npz,walk,0,1\n")

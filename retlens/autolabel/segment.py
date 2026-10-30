@@ -17,10 +17,17 @@ Boundaries sit on physical events: a step on the frames a foot leaves and touche
 jump, posture change or reach where the speed has dropped below a fraction (onset_frac) of its peak.
 The thresholds (DEFAULTS) come from definitions of the movements, the biomechanics and ergonomics
 literature and body proportions, not from fitting labelled data; a rule file may override them.
+
+In the air means both feet off what they stand on (every heel and toe point above ground_height)
+and moving. A jump is such a flight in which the pelvis falls like a body in free fall; hanging
+is a second or more with the feet up, both arms over the head and the pelvis lifted. A stair
+step is a step onto a support at another level (signals: a level the foot stands on carrying
+the body), so a knee raised high and put back is not one.
 """
 
 from __future__ import annotations
 
+import bisect
 import copy
 import math
 
@@ -45,7 +52,9 @@ DEFAULTS = {  # lengths m, times s, angles deg
     "contact": {
         "still_speed": 0.3,  # heel or toe slower than this = the foot stands (a swinging foot passes 1 m/s walking)
         "min_frames": 2,  # shorter stands / lifts are noise
-        "ground_height": 0.02,  # a foot point this close to the floor touches it (flight while running)
+        "stand_height": 0.2,  # a foot held still higher than this above its support is held up (a knee raised, a
+        #                       foot on a rung), not standing: above a stair rise (0.15-0.18 m) not yet taken as a level
+        "ground_height": 0.02,  # a foot point this close to its support touches it: in the air all four are higher
         "air_height": 0.05,  # at a jump's top both feet above this count as in the air even when they slow down
         "apex_gap": 0.13,  # ... for gaps up to this long
     },
@@ -53,23 +62,31 @@ DEFAULTS = {  # lengths m, times s, angles deg
         "min_swing": 0.1,  # time a foot is in the air: the swing phase of human steps
         "max_swing": 1.2,
         "min_disp": 0.1,  # moved at least this far (less than half a foot length is shuffling)
-        "min_rise": 0.1,  # or this high (stair step 0.15-0.18 m)
+        "min_rise": 0.1,  # or lifted this high (stair step 0.15-0.18 m; a knee raised in place)
     },
     "gait": {
-        "min_steps": 3,  # walking = at least 3 alternating steps
+        "min_steps": 3,  # walking = at least 3 alternating steps that move the foot (min_disp, or onto another level)
         "max_pause": 0.5,  # the next step lifts within this after the last strike: the same walk
+        "slow_pause": 1.0,  # ... or within this when the other foot steps on the same way (one step a second:
+        #                     the slowest walking cadence, 60 steps/min, with its long double support)
         "min_speed": 0.2,  # mean horizontal pelvis speed of a walk; slower = stepping in place (발 옮기기)
         "run_flight": 0.067,  # both feet off for at least this between steps: a running step (2 frames @ 30 fps)
-        "stair_rise": 0.1,  # a walking step that rises or falls this much is a stair step
+        "run_froude": 0.5,  # a step faster than this Froude number (v^2 / g / hip height) is running even with no flight
+        #                     seen: people change from walking to running there (about 2.1 m/s; Alexander 1989)
+        "stair_rise": 0.1,  # a walking step onto a support this much higher or lower is a stair step
     },
     "jump": {
         "min_flight": 0.1,  # shortest time in the air
         "leap_flight": 0.25,  # off one foot onto the other: a jump only when longer than this (running flight is shorter)
-        "max_flight": 1.0,  # people stay under 1 s in the air jumping; longer = hanging
-        "hang_height": 0.15,  # hanging: both feet this high above the floor, both arms over the head
+        "leap_ratio": 1.5,  # ... and half again as long as the flights of the running strides around it, if any
+        #                     (it stands out of the run; a bounding run's strides reach 0.25 s too)
+        "max_flight": 1.0,  # people stay under 1 s in the air jumping
+        "min_fall": 0.5,  # in the air the pelvis accelerates down at this fraction of g or more (free fall; the
+        #                   limbs moving shift the centre of mass against the pelvis): not a body resting on something
+        "hang_height": 0.15,  # hanging: both feet this high above the floor, both arms over the head, 1 s or more
         "onset_frac": 0.05,  # boundaries: vertical pelvis speed below this fraction of its peak (5% movement onset)
         "quiet": 0.1,  # ... for at least this long
-        "window": 1.0,  # searched before take-off and after landing
+        "window": 1.0,  # searched before take-off and after landing, no further than the last touch-down / next lift
     },
     "turn": {  # El-Gohary et al. 2014 (yaw rate of a pelvis sensor)
         "rate_peak": 15,  # peak yaw rate in the turn (deg/s)
@@ -81,11 +98,14 @@ DEFAULTS = {  # lengths m, times s, angles deg
     },
     "posture": {
         "bend_trunk": 20,  # trunk 20 deg or more from vertical = bent (the first bend band of ergonomic scores)
+        "bend_band": 3,  # ... and stays bent until this much under it (half the ~6 deg the chest joint of one take
+        #                  differs between skeletons, BVH vs SMPL-X), so a trunk near the threshold does not flicker
         "lie_trunk": 60,  # 60 deg or more = closer to lying (their deepest band)
         "squat_knee": 60,  # both knees bent 60 deg or more
         "low_pelvis": 0.75,  # pelvis height ratio of a 60 deg knee bend on a two-segment leg: (1 + cos 60)/2
         "floor_pelvis": 0.54,  # knee height / hip height standing (0.285H / 0.530H): lower = floor-level posture
         "sit_behind": 0.5,  # pelvis behind the ankles by half a thigh or more = sitting on something
+        "seat_speed": 0.2,  # on a high seat the pelvis stays in place: slower than walking (gait min_speed)
         "floor_contact": 0.15,  # a knee or wrist joint centre lower than this touches the floor
         "inverted": 0.1,  # head this much below the pelvis = upside down
         "min_state": 0.3,  # shorter postures and holds join their neighbours
@@ -96,7 +116,8 @@ DEFAULTS = {  # lengths m, times s, angles deg
         "arm_raise": 45,  # upper arm 45 deg or more from the trunk = arm held out (the 45-90 deg band of arm scores)
         "floor_zone": 0.285,  # wrist height / stature below knee height = floor level
         "high_zone": 0.818,  # shoulder height or higher = high
-        "below_pelvis": 0.05,  # a floor-level hand is at least 5% of stature below the pelvis (not a hand resting while seated on the floor)
+        "below_pelvis": 0.1,  # a floor-level hand is below the knees and at least 10% of stature below the pelvis: a hand
+        #                       resting by a body sitting or lying on the floor is about 6% (the pelvis's half depth)
         "min_ext": 0.3,  # shortest time held out (not the arm swing of running)
         "min_gap": 0.2,
         "peak_min": 0.3,  # slower hand movements get no reach / return boundaries (m/s, relative to the pelvis)
@@ -106,6 +127,12 @@ DEFAULTS = {  # lengths m, times s, angles deg
     },
     "carry": {
         "front": 0.05,  # both wrists this far in front of the chest
+        "forearm": 0.71,  # and the forearms pointing ahead, 45 deg or more up from hanging (sin 45): hands held out
+        #                   together, not arms hanging at the sides
+        "lap_rest": 0.108,  # a wrist within a hand length (0.108 of stature, Winter) of the front half of a thigh
+        #                     rests on the lap or a knee (seated), not holding
+        "abreast": 0.054,  # the hands this close front to back (/ stature, half a hand length; mean over std_window):
+        #                    on the two sides of one object; arms swinging in a walk or run alternate
         "min_h": 0.285,  # between knee
         "max_h": 0.818,  # and shoulder height (/ stature)
         "min_width": 0.15,  # hands at least an object's width apart (not hands clasped)
@@ -169,6 +196,13 @@ def sec(x):
     return max(1, int(round(x * FPS)))
 
 
+def hysteresis(x, on, off):
+    """True from where x reaches on until it falls below off (between them it keeps the last state)."""
+    state = np.where(x >= on, 1, np.where(x < off, 0, -1))
+    i = np.maximum.accumulate(np.where(state >= 0, np.arange(len(x)), 0))
+    return state[i] == 1
+
+
 def labels_to_segments(lab):
     """[(label, start, end exclusive)] of the runs of equal labels."""
     lab = np.asarray(lab, dtype=object)
@@ -225,11 +259,13 @@ def _quiet_after(a, t, hi, thr, q):
 
 # ---------------------------------------------------------------- stance, steps, flight
 def stance(f, c):
-    """Per foot: standing when the heel or the toe is slower than still_speed. Height is not looked at (stairs, platforms)."""
+    """Per foot: standing when the heel or the toe is slower than still_speed and the foot is no more
+    than stand_height above its support (heights follow the feet onto stairs and platforms)."""
     n = c["min_frames"]
     out = {}
     for s in ("l", "r"):
-        st = (f[f"heel_v_{s}"] < c["still_speed"]) | (f[f"toe_v_{s}"] < c["still_speed"])
+        st = ((f[f"heel_v_{s}"] < c["still_speed"]) | (f[f"toe_v_{s}"] < c["still_speed"])) & \
+             (np.minimum(f[f"heel_h_{s}"], f[f"toe_h_{s}"]) <= c["stand_height"])
         st = fill_gaps(st, n)  # a lift of a frame or two is noise
         st = ~fill_gaps(~st, n)  # and so is a stand that short
         out[s] = st
@@ -237,97 +273,132 @@ def stance(f, c):
 
 
 def find_steps(f, st, c):
-    """Steps: a foot leaves (lift) and stands again (strike) after a human swing time, moved."""
+    """Steps: a foot leaves (lift) and stands again (strike) after a human swing time, moved. A swing
+    cut by the clip's start or end is a step when what is seen of it moved and is not too long.
+    climb: how much higher the support the foot lands on is than the one it left (signals support_*)."""
     T = len(st["l"])
     out = []
     for s in ("l", "r"):
         for a, b in runs(~st[s]):
             d = (b - a) / FPS
-            if a == 0 or b == T or d < c["min_swing"] or d > c["max_swing"]:
+            if d > c["max_swing"] or (d < c["min_swing"] and 0 < a and b < T):
                 continue
-            dx = f[f"foot_x_{s}"][b] - f[f"foot_x_{s}"][a - 1]
-            dy = f[f"foot_y_{s}"][b] - f[f"foot_y_{s}"][a - 1]
-            dz = f[f"foot_z_{s}"][b] - f[f"foot_z_{s}"][a - 1]
+            i, j = max(a - 1, 0), min(b, T - 1)
+            dx = f[f"foot_x_{s}"][j] - f[f"foot_x_{s}"][i]
+            dy = f[f"foot_y_{s}"][j] - f[f"foot_y_{s}"][i]
+            dz = f[f"foot_z_{s}"][j] - f[f"foot_z_{s}"][i]
             disp = float(np.hypot(dx, dy))
-            if disp < c["min_disp"] and abs(dz) < c["min_rise"]:
+            lifted = float(f[f"foot_z_{s}"][a:b].max() - f[f"foot_z_{s}"][i]) if b > a else 0.0
+            if disp < c["min_disp"] and max(abs(dz), lifted) < c["min_rise"]:
                 continue
-            out.append({"foot": s, "lift": int(a), "strike": int(b), "disp": disp, "rise": float(dz)})
+            # the level is taken once the foot has stood a moment (signals finds it on still feet)
+            climb = f[f"support_{s}"][min(b + sec(0.2), T - 1)] - f[f"support_{s}"][i]
+            out.append({"foot": s, "lift": int(a), "strike": int(b), "disp": disp, "rise": float(dz),
+                        "climb": float(climb), "dx": float(dx), "dy": float(dy)})
     return sorted(out, key=lambda x: x["lift"])
 
 
 def airborne(f, st, c):
-    """Frames with neither foot standing. A gap where the feet slow down at a jump's top is filled
-    only while both feet are more than air_height above the floor."""
-    air = ~st["l"] & ~st["r"]
+    """Frames with neither foot standing and every heel and toe point more than ground_height above its
+    support (a foot rolling or sliding on the floor is not in the air). A gap where the feet slow down
+    at a jump's top is filled only while both feet are more than air_height up."""
     low = lambda s: np.minimum(f[f"heel_h_{s}"], f[f"toe_h_{s}"])
+    air = ~st["l"] & ~st["r"] & (low("l") > c["ground_height"]) & (low("r") > c["ground_height"])
     high = (low("l") > c["air_height"]) & (low("r") > c["air_height"])
     return fill_gaps(air, sec(c["apex_gap"]), allow=high)
 
 
-def walking(steps, T, max_pause):
-    """걸음 중: from the first lift to the last strike of steps whose next one lifts within
-    max_pause after the previous strike (any steps: walking, running, stepping in place)."""
-    m = np.zeros(T, dtype=bool)
-    cur = None
-    for s in sorted(steps, key=lambda x: x["lift"]):
-        if cur and s["lift"] - cur[1] <= sec(max_pause):
-            cur[1] = max(cur[1], s["strike"])
-        else:
-            if cur:
-                m[cur[0]:cur[1]] = True
-            cur = [s["lift"], s["strike"]]
+def bouts(steps, g):
+    """Steps (sorted by lift) grouped into walks: the next one lifts within max_pause after the last
+    strike, or within slow_pause when it is the other foot stepping on the same way."""
+    out, cur, end = [], [], 0
+    for s in steps:
+        if cur:
+            p, gap = cur[-1], s["lift"] - end
+            on = p["foot"] != s["foot"] and p["dx"] * s["dx"] + p["dy"] * s["dy"] > 0
+            if gap > sec(g["max_pause"]) and not (on and gap <= sec(g["slow_pause"])):
+                out.append(cur)
+                cur = []
+        end = max(end, s["strike"]) if cur else s["strike"]
+        cur.append(s)
     if cur:
-        m[cur[0]:cur[1]] = True
+        out.append(cur)
+    return out
+
+
+def walking(steps, T, g):
+    """걸음 중: from the first lift to the last strike of steps that follow each other (bouts; any
+    steps: walking, running, stepping in place)."""
+    m = np.zeros(T, dtype=bool)
+    for b in bouts(sorted(steps, key=lambda x: x["lift"]), g):
+        m[b[0]["lift"]:max(x["strike"] for x in b)] = True
     return m
 
 
+def _falls(z, frac):
+    """The pelvis heights z (m) of a flight bend down like a thrown body's: the parabola through them
+    accelerates down at frac x g or more."""
+    if len(z) < 3:
+        return False
+    return 2 * np.polyfit(np.arange(len(z)) / FPS, z, 2)[0] <= -frac * 9.81
+
+
 # ---------------------------------------------------------------- 이동
-def locomotion(f, st, steps, air, cfg):
+def locomotion(f, dims, st, steps, air, cfg):
     T = len(f["speed"])
     g, jc, tc = cfg["gait"], cfg["jump"], cfg["turn"]
     lab = np.full(T, "정지", dtype=object)
     attrs = []
 
-    # steps belong to one walk when the next lifts within max_pause after the last strike
-    bouts, cur = [], []
-    for s in steps:
-        if cur and s["lift"] - max(x["strike"] for x in cur) > sec(g["max_pause"]):
-            bouts.append(cur)
-            cur = []
-        cur.append(s)
-    if cur:
-        bouts.append(cur)
+    # flights: in the air (airborne: both feet off the ground, not the moment both feet move in a fast
+    # walk's double support) from a foot on its support (standing, or a heel or toe point within
+    # ground_height) to one on it again, within 0.1 s (not feet coming down off a stool's rung)
+    k = sec(0.1)
+    gh = cfg["contact"]["ground_height"]
+    touch = {s: st[s] | (np.minimum(f[f"heel_h_{s}"], f[f"toe_h_{s}"]) <= gh) for s in ("l", "r")}
+    flights = []
+    for a, e in runs(air):
+        take = {s for s in ("l", "r") if touch[s][max(0, a - k):a].any()}
+        land = {s for s in ("l", "r") if touch[s][e:min(T, e + k)].any()}
+        if take and land:
+            flights.append((a, e, take, land))
 
+    # steps belong to one walk when the next lifts soon after the last strike (bouts). A walk has
+    # min_steps steps that take the foot somewhere (min_disp, or onto another level), with both feet,
+    # by a body up on its legs (the pelvis above floor level, not getting up from the floor)
+    sc = cfg["step"]
     gait_bouts = []
-    for b in bouts:
+    for b in bouts(steps, g):
         a, e = b[0]["lift"], max(x["strike"] for x in b)
-        feet = {x["foot"] for x in b}
+        moved = [x for x in b if x["disp"] >= sc["min_disp"] or abs(x["climb"]) >= sc["min_rise"]]
         prog = float(f["speed"][a:e].mean()) if e > a else 0.0
-        if len(b) >= g["min_steps"] and len(feet) == 2 and prog >= g["min_speed"]:
+        up = e > a and float(np.median(f["pelvis_h"][a:e])) >= cfg["posture"]["floor_pelvis"]
+        if len(moved) >= g["min_steps"] and len({x["foot"] for x in moved}) == 2 and prog >= g["min_speed"] and up:
             gait_bouts.append(b)
         else:
             lab[a:e] = "발 옮기기"
             attrs.append(("이동", "발 옮기기", a, e, {"steps": len(b)}))
 
-    # a step with run_flight or more in the air is a running step. In the air = neither foot standing and
-    # all four heel / toe points above ground_height (not the moment both feet move in a fast walk's double support)
+    # running steps: a flight of run_flight or more, or faster than run_froude (a run whose flight is too short to see)
     nfl = sec(g["run_flight"])
-    gh = cfg["contact"]["ground_height"]
-    off_ground = np.ones(T, dtype=bool)
-    for s_ in ("l", "r"):
-        off_ground &= (f[f"heel_h_{s_}"] > gh) & (f[f"toe_h_{s_}"] > gh)
-    flight = air & off_ground
+    v_run = math.sqrt(g["run_froude"] * 9.81 * dims["pelvis_h"])
+    cum = np.concatenate([[0.0], np.cumsum(f["speed"], dtype=np.float64)])
+    f_end = [e for _, e, _, _ in flights]
     for b in gait_bouts:
         kinds = []
         for x in b:
-            lo = max(0, x["lift"] - sec(0.1))
-            fl = max((e - s for s, e in runs(flight[lo:x["strike"]])), default=0)
-            if fl >= nfl:
+            lo, hi = max(0, x["lift"] - k), x["strike"]
+            fl, i = 0, bisect.bisect_right(f_end, lo)
+            while i < len(flights) and flights[i][0] < hi:
+                fl = max(fl, min(flights[i][1], hi) - max(flights[i][0], lo))
+                i += 1
+            n = max(x["strike"] - x["lift"], 1)
+            if fl >= nfl or (cum[x["lift"] + n] - cum[x["lift"]]) / n > v_run:
                 kinds.append("달리기")
             else:
-                # walking steps that rise or fall a stair step are stairs
-                kinds.append("계단 오르기" if x["rise"] >= g["stair_rise"] else
-                             ("계단 내리기" if x["rise"] <= -g["stair_rise"] else "걷기"))
+                # walking steps onto a support a stair step higher or lower are stairs
+                kinds.append("계단 오르기" if x["climb"] >= g["stair_rise"] else
+                             ("계단 내리기" if x["climb"] <= -g["stair_rise"] else "걷기"))
         # a single step unlike both neighbours follows them
         for i in range(1, len(kinds) - 1):
             if kinds[i - 1] == kinds[i + 1] != kinds[i]:
@@ -353,38 +424,41 @@ def locomotion(f, st, steps, air, cfg):
                 }))
             i = j + 1
 
-    # jumps: flights taking off or landing on both feet, off and onto the same foot (hop), or long ones.
-    # A short flight from one foot to the other is running
+    # jumps: flights in which the pelvis falls freely (_falls), taking off or landing on both feet, off and
+    # onto the same foot (hop), or long ones (leap: leap_flight, and leap_ratio over the strides of a run
+    # around it). A short flight from one foot to the other is a running step
     av = np.abs(f["pelvis_vz"])
     W, q = sec(jc["window"]), sec(jc["quiet"])
-    hang = np.zeros(T, dtype=bool)
-    for a, e in runs(air):
+    strikes = np.sort([a for s in ("l", "r") for a, _ in runs(st[s])])
+    lifts = np.sort([b for s in ("l", "r") for _, b in runs(st[s])])
+    strides = [(a, e) for a, e, take, land in flights if len(take) == len(land) == 1 and take != land]
+    starts = [a for a, _ in strides]
+    for a, e, take, land in flights:
         d = (e - a) / FPS
-        if d < jc["min_flight"]:
+        if not jc["min_flight"] <= d <= jc["max_flight"] or not _falls(f["pelvis_z"][a:e], jc["min_fall"]):
             continue
-        if d > jc["max_flight"]:
-            hang[a:e] = True
-            continue
-        k = sec(0.1)
-        take = {s for s in ("l", "r") if st[s][max(0, a - k):a].any()}
-        land = {s for s in ("l", "r") if st[s][e:min(T, e + k)].any()}
-        if not (len(take) == 2 or len(land) == 2 or (take == land and len(take) == 1) or d >= jc["leap_flight"]):
-            continue
-        lo, hi = max(0, a - W), min(T, e + W)
-        thr_pre = jc["onset_frac"] * av[lo:a + 1].max()
-        thr_post = jc["onset_frac"] * av[e - 1:hi].max()
-        s0 = _quiet_before(av, a, lo, thr_pre, q)
-        e0 = _quiet_after(av, e, hi, thr_post, q)
+        if not (len(take) == 2 or len(land) == 2 or take == land):
+            near = [y - x for x, y in strides[bisect.bisect_left(starts, a - W):bisect.bisect_right(starts, a + W)]
+                    if x != a]
+            if d < jc["leap_flight"] or (near and d < jc["leap_ratio"] * float(np.median(near)) / FPS):
+                continue
+        # from where the pelvis starts moving to where it stops; when it keeps moving (running, a series
+        # of jumps) from the last touch-down before take-off to the next lift after landing
+        before, after = strikes[strikes < a], lifts[lifts > e]
+        lo = max(0, a - W, int(before[-1]) if len(before) else 0)
+        hi = min(T, e + W, int(after[0]) if len(after) else T)
+        s0 = _quiet_before(av, a, lo, jc["onset_frac"] * av[lo:a + 1].max(), q)
+        e0 = _quiet_after(av, e, hi, jc["onset_frac"] * av[e - 1:hi].max(), q)
         lab[s0:e0] = "점프"
         kind = "hop" if take == land and len(take) == 1 else ("two_foot" if len(take) == 2 else "leap")
         attrs.append(("이동", "점프", s0, e0, {"flight_s": round(d, 2), "kind": kind, "takeoff": int(a),
                                              "landing": int(e)}))
 
-    # hanging: people do not stay a second in the air jumping; both feet up and both arms over the head
+    # hanging: a second or more with both feet hang_height up, both arms over the head and the pelvis at
+    # least at its standing height (held up by the arms; people do not stay a second in the air jumping)
     low = lambda s: np.minimum(f[f"heel_h_{s}"], f[f"toe_h_{s}"])
-    floating = (low("l") > jc["hang_height"]) & (low("r") > jc["hang_height"]) & \
-               (f["arm_elev_l"] >= 90) & (f["arm_elev_r"] >= 90)
-    hang |= floating
+    hang = (low("l") > jc["hang_height"]) & (low("r") > jc["hang_height"]) & \
+           (f["arm_elev_l"] >= 90) & (f["arm_elev_r"] >= 90) & (f["pelvis_h"] >= 1.0)
     for a, e in runs(hang):
         if (e - a) / FPS >= jc["max_flight"]:
             lab[a:e] = "매달림"
@@ -415,16 +489,30 @@ def posture_state(f, dims, pc):
     ph, trunk = f["pelvis_h"], f["trunk"]
     kf_min = np.minimum(f["knee_flex_l"], f["knee_flex_r"])
     kh = np.minimum(f["knee_h_l"], f["knee_h_r"])
+    kf_low = np.where(f["knee_h_l"] <= f["knee_h_r"], f["knee_flex_l"], f["knee_flex_r"])  # the lower knee's bend
     hands_low = np.maximum(f["hand_h_l"], f["hand_h_r"]) * dims["stature"] < pc["floor_contact"]
     floor_level = ph < pc["floor_pelvis"]
     inverted = f["head_rel"] < -pc["inverted"]
-    crawl = (trunk >= pc["lie_trunk"]) & hands_low & (kh < pc["floor_contact"])
+    # on hands and knees the thighs hold the pelvis up, about a thigh above the knees; lying it is down at their
+    # level: all fours needs it at least half a thigh above the lower knee
+    pelvis_up = ph * dims["pelvis_h"] - kh >= 0.5 * dims["thigh"]
+    crawl = (trunk >= pc["lie_trunk"]) & hands_low & (kh < pc["floor_contact"]) & pelvis_up
     lie = floor_level & (trunk >= pc["lie_trunk"]) & ~crawl
-    kneel = (kh < pc["floor_contact"]) & ~crawl & ~lie
-    sit = ((ph < pc["low_pelvis"]) & (f["pelvis_behind"] >= pc["sit_behind"])) | \
-          (floor_level & (trunk < pc["lie_trunk"]))
+    # a knee on the floor under a body that is not lying: kneeling, with that knee bent (the shank on the floor)
+    kneel = (kh < pc["floor_contact"]) & (kf_low >= pc["squat_knee"]) & ~crawl & ~lie
+    # sitting: the pelvis low and behind the feet (a chair), at floor level upright, or on a high seat with the
+    # pelvis kept in place, knees bent squat_knee or more and either the pelvis behind the feet under an upright
+    # trunk (the weight behind the feet: standing would fall back) or both feet off the floor (floor_contact;
+    # on a rung or hanging), so the legs do not hold the body up
+    feet_up = np.minimum(np.minimum(f["heel_h_l"], f["toe_h_l"]), np.minimum(f["heel_h_r"], f["toe_h_r"])) > \
+        pc["floor_contact"]
+    behind = f["pelvis_behind"] >= pc["sit_behind"]
+    sit = ((ph < pc["low_pelvis"]) & behind) | \
+          (floor_level & (trunk < pc["lie_trunk"])) | \
+          ((kf_min >= pc["squat_knee"]) & (f["speed"] < pc["seat_speed"]) &
+           ((behind & (trunk < pc["bend_trunk"])) | ((ph >= pc["low_pelvis"]) & (trunk < pc["lie_trunk"]) & feet_up)))
     squat = (ph < pc["low_pelvis"]) & (kf_min >= pc["squat_knee"])
-    bend = trunk >= pc["bend_trunk"]
+    bend = hysteresis(trunk, pc["bend_trunk"], pc["bend_trunk"] - pc["bend_band"])
     st = np.select([inverted, crawl, lie, kneel, sit, squat, bend],
                    ["거꾸로", "네발 자세", "누움", "무릎 꿇기", "앉음", "쪼그림", "허리 굽힘"], "선 자세").astype(object)
     return smooth_labels(st, pc["min_state"])
@@ -469,22 +557,27 @@ def posture(f, dims, pc):
 
 
 def transition_kind(A, B):
+    """앉기 into a seat, 일어서기 out of a seat or up from the floor; other changes (a squat, a kneel,
+    a bend and back) are 낮추기 / 높이기 by the posture's rank."""
     up = {"선 자세", "허리 굽힘"}
     if B == "앉음" and A in up:
         return "앉기"
-    if A in ("앉음", "누움", "네발 자세", "무릎 꿇기", "쪼그림", "거꾸로") and B in up:
+    if A in ("앉음", "누움", "네발 자세", "거꾸로") and B in up:
         return "일어서기"
     return "낮추기" if POSTURE_RANK.get(B, 0) > POSTURE_RANK.get(A, 0) else "높이기"
 
 
 # ---------------------------------------------------------------- 손
 def hand(f, dims, s, hc, track):
-    """One hand. Held out = the upper arm arm_raise deg or more from the trunk, or the hand at floor
-    level below the pelvis. The movement into held out = 뻗기, while held out = 작업, the movement out = 되돌리기."""
+    """One hand. Held out = the upper arm arm_raise deg or more from the trunk, or the hand down at floor
+    level, below the knees and the pelvis (not resting on the knees seated, or by a body on the floor).
+    The movement into held out = 뻗기, while held out = 작업, the movement out = 되돌리기."""
     T = len(f["speed"])
     v = f[f"hand_v_{s}"]
+    wrist = f[f"hand_h_{s}"] * dims["stature"]
     ext = (f[f"arm_elev_{s}"] >= hc["arm_raise"]) | \
-          ((f[f"hand_h_{s}"] < hc["floor_zone"]) & (f[f"hand_below_pelvis_{s}"] > hc["below_pelvis"]))
+          ((f[f"hand_h_{s}"] < hc["floor_zone"]) & (wrist < np.maximum(f["knee_h_l"], f["knee_h_r"])) &
+           (f[f"hand_below_pelvis_{s}"] > hc["below_pelvis"]))
     ext = drop_short(fill_gaps(ext, sec(hc["min_gap"])), sec(hc["min_ext"]))
     lab = np.full(T, "휴지", dtype=object)
     attrs = []
@@ -538,14 +631,19 @@ def _local_min_before(v, p, lo, below):
 
 
 def carry(f, dims, cc):
-    """Both hands holding: in front of the body, between knee and shoulder height, at least an
-    object's width apart and that distance steady (a rigid object held with both hands)."""
+    """Both hands holding: in front of the body with the forearms pointing ahead, between knee and
+    shoulder height, abreast, not resting on the lap, at least an object's width apart and that
+    distance steady (a rigid object held with both hands)."""
     d = f["hands_dist"]
     n = sec(cc["std_window"])
     m1 = uniform_filter1d(d, n, mode="nearest")
     sd = np.sqrt(np.maximum(uniform_filter1d(d * d, n, mode="nearest") - m1 * m1, 0))
     h_ok = lambda s: (f[f"hand_h_{s}"] >= cc["min_h"]) & (f[f"hand_h_{s}"] < cc["max_h"])
+    abreast = uniform_filter1d(np.abs(f["hand_fwd_l"] - f["hand_fwd_r"]), n, mode="nearest") < \
+        cc["abreast"] * dims["stature"]
     m = (f["hand_fwd_l"] > cc["front"]) & (f["hand_fwd_r"] > cc["front"]) & h_ok("l") & h_ok("r") & \
+        ((f["forearm_fwd_l"] + f["forearm_fwd_r"]) / 2 >= cc["forearm"]) & abreast & \
+        (f["hand_lap_l"] >= cc["lap_rest"]) & (f["hand_lap_r"] >= cc["lap_rest"]) & \
         (d >= cc["min_width"]) & (sd < cc["max_std"])
     m = drop_short(fill_gaps(m, sec(0.2)), sec(cc["min_dur"]))
     return np.where(m, "들기", "없음").astype(object)
@@ -557,7 +655,7 @@ def tracks(f, dims, cfg):
     st = stance(f, cfg["contact"])
     steps = find_steps(f, st, cfg["step"])
     air = airborne(f, st, cfg["contact"])
-    loco, turn, _ = locomotion(f, st, steps, air, cfg)
+    loco, turn, _ = locomotion(f, dims, st, steps, air, cfg)
     post, pa = posture(f, dims, cfg["posture"])
     hl, _ = hand(f, dims, "l", cfg["hand"], "왼손")
     hr, _ = hand(f, dims, "r", cfg["hand"], "오른손")
@@ -569,5 +667,5 @@ def tracks(f, dims, cfg):
     both = np.array([a if rank[a] <= rank[b] else b for a, b in zip(hl, hr)], dtype=object)
     out = {"이동": loco, "회전": turn, "자세": post, "자세전환": kind, "왼손": hl, "오른손": hr, "손": both,
            "양손": carry(f, dims, cfg["carry"]),
-           "걸음": np.where(walking(steps, T, cfg["gait"]["max_pause"]), "걸음 중", "없음").astype(object)}
+           "걸음": np.where(walking(steps, T, cfg["gait"]), "걸음 중", "없음").astype(object)}
     return out, steps

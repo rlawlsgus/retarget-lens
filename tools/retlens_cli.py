@@ -1,5 +1,6 @@
 """retlens-cli: RetLens without a window, for scripts and AI agents. Every command prints one
-JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"error": ...}).
+JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"error": ...});
+autolabel: 1 = no motion labelled, 2 = some not (their rows have labels.error).
 
     retlens-cli info                        # version, file locations, 환경 점검
     retlens-cli library --query walk        # motion files (with CMU descriptions)
@@ -180,7 +181,10 @@ def _smpl():
 
 def autolabel(args) -> dict:
     """자동 라벨 of human motions by a rule file, from their skeletons alone (no retargeting); with --out
-    each motion's segments also go to <out>/<stem>.labels.csv (put one next to its motion and RetLens shows it)."""
+    each motion's segments also go to <out>/.../<stem>.labels.csv (put one next to its motion and RetLens
+    shows it). A motion labelled with no segments gets a CSV of the header only; one that could not be
+    labelled gets none, and a CSV of an earlier run at its place is removed (csv_removed), so <out> holds
+    only this run's labels. Exit code 1 when no motion could be labelled, 2 when some could not."""
     from retlens import autolabel as al
     from retlens import motion_labels
     from retlens.compare import find_take, load_skeleton
@@ -189,7 +193,7 @@ def autolabel(args) -> dict:
     if not rules:
         raise ValueError(f"no rule file: pass --rules, set 자동 라벨 규칙 in RetLens or ${al.ENV} "
                          f"(an example: {al.EXAMPLE})")
-    al.check_rules(rules)  # a broken rule file stops here, not once per motion
+    checked = al.check_rules(rules)  # a broken rule file stops here, not once per motion
     csv_for = _label_csv_names(args.files, args.out) if args.out else {}
     out = []
     for f in args.files:
@@ -204,20 +208,46 @@ def autolabel(args) -> dict:
                 row["solved_motion"] = src
             lab = al.label_motion(load_skeleton(src, smpl_model_dir=_smpl()), rules)
         except Exception as e:
-            lab = motion_labels.MotionLabels(path=rules, error=f"{type(e).__name__}: {e}", auto="error")
+            lab = motion_labels.MotionLabels(path=rules, error=f"{type(e).__name__}: {e}",
+                                             auto=checked["name"] or os.path.splitext(os.path.basename(rules))[0])
         row["labels"] = lab.summary(segments=not args.summary)
-        if args.out and lab.segments:
+        if args.out:
             path = csv_for[f]
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            row["csv"] = motion_labels.save_csv(lab, path)
+            if not lab.error:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                row["csv"] = motion_labels.save_csv(lab, path)
+            elif os.path.isfile(path):  # an earlier run's labels would pass for this run's
+                os.remove(path)
+                row["csv_removed"] = path
         out.append(row)
-    return {"rules": os.path.abspath(rules), "motions": out}
+    failed = sum(bool(r["labels"]["error"]) for r in out)
+    return _Exit({"rules": os.path.abspath(rules), "motions": out},
+                 1 if out and failed == len(out) else 2 if failed else 0)
+
+
+class _Exit(dict):
+    """A command's JSON with its own exit code (autolabel: some or all motions failed)."""
+
+    def __init__(self, out: dict, code: int):
+        super().__init__(out)
+        self.code = code
+
+
+def _folder_below(d: str) -> str:
+    """A folder as a relative path, its drive or network share a folder of its own:
+    C:\\mocap\\s01 -> C\\mocap\\s01, \\\\nas\\mocap\\s01 -> nas_mocap\\s01."""
+    drive, rest = os.path.splitdrive(d)
+    drive = drive.replace(":", "").strip("\\/").replace("\\", "_").replace("/", "_")
+    return os.path.join(drive, rest.lstrip("\\/"))
 
 
 def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
-    """<out>/<stem>.labels.csv per motion. Motions of the same name (AMASS: 0000_treadmill_norm_stageii in
-    every subject's folder) keep their folders below <out>, from where their paths part; the same name in
-    the same folder (X.c3d and X.bvh) gets the extension too, so no file is written over another."""
+    """<out>/<stem>.labels.csv per motion, always named so RetLens finds it next to its motion. Motions
+    of the same name (AMASS: 0000_treadmill_norm_stageii in every subject's folder) keep their folders
+    below <out>, from where their paths part (on other drives or shares: from the drive); the same name in
+    the same folder (X.c3d and X.bvh) goes one folder further down, by extension (<out>/c3d/X.labels.csv).
+    Every path is inside <out>: nothing is written next to the motions."""
+    root = os.path.abspath(out)
     by: dict[str, list[str]] = {}
     for f in dict.fromkeys(files):
         by.setdefault(os.path.splitext(os.path.basename(f))[0].lower(), []).append(f)
@@ -226,14 +256,17 @@ def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
         dirs = [os.path.dirname(os.path.abspath(f)) for f in group]
         try:
             base = os.path.commonpath(dirs) if len(group) > 1 else ""
-        except ValueError:  # on different drives: C\..., D\...
+        except ValueError:  # on different drives or shares: C:\..., \\nas\share\...
             base = None
         for f, d in zip(group, dirs):
             stem, ext = os.path.splitext(os.path.basename(f))
-            sub = d.replace(":", "") if base is None else os.path.relpath(d, base) if base else "."
-            same_folder = sum(x == d for x in dirs) > 1
-            name = f"{stem}{ext}.labels.csv" if same_folder else f"{stem}.labels.csv"
-            names[f] = os.path.abspath(os.path.join(out, sub, name))
+            sub = _folder_below(d) if base is None else os.path.relpath(d, base) if base else "."
+            if sum(os.path.normcase(x) == os.path.normcase(d) for x in dirs) > 1:
+                sub = os.path.join(sub, ext.lstrip(".").lower() or "_")
+            path = os.path.abspath(os.path.join(root, sub, f"{stem}.labels.csv"))
+            if os.path.commonpath([os.path.normcase(path), os.path.normcase(root)]) != os.path.normcase(root):
+                raise ValueError(f"--out 밖에 쓰게 됩니다: {path}")  # a guard: label files next to motions are the user's
+            names[f] = path
     return names
 
 
@@ -282,7 +315,9 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("autolabel", help="자동 라벨: label human motions by a rule file (no retargeting)")
     p.add_argument("files", nargs="+")
     p.add_argument("--rules", default=None, help="rule file (default: the 자동 라벨 규칙 setting / $RETLENS_LABEL_RULES)")
-    p.add_argument("--out", default=None, help="folder for <stem>.labels.csv of each motion (same names: their folders below it)")
+    p.add_argument("--out", default=None,
+                   help="folder for <stem>.labels.csv of each motion (same names: their folders below it; "
+                        "a motion that fails: an earlier run's CSV there is removed)")
     p.add_argument("--summary", action="store_true", help="counts and tracks only, not every segment")
     p = sub.add_parser("c3d-qc", help="raw marker QC of C3D files")
     p.add_argument("files", nargs="+")
@@ -316,7 +351,8 @@ def main(argv=None) -> int:
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # stdout carries the JSON only: banners and prints (viser, GMR) go to stderr
     try:
-        out, code = run(args), 0
+        out = run(args)
+        code = getattr(out, "code", 0)
     except Exception as e:
         out, code = {"error": f"{type(e).__name__}: {e}"}, 1
     finally:

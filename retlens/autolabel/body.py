@@ -7,18 +7,23 @@ The tracks need 17 joints (signals.JOINTS) at 30 fps and six body sizes (signals
   the sizes estimated from the bone lengths with body proportions of Winter (2009),
   Biomechanics and Motor Control of Human Movement, table 4.1: thigh 0.245 H and shank 0.246 H
   of stature H, ankle height 0.039 H; the toe joint's height from how far it sits below the
-  ankle while the foot stands flat.
+  ankle while the foot stands flat. A skeleton with no toe joint (the ankle a leaf, as in
+  Daz / Poser FBX) gets a toe point half a foot length (0.152 H) in front of the ankle, the foot
+  held at right angles to the shank.
 """
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
 from ..motion import SkeletonMotion
-from .signals import FPS, JOINTS, resample, support_velocity
+from .signals import FPS, JOINTS, resample, support_shift, support_velocity
 
 LEG = 0.245 + 0.246  # thigh + shank / stature
 ANKLE = 0.039  # ankle height / stature
+BALL = 0.152 / 2  # ankle to the ball of the foot / stature: half the foot length
 _SMPL = {"pelvis": "pelvis", "head": "head", "spine3": "spine3",
          **{f"{s}_{j}": f"{side}_{j}" for s, side in (("l", "left"), ("r", "right"))
             for j in ("hip", "knee", "ankle", "foot", "shoulder", "elbow", "wrist")}}
@@ -27,7 +32,8 @@ _HEADS = ("Head", "head", "HEAD")
 
 
 def joint_index(human: SkeletonMotion) -> dict[str, int]:
-    """signals.JOINTS -> the motion's joint index. ValueError naming what is missing."""
+    """signals.JOINTS -> the motion's joint index. ValueError naming what is missing. With no toe
+    joint the foot is the ankle's index (prepare puts a toe point on the sole)."""
     names = list(human.joint_names)
     lookup = {n: i for i, n in enumerate(names)}
     if all(v in lookup for v in _SMPL.values()):
@@ -53,11 +59,9 @@ def joint_index(human: SkeletonMotion) -> dict[str, int]:
             idx[f"{s}_{ours}"] = find(_LEFT_ALIASES[part], s, what)
         try:
             idx[f"{s}_foot"] = find(_TOES, s, "발끝")
-        except ValueError:  # no toe joint by name: the ankle's child (a toe end site at least)
+        except ValueError:  # no toe joint by name: the ankle's child (a toe end site at least), else the ankle
             kids = [i for i, p in enumerate(parents) if p == idx[f"{s}_ankle"]]
-            if not kids:
-                raise
-            idx[f"{s}_foot"] = kids[0]
+            idx[f"{s}_foot"] = kids[0] if kids else idx[f"{s}_ankle"]
     # chest = the spine joint the arm hangs from (past a clavicle / shoulder joint), as retargeting takes it
     p = int(parents[idx["l_shoulder"]])
     if any(k in names[p].lower() for k in ("shoulder", "clavicle", "collar")):
@@ -70,17 +74,26 @@ def joint_index(human: SkeletonMotion) -> dict[str, int]:
     return idx
 
 
-def dims_from_model(model_path: str, betas, num_betas: int = 16) -> dict:
-    """Body sizes of an SMPL-family body model with these betas, on its rest pose (model Y up)."""
+@functools.lru_cache(maxsize=4)
+def _model(model_path: str, num_betas: int):
+    """(v_template, shapedirs[..., :num_betas], J_regressor[:22]) of a body model file, read once
+    (the file is about 100 MB; every motion of the same model uses it)."""
     m = np.load(model_path, allow_pickle=True)
-    b = np.zeros(num_betas)
-    betas = np.asarray(betas, dtype=np.float64).reshape(-1)
-    b[:min(len(betas), num_betas)] = betas[:num_betas]
-    v = m["v_template"].astype(np.float64) + m["shapedirs"][:, :, :num_betas].astype(np.float64) @ b
     reg = m["J_regressor"]
     if reg.dtype == object:  # scipy sparse pickled into the npz
         reg = reg.item().toarray()
-    j = np.asarray(reg, dtype=np.float64)[:22] @ v
+    return (m["v_template"].astype(np.float64), m["shapedirs"][:, :, :num_betas].astype(np.float64),
+            np.asarray(reg, dtype=np.float64)[:22])
+
+
+def dims_from_model(model_path: str, betas, num_betas: int = 16) -> dict:
+    """Body sizes of an SMPL-family body model with these betas, on its rest pose (model Y up)."""
+    v0, sd, reg = _model(model_path, num_betas)
+    b = np.zeros(num_betas)
+    betas = np.asarray(betas, dtype=np.float64).reshape(-1)
+    b[:min(len(betas), num_betas)] = betas[:num_betas]
+    v = v0 + sd @ b[:sd.shape[2]]
+    j = reg @ v
     sole = v[:, 1].min()
     dist = lambda a, c: float(np.linalg.norm(j[a] - j[c]))
     # SMPL joint order: 0 pelvis, 1 left_hip, 4 left_knee, 7 left_ankle, 10 left_foot, 16 / 18 / 20 left shoulder / elbow / wrist
@@ -96,12 +109,11 @@ def dims_from_motion(P: dict) -> tuple[dict, list[str]]:
     stature = (thigh + shank) / LEG
     h_ankle = ANKLE * stature
     notes = ["체형(키·발목 높이 등)은 몸 모델이 없어 뼈 길이로 추정함 (BVH·FBX). 같은 촬영의 SMPL-X와는 "
-             "관절 위치가 달라 라벨이 조금 다를 수 있음"]
+             "관절 위치가 달라 라벨이 조금 다를 수 있음 (특히 허리를 20도 안팎으로 굽힌 자세)"]
     # the toe joint sits below the ankle joint by (h_ankle - h_toe) while the foot stands flat and still;
     # on a treadmill the standing foot goes with the belt, so still is looked for in the belt's frame
     belt = support_velocity(P, {"h_ankle": h_ankle, "h_toe": h_ankle / 2})
-    t = np.arange(len(P["pelvis"]))[:, None] / FPS
-    shift = np.concatenate([belt[None, :] * t, np.zeros_like(t)], axis=1)
+    shift = np.concatenate([support_shift(belt), np.zeros((len(belt), 1))], axis=1)
     drops = []
     for s in ("l", "r"):
         ank, toe = P[f"{s}_ankle"] - shift, P[f"{s}_foot"] - shift
@@ -137,9 +149,32 @@ def prepare(human: SkeletonMotion) -> tuple[dict, dict, list[str]]:
         raise ValueError(f"너무 짧습니다: {human.num_frames}프레임 ({human.duration:.3f} s). "
                          f"자동 라벨은 {FPS:g} fps로 2프레임({2 / FPS:.2f} s) 이상이어야 합니다")
     P = {k: P30[:, i] for i, k in enumerate(JOINTS)}
+    toeless = [s for s in ("l", "r") if idx[f"{s}_foot"] == idx[f"{s}_ankle"]]
+    for s in toeless:
+        P[f"{s}_foot"] = toe_point(P, s)
     model = human.meta.get("model_path")
     if model and human.meta.get("betas") is not None:
         dims = dims_from_model(model, human.meta["betas"])
-        return P, dims, [f"체형은 몸 모델과 betas로 계산: 키 {dims['stature']:.2f} m"]
-    dims, notes = dims_from_motion(P)
+        notes = [f"체형은 몸 모델과 betas로 계산: 키 {dims['stature']:.2f} m"]
+    else:
+        dims, notes = dims_from_motion(P)
+    if toeless:
+        notes.append("발끝 관절이 없어 발끝을 발목 앞의 점으로 추정함 (발이 정강이와 직각이라고 봄)")
     return P, dims, notes
+
+
+def toe_point(P: dict, s: str) -> np.ndarray:
+    """A toe point for a foot with no toe joint (30 fps joints): on the sole, half a foot length in front
+    of the ankle, with the foot at right angles to the shank and turned with the hips. signals measures
+    each point against its own height while the foot stands, so a shank that is not upright then does
+    not matter; when the real foot points down (push-off) this point goes under the floor, which still
+    reads as touching it, and in the swing it rises with the foot."""
+    bone = lambda a, b: float(np.median(np.linalg.norm(P[a] - P[b], axis=1)))
+    stature = (bone("l_hip", "l_knee") + bone("r_hip", "r_knee") + bone("l_knee", "l_ankle") +
+               bone("r_knee", "r_ankle")) / 2 / LEG
+    ank = P[f"{s}_ankle"]
+    u = ank - P[f"{s}_knee"]
+    u /= np.linalg.norm(u, axis=1, keepdims=True) + 1e-9  # down the shank
+    fwd = np.cross(u, P["l_hip"] - P["r_hip"])  # the knee bends about the hip line: the foot points this way
+    fwd /= np.linalg.norm(fwd, axis=1, keepdims=True) + 1e-9
+    return ank + BALL * stature * fwd + ANKLE * stature * u

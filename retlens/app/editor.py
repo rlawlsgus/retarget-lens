@@ -21,6 +21,7 @@ a Qt WebEngine view with viser's own control panel hidden; every control lives i
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import threading
@@ -169,6 +170,7 @@ class SceneBridge(QObject):
     """Scene events (any thread) -> the Qt main thread."""
     event = Signal(str, object)
     added = Signal(object)  # Item, or an error text
+    labelled = Signal(object)  # (job, item, automatic labels) made off the GUI thread
     log = Signal(str)
 
 
@@ -602,6 +604,29 @@ class SceneSettingsPanel(QScrollArea):
 
 
 # ------------------------------------------------------------------------------ timeline
+RULER_STEPS = (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600)
+
+
+def ruler_step(span: float) -> float:
+    """Seconds between the timeline's ticks: at most 14 of them, however long the motions are."""
+    need = span / 14
+    return next((s for s in RULER_STEPS if s >= need), 3600 * math.ceil(need / 3600))
+
+
+class _Same:
+    """Equal only to itself wrapping the same object, which it keeps alive (unlike id())."""
+    __slots__ = ("obj",)
+
+    def __init__(self, obj):
+        self.obj = obj
+
+    def __eq__(self, other):
+        return isinstance(other, _Same) and other.obj is self.obj
+
+    def __hash__(self):
+        return id(self.obj)
+
+
 class TimelineTracks(QWidget):
     """Ruler, one bar per motion (its offset and length, falls in red), its labelled segments in
     lanes under the bar (one lane per label track, retlens.motion_labels) and the playhead. A
@@ -638,7 +663,14 @@ class TimelineTracks(QWidget):
         return out
 
     def _row_at(self, y: float):
+        if y < self._ruler_top() + self.RULER_H:  # the ruler stays over the rows scrolled under it
+            return None
         return next((r for r in self._rows() if r[1] <= y < r[1] + r[2]), None)
+
+    def _ruler_top(self) -> int:
+        """Where the ruler is drawn: the top of the part in view (in TimelinePanel's scroll area the
+        rows scroll and the ruler stays)."""
+        return max(0, -self.y())
 
     def _seg_rect(self, it: Item, y: int, lane: dict, s, span, dur: float) -> QRectF | None:
         """Where a segment is drawn: clipped to what plays (a physics result may be shorter); None past
@@ -694,11 +726,14 @@ class TimelineTracks(QWidget):
         w = max(1, self.width() - self.NAME_W - 10)
         return lo + (x - self.NAME_W) / w * (hi - lo)
 
-    def _layer_key(self) -> tuple:
-        """Everything the picture under the playhead depends on."""
+    def _layer_key(self, rows: list | None = None) -> tuple:
+        """Everything the picture under the playhead depends on (rows: as _rows() laid them out).
+        Motions and labels are compared as objects, not by id(): a freed label set's id can come
+        back for the next one, which would look unchanged."""
         sc, sel, pal = self.win.scene, self.win.selected, self.palette()
-        rows = tuple((id(it), it.label, id(it.labels), it.offset, it.visible, it.color, sc.shown(it).robot.duration,
-                      it is sel, tuple(sc.falls(it))) for it in list(sc.items))
+        rows = tuple((_Same(it), it.label, _Same(labels), it.offset, it.visible, it.color, sc.shown(it).robot.duration,
+                      it is sel, tuple(sc.falls(it))) for it, _y, _h, _tracks, labels in
+                     (rows if rows is not None else self._rows()))
         return (self.width(), self.height(), self.devicePixelRatioF(), self._span(), rows,
                 pal.color(QPalette.Base).rgba(), pal.color(QPalette.Text).rgba(), self.font().key())
 
@@ -707,14 +742,17 @@ class TimelineTracks(QWidget):
         return self._layer_key(), self.win.scene.t
 
     def paintEvent(self, _):
-        key = self._layer_key()
+        rows = self._rows()
+        key = self._layer_key(rows)
         if self._layer is None or self._layer[0] != key:
             dpr = self.devicePixelRatioF()
             pm = QPixmap(max(1, round(self.width() * dpr)), max(1, round(self.height() * dpr)))
             pm.setDevicePixelRatio(dpr)
             lp = QPainter(pm)
-            self._paint_layer(lp, key[3])
-            lp.end()
+            try:
+                self._paint_layer(lp, key[3], rows)
+            finally:  # a painter left open on the pixmap kills the process when the pixmap goes
+                lp.end()
             self._layer = (key, pm)
         p = QPainter(self)
         p.drawPixmap(0, 0, self._layer[1])
@@ -722,38 +760,53 @@ class TimelineTracks(QWidget):
         sc, span = self.win.scene, key[3]
         p.setPen(QPen(self.palette().color(QPalette.Text), 1.5))
         p.setBrush(Qt.NoBrush)
-        for it, y, _h, tracks, labels in self._rows():  # the segment being played in each lane: outlined
+        for it, y, _h, tracks, labels in rows:  # the segment being played in each lane: outlined
             if tracks:
                 lane, dur = {t: k for k, t in enumerate(tracks)}, sc.shown(it).robot.duration
                 for s in labels.at(sc.t - it.offset):
                     r = self._seg_rect(it, y, lane, s, span, dur)
                     if r is not None:
                         p.drawRect(r.adjusted(1, 1, -1, -1))
+        self._paint_ruler(p, span)
         x = self._x(sc.t, span)
         p.setPen(QPen(QColor(255, 150, 40), 2))
         p.drawLine(int(x), 0, int(x), self.height())
 
-    def _paint_layer(self, p: QPainter, span) -> None:
+    def _ruler_ticks(self, span):
+        lo, hi = span
+        step = ruler_step(hi - lo)
+        t = np.ceil(lo / step) * step
+        while t <= hi + 1e-9:
+            yield t, self._x(t, span)
+            t += step
+
+    def _paint_ruler(self, p: QPainter, span) -> None:
+        """The time ruler at the top of the part in view (the rows under it scroll, it does not)."""
+        pal, top = self.palette(), self._ruler_top()
+        p.fillRect(0, top, self.width(), self.RULER_H, pal.color(QPalette.Base))
+        small = QFont(self.font())
+        small.setPointSizeF(max(7.0, small.pointSizeF() - 1))
+        p.setFont(small)
+        for t, x in self._ruler_ticks(span):
+            p.setPen(pal.color(QPalette.Mid))
+            p.drawLine(int(x), top + self.RULER_H - 6, int(x), top + self.RULER_H)
+            p.setPen(pal.color(QPalette.Text))
+            p.drawText(int(x) + 3, top + self.RULER_H - 8, f"{t:g}s")
+
+    def _paint_layer(self, p: QPainter, span, rows: list | None = None) -> None:
+        rows = rows if rows is not None else self._rows()
         p.setRenderHint(QPainter.Antialiasing)
         pal = self.palette()
         p.fillRect(self.rect(), pal.color(QPalette.Base))
         text, grid = pal.color(QPalette.Text), pal.color(QPalette.Mid)
-        lo, hi = span
-        step = next(s for s in (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120) if (hi - lo) / s <= 14)
-        p.setPen(text)
         small = QFont(self.font())
         small.setPointSizeF(max(7.0, small.pointSizeF() - 1))
         p.setFont(small)
-        t = np.ceil(lo / step) * step
-        while t <= hi + 1e-9:
-            x = self._x(t, span)
-            p.setPen(grid)
+        p.setPen(grid)
+        for _t, x in self._ruler_ticks(span):  # the grid; the ruler's numbers are drawn over it in view
             p.drawLine(int(x), self.RULER_H - 6, int(x), self.height())
-            p.setPen(text)
-            p.drawText(int(x) + 3, self.RULER_H - 8, f"{t:g}s")
-            t += step
         sc, sel = self.win.scene, self.win.selected
-        for it, y, h, tracks, labels in self._rows():
+        for it, y, h, tracks, labels in rows:
             if it is sel:
                 p.fillRect(0, y, self.width(), h, pal.color(QPalette.Highlight).darker(250))
             broken = labels is not None and bool(labels.error)  # its label file could not be used: say so
@@ -908,6 +961,7 @@ class TimelinePanel(QWidget):
         self.scroll.setFrameShape(QScrollArea.NoFrame)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setMinimumHeight(TimelineTracks.RULER_H + 2 * TimelineTracks.ROW_H + 4)
+        self.scroll.verticalScrollBar().valueChanged.connect(lambda _: self.tracks.update())  # the ruler stays on top
         lay.addWidget(self.scroll, 1)
         self._view = None  # tracks.view_key() last drawn
         self._playing = None  # the play button's icon shows this
@@ -1635,6 +1689,13 @@ def _path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
+def _pick_label_file(files: list[str], source: str) -> str:
+    """Of the label files dropped with one motion, the one opening it would pick (its own names
+    first, in motion_labels' order), else the first dropped."""
+    order = {_path_key(p): i for i, p in enumerate(motion_labels.candidates(source))}
+    return min(files, key=lambda f: order.get(_path_key(f), len(order)))
+
+
 def _motion_for_label(label: str, motions: list[str], prefer: str | None = None) -> str | None:
     """The motion file a label file is named after (02_01.labels.csv -> 02_01.bvh, else the same take
     02_01_stageii.npz); of several, the one in the label file's folder, else `prefer`, else the first."""
@@ -2175,6 +2236,8 @@ class EditorWindow(QMainWindow):
         self.bridge = SceneBridge()
         self.bridge.event.connect(self._on_scene)
         self.bridge.added.connect(self._on_added)
+        self.bridge.labelled.connect(self._on_labelled)
+        self._label_jobs: dict[Item, dict] = {}  # 자동 라벨 being made off the GUI thread: each motion's latest request
         self.bridge.log.connect(self._append_log)
         scene.listen(lambda e, p: self.bridge.event.emit(e, p))
         base_log = scene.log
@@ -2183,7 +2246,7 @@ class EditorWindow(QMainWindow):
         self._eula = accept_eula or self.settings.value("isaac/eula_accepted", False, type=bool)
         scene.runner.accept_eula = self._eula
         self._loading = 0
-        self._pending_labels: dict[str, str] = {}  # label files dropped with their motion, by that file (_path_key)
+        self._pending_labels: dict[str, list[str]] = {}  # label files dropped with their motion, by that file (_path_key)
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
         self.setDockOptions(QMainWindow.AnimatedDocks | QMainWindow.AllowTabbedDocks | QMainWindow.AllowNestedDocks)
@@ -2628,6 +2691,10 @@ class EditorWindow(QMainWindow):
 
     def reload_labels(self, it: Item) -> None:
         """다시 읽기: the label file, or the automatic labels made again (a failure is said, labels kept)."""
+        lab = it.labels
+        if lab is not None and lab.auto:  # made again off the GUI thread
+            self.auto_label(it, lab.path or None)
+            return
         self._show_labels_result(it, self.scene.reload_labels(it))
 
     def pick_label_rules(self, it: Item | None = None) -> str:
@@ -2636,7 +2703,7 @@ class EditorWindow(QMainWindow):
         outside this repository (configs/ holds only the example)."""
         cur = autolabel.rules_file()
         start = cur if cur else app_paths.documents_dir()
-        path, _ = QFileDialog.getOpenFileName(self, "자동 라벨 규칙 파일 (예시: 프로그램 폴더의 configs\\label_rules_example.yaml)",
+        path, _ = QFileDialog.getOpenFileName(self, f"자동 라벨 규칙 파일 (예시: {os.path.normpath(autolabel.EXAMPLE)})",
                                               start, "규칙 파일 (*.yaml *.yml *.json);;모든 파일 (*)")
         if not path:
             return ""
@@ -2656,7 +2723,7 @@ class EditorWindow(QMainWindow):
                 QMessageBox.warning(self, "자동 라벨", f"규칙 파일이 없습니다:\n{rules}\n\n다른 파일을 고르세요.")
             self.pick_label_rules(it)  # labels it once a file is picked
             return
-        self._show_labels_result(it, self.scene.auto_label(it, rules))
+        self._label_off_gui([it], rules)
 
     def auto_label_all(self) -> None:
         rules = autolabel.rules_file()
@@ -2670,10 +2737,39 @@ class EditorWindow(QMainWindow):
             QMessageBox.warning(self, "자동 라벨", f"규칙 파일을 쓸 수 없습니다. 라벨은 그대로입니다.\n\n{rules}\n{e}")
             return
         human = [it for it in self.scene.items if self.scene.has_skeleton(it)]  # robot motions keep their labels
-        done = [(it, self.scene.auto_label(it, rules)) for it in human]
-        bad = [f"{it.label}: {lab.error}" for it, lab in done if lab.error]
-        skipped = len(self.scene.items) - len(human)
-        self.status(f"자동 라벨: 모션 {len(done) - len(bad)}개" + (f", 붙이지 못한 모션 {len(bad)}개" if bad else "")
+        if human:
+            self._label_off_gui(human, rules, skipped=len(self.scene.items) - len(human))
+
+    def _label_off_gui(self, items: list[Item], rules: str, skipped: int | None = None) -> None:
+        """Make the motions' automatic labels in a worker (an AMASS take or a C3D's solved take takes a
+        second or more to load) and put each on its motion on the GUI thread (_on_labelled), unless it
+        was removed or labelled again meanwhile. skipped: 모두 자동 라벨, said at the end with the
+        robot motions it left as they were; None: one motion, said as any labels are."""
+        job = {"items": items, "done": [], "skipped": skipped}
+        for it in items:
+            self._label_jobs[it] = job  # a later request for the motion wins over this one
+        self.status(f"자동 라벨 계산 중: {items[0].label}" + (f" 외 {len(items) - 1}개" if len(items) > 1 else ""))
+
+        def work():
+            for it in items:
+                self.bridge.labelled.emit((job, it, self.scene.make_auto_labels(it, rules)))
+
+        threading.Thread(target=work, daemon=True, name="auto-label").start()
+
+    def _on_labelled(self, payload) -> None:
+        job, it, lab = payload
+        job["done"].append((it, lab))
+        if self._label_jobs.get(it) is job:
+            del self._label_jobs[it]
+            if any(x is it for x in self.scene.items):
+                self.scene.put_auto_labels(it, lab)
+                if job["skipped"] is None:
+                    self._show_labels_result(it, lab)
+        if job["skipped"] is None or len(job["done"]) < len(job["items"]):
+            return
+        bad = [f"{x.label}: {lb.error}" for x, lb in job["done"] if lb.error]
+        n, skipped = len(job["done"]) - len(bad), job["skipped"]
+        self.status(f"자동 라벨: 모션 {n}개" + (f", 붙이지 못한 모션 {len(bad)}개" if bad else "")
                     + (f", 사람 골격이 없는 로봇 모션 {skipped}개는 그대로" if skipped else ""), 10000)
         if bad:
             QMessageBox.warning(self, "자동 라벨", "자동 라벨을 붙이지 못한 모션은 라벨이 그대로입니다.\n\n" + "\n".join(bad[:10])
@@ -2753,7 +2849,10 @@ class EditorWindow(QMainWindow):
             self.select(result)
             pending = self._pending_labels.pop(_path_key(result.source), None)
             if pending:  # dropped together with this very file
-                self._show_labels_result(result, self.scene.set_labels(result, pending))
+                f = _pick_label_file(pending, result.source)
+                self._show_labels_result(result, self.scene.set_labels(result, f))
+                if len(pending) > 1:  # a motion shows one label file
+                    self.status(f"라벨 파일 {len(pending)}개를 함께 놓아 {os.path.basename(f)}만 {result.label}에 붙였습니다", 10000)
             if len(self.scene.items) == 1 or self._loading == 0:
                 self.scene.fit_camera()
         else:
@@ -2793,11 +2892,13 @@ class EditorWindow(QMainWindow):
             files = [u.toLocalFile() for u in e.mimeData().urls() if u.toLocalFile()]
             labels = [f for f in files if motion_labels.is_label_file(f)]  # before motions: a label table is a .csv
             paths = [f for f in files if f not in labels and f.lower().endswith(MOTION_EXT)]
-            alone = []
+            alone, opened = [], [x.source for x in self.scene.items]
             for f in labels:  # dropped with its motion: attached to that file once it has loaded (_on_added)
                 motion = _motion_for_label(f, paths)
-                if motion is not None and _path_key(motion) not in self._pending_labels:
-                    self._pending_labels[_path_key(motion)] = f
+                if motion is None and len(paths) == 1 and _motion_for_label(f, opened) is None:
+                    motion = paths[0]  # named after no motion, dropped with one: for that one
+                if motion is not None:
+                    self._pending_labels.setdefault(_path_key(motion), []).append(f)
                 else:
                     alone.append(f)
             self.attach_label_files(alone)

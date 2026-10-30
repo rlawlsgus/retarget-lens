@@ -42,6 +42,45 @@ def test_cli_info_and_errors(tmp_path):
     assert all(c["action"] in ("none", "configure", "install", "manual", "blocked") for c in out["components"])
 
 
+def test_cli_autolabel_out_and_exit_codes(tmp_path):
+    """autolabel --out: every CSV inside --out, named as RetLens looks for it; a motion labelled with
+    nothing gets a header-only CSV, one that fails removes an earlier run's; the exit code says failures."""
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import retlens_cli
+    from retlens.synthetic import walking_bvh_text
+
+    names = retlens_cli._label_csv_names
+    out = str(tmp_path / "out")
+    share = [r"\\nas\mocap\s01\take.bvh", r"\\nas\archive\s01\take.bvh"]  # other shares: no common folder
+    got = names(share, out)
+    assert all(os.path.commonpath([p, out]) == out and p.endswith("take.labels.csv") for p in got.values())
+    assert len(set(got.values())) == 2
+    same = [str(tmp_path / "t" / "X.c3d"), str(tmp_path / "t" / "X.bvh")]  # same name, same folder
+    got = names(same, out)
+    assert {os.path.relpath(p, out) for p in got.values()} == {os.path.join("c3d", "X.labels.csv"),
+                                                              os.path.join("bvh", "X.labels.csv")}
+
+    bvh = tmp_path / "walk.bvh"
+    bvh.write_text(walking_bvh_text(seconds=2.0))
+    rules = tmp_path / "r.yaml"
+    rules.write_text("rules:\n  - {label: 물구나무, when: {자세: 거꾸로}}\n", encoding="utf-8")  # nobody is upside down
+    code, res = _cli("autolabel", str(bvh), "--rules", str(rules), "--out", out, tmp_path=tmp_path)
+    csv_path = res["motions"][0]["csv"]
+    assert code == 0 and res["motions"][0]["labels"]["count"] == 0
+    with open(csv_path, encoding="utf-8-sig") as f:
+        assert f.read().strip() == "track,label,name,start_s,end_s,note,color"  # this run's answer: nothing
+    missing = str(tmp_path / "walk2.bvh")
+    os.makedirs(os.path.join(out), exist_ok=True)
+    stale = os.path.join(out, "walk2.labels.csv")
+    with open(stale, "w", encoding="utf-8") as f:
+        f.write("label,start_s,end_s\nold,0,1\n")
+    code, res = _cli("autolabel", str(bvh), missing, "--rules", str(rules), "--out", out, tmp_path=tmp_path)
+    assert code == 2 and res["motions"][1]["labels"]["error"] and res["motions"][1]["csv_removed"] == stale
+    assert not os.path.exists(stale)
+    code, res = _cli("autolabel", missing, "--rules", str(rules), tmp_path=tmp_path)
+    assert code == 1 and res["motions"][0]["labels"]["error"]
+
+
 @needs_sample
 def test_cli_inspect_metrics_compare(tmp_path):
     code, out = _cli("inspect", SAMPLE, "--foot-flat", tmp_path=tmp_path)  # robot motions ignore 리타게팅 보정

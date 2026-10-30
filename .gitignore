@@ -12,7 +12,11 @@ models/
 # 자동 라벨 rule files are a project's own (often private) label definitions: only the example is shared
 configs/label_rules*
 *.rules.yaml
+*.rules.yml
 *.rules.json
+*_subtask.yaml
+*_subtask.yml
+*_subtask.json
 !configs/label_rules_example.yaml
 
 # packaging output (scripts\build_retlens.ps1, scripts\package_release.ps1)

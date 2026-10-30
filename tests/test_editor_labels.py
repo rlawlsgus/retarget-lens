@@ -85,6 +85,22 @@ def test_drop_open_and_attach(tmp_path, monkeypatch):
     editor.EditorWindow._on_added(win, item("a"))  # opened later on its own: no stale label file
     assert attached == []
 
+    # two of its label files, or one of another name, with one motion while another is selected:
+    # all wait for that motion (none goes to the selected one); opening it picks the one opening would
+    win.selected = item("b")
+    sub = tmp_path / "a" / "02_01_subtask.csv"
+    sub.write_text("label,start_s,end_s\nreach,0,1\n", encoding="utf-8")
+    seg = tmp_path / "a" / "segments.csv"
+    seg.write_text("label,start_s,end_s\nidle,0,1\n", encoding="utf-8")
+    drop(tmp_path / "a" / "02_01.bvh", sub, lab, seg)
+    assert alone == [] and len(next(iter(win._pending_labels.values()))) == 3
+    editor.EditorWindow._on_added(win, item("a"))
+    assert len(attached) == 1 and os.path.samefile(attached[0][1], lab)  # <stem>.labels.csv comes first
+    attached.clear()
+    drop(tmp_path / "a" / "02_01.bvh", seg)
+    editor.EditorWindow._on_added(win, item("a"))
+    assert alone == [] and len(attached) == 1 and os.path.samefile(attached[0][1], seg)
+
 
 class _Robot:
     def __init__(self, duration):
@@ -152,6 +168,48 @@ def test_the_timeline_repaints_on_change_and_scrolls(monkeypatch):
     assert hit is not None and hit[0] is it and hit[1].track == "왼손" and hit[1].start == 10.0
     assert tr.segment_at(QPointF(tr._x(it.offset + 10.1), y + 5)) is None  # on the motion's bar, not a lane
     assert tr.segment_at(QPointF(20, lane_y)) is None  # the names column
+    # scrolled down: the ruler stays at the top of what is in view, over the rows under it
+    panel.scroll.verticalScrollBar().setValue(120)
+    APP.processEvents()
+    top = tr._ruler_top()
+    assert top == 120 and tr._row_at(top + 5) is None and tr._row_at(top + tr.RULER_H + 5) is not None
+    assert not tr.grab().isNull()
+
+
+def test_long_timelines_and_a_failed_paint_do_not_crash():
+    """Over 28 min the ruler's step table ran out (StopIteration), and the painter it left open on the
+    layer picture aborted the process on the next paint."""
+    assert editor.ruler_step(1680) == 120 and editor.ruler_step(40 * 60) == 300 and editor.ruler_step(1e5) == 7200
+    it = _item("long", ["이동"])
+    it.robot = _Robot(40 * 60.0)
+    win = types.SimpleNamespace(scene=_Scene([it]), selected=it)
+    panel = editor.TimelinePanel(win)
+    panel.resize(1200, 160)
+    tr = panel.tracks
+    assert not tr.grab().isNull()
+
+    def broken(*a):
+        raise RuntimeError("paint failed")
+
+    tr._layer, tr._paint_layer = None, broken
+    for _ in range(2):  # the error is reported; the painter was closed, so the next paint does not abort
+        try:
+            tr.grab()
+        except RuntimeError:
+            pass
+
+
+def test_the_layer_key_holds_the_labels_themselves():
+    """Equal-looking but different label sets (or one at a freed one's address) draw again."""
+    a, b = motion_labels.MotionLabels(path="x.csv"), motion_labels.MotionLabels(path="x.csv")
+    assert a == b and editor._Same(a) != editor._Same(b) and editor._Same(a) == editor._Same(a)
+    it = _item("m", ["이동"])
+    win = types.SimpleNamespace(scene=_Scene([it]), selected=it)
+    tr = editor.TimelinePanel(win).tracks
+    key = tr._layer_key()
+    assert key[4][0][2].obj is it.labels
+    it.labels = motion_labels.MotionLabels(path="x.csv", segments=list(it.labels.segments))
+    assert tr._layer_key() != key
 
 
 class _Swapping:
