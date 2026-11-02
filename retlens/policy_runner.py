@@ -1,6 +1,7 @@
 """Background MuJoCo runs for 균형 제어 in RetLens's physics mode (retlens/app/scene.py): a robot
-motion replayed with no controller ("pd": open-loop stiff PD) or followed by GMT's tracking policy
-("gmt"), both retlens/policy_replay.py, the same runs as tools/policy_replay.py.
+motion replayed with stiff PD and the pelvis harness ("harness", the default), with no controller
+("pd": open-loop stiff PD) or followed by GMT's tracking policy ("gmt"), all retlens/policy_replay.py,
+the same runs as tools/policy_replay.py.
 
     runner = PolicyRunner(cache_dir)
     job = runner.request(motion, "gmt", on_done=lambda job: ...)
@@ -255,7 +256,8 @@ class PolicyRunner:
         job.stage, job.progress = "결과 저장", 0.96
         files = self.files()
         pr.save_result(res, job.out_npz, motion.joint_names, {
-            **job.info, "controller_label": pr.LABELS[job.controller], "model": MODEL_TEXT,
+            **job.info, "controller_label": pr.LABELS[job.controller],
+            "model": MODEL_TEXT + (", robot self-collision off" if job.controller == "harness" else ""),
             "gmt_files": {"model": files["model"], **({"policy": files["policy"]} if job.controller == "gmt" else {})},
             "physics_config": self.physics_config, "made_by": "RetLens 물리 모드 (retlens/policy_runner.py)"})
         job.result = job.out_npz

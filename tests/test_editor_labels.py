@@ -116,8 +116,12 @@ class _Scene:
 
     shown = staticmethod(lambda it: it)
     falls = staticmethod(lambda it: [])
+    problems = staticmethod(lambda it: {})
     is_policy_result = staticmethod(lambda it: False)
     toggle_play = seek = step = set_playing = staticmethod(lambda *a: None)
+    playlist = None
+    label_catalog = staticmethod(lambda: [])
+    playlist_state = staticmethod(lambda: None)
 
 
 def _item(name, tracks):
@@ -219,7 +223,7 @@ class _Swapping:
     def __init__(self, a, b):
         self._labs, self._n = (a, b), 0
         self.label, self.source, self.offset, self.visible, self.color = "swap", "swap.bvh", 0.0, True, (90, 90, 90)
-        self.robot = _Robot(240.0)
+        self.robot, self.metrics = _Robot(240.0), {}
 
     @property
     def labels(self):
@@ -260,3 +264,58 @@ def test_the_inspectors_segment_list_is_made_as_it_is_shown():
     assert m.data(idx) == "왼손" and m.data(m.index(961, 1)) == "b" and m.data(m.index(961, 3)) == "0.50"
     assert m.data(m.index(961, 1), Qt.DecorationRole) is m.data(m.index(963, 1), Qt.DecorationRole)  # one icon per color
     assert "0.25 – 0.50 s" in m.data(idx, Qt.ToolTipRole)
+
+
+def test_the_timeline_shows_only_what_applies():
+    """The 라벨 구간 row is there only while an open motion has labels, and the speed box follows the scene (the
+    API sets speeds the list does not have)."""
+    plain = _item("plain", [])
+    win = types.SimpleNamespace(scene=_Scene([plain]), selected=plain)
+    panel = editor.TimelinePanel(win)
+    panel.show()
+    panel.refresh()
+    APP.processEvents()
+    assert not panel.seg_row.isVisible() and panel.speed.currentData() == 1.0
+    labelled = _item("labelled", ["이동"])
+    win.scene.items.append(labelled)
+    win.scene.label_catalog = lambda: [{"key": "이동: a", "segments": 480, "seconds": 120.0, "motions": ["labelled"]}]
+    win.scene.view.speed, win.scene.view.loop = 0.3, False
+    panel.refresh()
+    APP.processEvents()
+    assert panel.seg_row.isVisible() and panel.seg_box.currentData() == "이동: a"
+    assert panel.speed.currentText() == "0.3x" and not panel.loop.isChecked()
+    win.scene.view.speed = 2.0
+    panel.refresh()
+    assert panel.speed.currentData() == 2.0 and panel.speed.findData(0.3) >= 0  # added once, kept
+
+
+def test_number_boxes_let_the_window_shortcuts_through():
+    """A focused number box (시간 오프셋, 허용 오차, 간격) would take Space and the letter shortcuts; digits stay its."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QAction, QKeySequence
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QDoubleSpinBox, QMainWindow
+
+    win = QMainWindow()
+    fired = []
+    for key in ("Space", "N"):
+        a = QAction(key, win)
+        a.setShortcut(QKeySequence(key))
+        a.setShortcutContext(Qt.ApplicationShortcut)
+        a.triggered.connect(lambda _=False, k=key: fired.append(k))
+        win.addAction(a)
+    box = editor.pass_shortcuts(QDoubleSpinBox())
+    box.setRange(-10, 10)
+    win.setCentralWidget(box)
+    win.show()
+    APP.processEvents()
+    win.activateWindow()
+    box.setFocus()
+    APP.processEvents()
+    QTest.keyClick(box, Qt.Key_Space)
+    QTest.keyClick(box, Qt.Key_N)
+    box.lineEdit().selectAll()
+    QTest.keyClicks(box, "2.5")
+    APP.processEvents()
+    assert fired == ["Space", "N"] and box.value() == 2.5
+    win.close()

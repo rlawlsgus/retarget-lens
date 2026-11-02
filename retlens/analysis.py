@@ -216,7 +216,8 @@ def foot_metrics(m: RobotMotion, fk: FootKinematics) -> dict:
     swing = speed > SWING_SPEED
     floor = floor_track(r["sole"], speed, m.fps)
     rel = r["sole"] - floor[:, None]
-    low_swing = float(100 * (swing & (rel < SWING_CLEARANCE)).sum() / max(swing.sum(), 1))
+    skim = swing & (rel < SWING_CLEARANCE)
+    low_swing = float(100 * skim.sum() / max(swing.sum(), 1))
     # balance: CoM projection and cart-table ZMP against the feet's support polygon
     bal, bs, static = balance(m, fk, r=r)
     sustained = next(k for k in bs["zmp"] if k.startswith("outside_ratio(>"))
@@ -236,4 +237,7 @@ def foot_metrics(m: RobotMotion, fk: FootKinematics) -> dict:
         "_sole": r["sole"],
         "_balance": bal,
         "_static_unbalanced": static,
+        # per frame, for the timeline (retlens.problems)
+        "_frames": {"slip": np.concatenate([[False], slide]), "penetration": lowest < -0.02,
+                    "swing_low": skim.any(axis=1)},
     }

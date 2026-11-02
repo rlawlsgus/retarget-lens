@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import analysis, paths
+from . import analysis, objects, paths, problems
 from .io import load_motion
 from .io.bvh import load_bvh
 from .io.fbx import load_fbx
@@ -272,8 +272,21 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         add_balance_flags(r, fm["_static_unbalanced"])
     out["qc"] = r.status
     out["qc_notes"] = "; ".join(r.notes)
+    flags = dict(fm.get("_frames", {}))
     if fk is not None and item.human is not None and item.retarget:  # retargeted here: how well (retarget_quality)
-        out.update(_retarget_quality(item, fk, out))
+        q = _retarget_quality(item, fk, out)
+        flags.update(q.pop("_frames", {}))
+        out.update(q)
+        if item.human.objects:  # props captured with the person: does the robot's hand meet them (retlens.objects)
+            try:
+                out.update(objects.hand_object_metrics(item.human, m, fk))
+            except Exception as e:  # a skeleton without hands to match: no contact numbers, the rest still works
+                out["_objects"] = {"error": f"{type(e).__name__}: {e}"}
+    if item.human is not None and item.human.kind == "markers":  # C3D: frames where a placed marker is missing
+        P = item.human.positions[:, item.human.meta.get("dots") or slice(1, None)]  # not the virtual pelvis
+        ok = np.isfinite(P).all(axis=2)
+        flags["marker_gap"] = (~ok[:, ok.any(axis=0)].all(axis=1), item.human.fps)  # markers never seen do not count
+    out["_problems"] = problems.problem_spans(flags, m.fps)  # where on the timeline (retlens.problems)
     phys = item.info.get("physics")
     if phys:  # from the Isaac run's json
         harness = (phys.get("harness_force_per_body_weight") or {}).get("mean")
@@ -283,12 +296,16 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         out["phys_saturated_pct"] = float("nan") if saturated is None else 100 * saturated
         out["phys_ok"] = "통과" if phys.get("consistent") else "; ".join(map(_issue_ko, phys.get("issues", []))) or "?"
     pol = item.info.get("policy_replay")
-    if pol:  # MuJoCo, no harness (tools/policy_replay.py, RetLens's 균형 제어)
+    if pol:  # MuJoCo (tools/policy_replay.py, RetLens's 균형 제어): the harness, or none
         out["phys_harness_pct"] = 0.0
         out["phys_falls"] = pol.get("falls")
         out["phys_saturated_pct"] = 100 * pol.get("torque_saturated_ratio", float("nan"))
         out["phys_body_error_cm"] = pol.get("body_error_cm")
         out["phys_ok"] = "통과" if not pol.get("falls") else f"넘어짐 {pol['falls']}회"
+        if pol.get("controller") == "harness":
+            harness = (pol.get("harness_force_per_body_weight") or {}).get("mean")
+            out["phys_harness_pct"] = float("nan") if harness is None else 100 * harness
+            out["phys_ok"] = "통과" if pol.get("consistent") else "; ".join(map(_issue_ko, pol.get("issues", []))) or "?"
     item.metrics = out
 
 
@@ -304,9 +321,11 @@ def _retarget_quality(item: Item, fk: analysis.FootKinematics, metrics: dict) ->
     if not q:
         return {}
     s, lost = rq.score({**metrics, **q})
+    frames = q.pop("_frames", {})
     details = {k[1:]: v for k, v in q.items() if k.startswith("_")}
     return {**{k: v for k, v in q.items() if not k.startswith("_")}, "retarget_score": round(s, 1),
-            "retarget_grade": f"{s:.0f} ({rq.grade(s)})", "_quality": {**details, "score_lost": dict(lost)}}
+            "retarget_grade": f"{s:.0f} ({rq.grade(s)})", "_quality": {**details, "score_lost": dict(lost)},
+            "_frames": frames}
 
 
 def _issue_ko(text: str) -> str:

@@ -81,6 +81,31 @@ def test_cli_autolabel_out_and_exit_codes(tmp_path):
     assert code == 1 and res["motions"][0]["labels"]["error"]
 
 
+def test_cli_summary(tmp_path):
+    """summary: motions of a folder (label files are not motions), their label time per track and label,
+    totals per folder, a CSV row each; an unreadable motion is reported and sets exit code 2."""
+    from retlens.synthetic import walking_bvh_text
+
+    take = tmp_path / "session1"
+    take.mkdir()
+    (take / "walk.bvh").write_text(walking_bvh_text(seconds=2.0))
+    (take / "walk2.bvh").write_text(walking_bvh_text(seconds=3.0))
+    (take / "walk.labels.csv").write_text("track,label,start_s,end_s\n동작,걷기,0,1.5\n동작,서기,1.5,9\n", encoding="utf-8")
+    out_csv = tmp_path / "summary.csv"
+    code, res = _cli("summary", str(take), "--csv", str(out_csv), tmp_path=tmp_path)
+    assert code == 0 and res["motions"] == 2 and res["failed"] == 0
+    assert res["per_folder"]["session1"]["motions"] == 2 and res["per_folder"]["session1"]["labelled"] == 1
+    assert res["per_label"]["동작: 걷기"]["seconds"] == pytest.approx(1.5)
+    assert res["per_label"]["동작: 서기"]["seconds"] == pytest.approx(res["total_s"] - 3.0 - 1.5, abs=0.05)  # clipped
+    walk = next(r for r in res["files"] if r["file"].endswith("walk.bvh"))
+    assert walk["labels"] == "file" and walk["objects"] == [] and walk["duration_s"] == pytest.approx(2.0, abs=0.05)
+    with open(out_csv, encoding="utf-8-sig") as f:
+        lines = f.read().splitlines()
+    assert lines[0].startswith("file,folder,duration_s,labels,objects") and len(lines) == 3
+    code, res = _cli("summary", str(take / "walk.bvh"), str(tmp_path / "gone.bvh"), tmp_path=tmp_path)
+    assert code == 2 and res["failed"] == 1 and any(r.get("error") for r in res["files"])
+
+
 @needs_sample
 def test_cli_inspect_metrics_compare(tmp_path):
     code, out = _cli("inspect", SAMPLE, "--foot-flat", tmp_path=tmp_path)  # robot motions ignore 리타게팅 보정

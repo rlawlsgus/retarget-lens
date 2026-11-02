@@ -1,6 +1,7 @@
 """Balance on / off in MuJoCo: replay robot motions with no controller (open-loop PD, like
-`isaac_replay.py --physics --assist 0`) and with GMT, a pretrained general tracking policy that keeps
-its balance the way a deployed tracker does (retlens/policy_replay.py; scripts/install_gmt.ps1).
+`isaac_replay.py --physics --assist 0`), with the same PD plus the pelvis harness (like
+`isaac_replay.py --physics`), and with GMT, a pretrained general tracking policy that keeps its balance
+the way a deployed tracker does (retlens/policy_replay.py; scripts/install_gmt.ps1).
 
     python tools/policy_replay.py data/retargeted/cmu_fbx/02_01_g1.npz
     python tools/policy_replay.py data/raw/cmu_bvh/02_01.bvh --swing-clearance 2   # human motion: retargeted (cached)
@@ -166,25 +167,30 @@ def write_summary(out_dir: str) -> str:
         m = info.get("policy_replay")
         if m:
             rows.append((info, m))
-    order = {c: i for i, c in enumerate(pr.CONTROLLERS)}  # per clip: off, then on
+    order = {c: i for i, c in enumerate(pr.CONTROLLERS)}  # per clip: off, harness, policy
     rows.sort(key=lambda r: (r[0].get("label", ""), r[0].get("kind", ""), order.get(r[1].get("controller"), 9)))
     fmt = lambda v, f="{:.1f}": "-" if v is None else f.format(v)  # noqa: E731
     lines = [f"# 균형 켬 / 끔 비교 (MuJoCo, {time.strftime('%Y-%m-%d %H:%M')})", "",
-             "같은 클립을 같은 G1 모델(GMT의 23 DoF G1, 1 kHz)에서 두 가지로 돌린 결과입니다. "
+             "같은 클립을 같은 G1 모델(GMT의 23 DoF G1, 1 kHz)에서 세 가지로 돌린 결과입니다. "
              "**제어기 없음**: 리타겟 관절각을 높은 게인의 PD로 그대로 따라감(Isaac `--physics --assist 0`과 같은 개루프 재생). "
+             "**골반 보조 힘**: 같은 PD에 골반 가상 하네스(configs/physics.yaml `assist`, Isaac `--physics`와 같은 식)를 더함. "
+             "로봇 부위끼리의 충돌은 Isaac처럼 끕니다. "
              "**추적 정책 (GMT)**: 공개된 G1 범용 추적 정책이 기준 동작과 자기 상태를 보고 관절 목표를 냄(실제 로봇의 방식). "
-             "보조 힘(하네스)은 둘 다 없습니다. 넘어지면(기울기 60°, 골반 0.3 m 아래, 원본보다 0.25 m 낮음) 그 시각의 원본 자세로 다시 시작해 셉니다. "
+             "넘어지면(기울기 60°, 골반 0.3 m 아래, 원본보다 0.25 m 낮음) 그 시각의 원본 자세로 다시 시작해 셉니다. "
              "넘어짐 괄호 안은 클립이 끝난 뒤 마지막 자세로 1초 서 있는 동안의 넘어짐입니다. "
+             "보조 힘: 하네스 힘 / 체중(평균 / 95%, 보조 힘 모드만). "
              "관절 RMSE: 23관절(다리 12관절). 몸 위치 오차: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치 차의 평균. "
              "정책 보정: 정책이 낸 관절 목표와 원본 관절각의 평균 차이. 토크 한계: 요구 토크가 한계를 넘은 스텝 비율. "
              f"`tools/policy_replay.py`가 만듭니다.", "",
-             "| 클립 | 종류 | 제어 | 길이 s | 넘어짐 | 첫 넘어짐 s | 관절 RMSE° (다리) | 몸 위치 오차 cm | 골반 높이 오차 cm | 정책 보정 ° | 토크 한계 % |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| 클립 | 종류 | 제어 | 길이 s | 넘어짐 | 첫 넘어짐 s | 보조 힘 % | 관절 RMSE° (다리) | 몸 위치 오차 cm | 골반 높이 오차 cm | 정책 보정 ° | 토크 한계 % |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for info, m in rows:
-        lines.append("| {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} |".format(
+        pull = m.get("harness_force_per_body_weight") or {}
+        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} |".format(
             info.get("label", "?"), info.get("kind", ""), pr.LABELS.get(m["controller"], m["controller"]),
             fmt(m.get("clip_s")), f"{m['falls']}" + (f" (+{m['hold_falls']})" if m.get("hold_falls") else ""),
             fmt(m.get("first_fall_s"), "{:.2f}"),
+            f"{100 * pull['mean']:.0f} / {100 * pull['p95']:.0f}" if pull.get("mean") is not None else "-",
             fmt(m.get("joint_rmse_deg")), fmt(m.get("leg_joint_rmse_deg")), fmt(m.get("body_error_cm")),
             fmt(m.get("pelvis_height_error_cm")), fmt(m.get("policy_correction_deg")),
             fmt(100 * m["torque_saturated_ratio"] if m.get("torque_saturated_ratio") is not None else None)))
@@ -259,11 +265,13 @@ def main() -> int:
                 out = os.path.join(args.out_dir, folder, f"{name}_{c}_sim.npz")
                 pr.save_result(res, out, motion.joint_names, {
                     "label": label, "kind": kind, "source": source, "controller_label": pr.LABELS[c],
-                    "model": "GMT G1 (23 DoF, wrists fixed), MuJoCo 1 kHz", "gmt_files": files,
+                    "model": "GMT G1 (23 DoF, wrists fixed), MuJoCo 1 kHz"
+                             + (", robot self-collision off" if c == "harness" else ""), "gmt_files": files,
                     "swing_clearance_cm": args.swing_clearance, "smooth_hz": args.smooth})
                 log(f"{label} [{c}] {ref.length:.1f}s in {time.time() - t0:.1f}s: falls {m['falls']}"
                     f"{' (first ' + str(m['first_fall_s']) + ' s)' if m['falls'] else ''}"
                     f"{', +' + str(m['hold_falls']) + ' in the hold' if m['hold_falls'] else ''}, "
+                    f"{'harness ' + format(m['harness_force_per_body_weight']['mean'], '.0%') + ' body weight, ' if c == 'harness' else ''}"
                     f"joint RMSE {m['joint_rmse_deg']} deg, body error {m['body_error_cm']} cm, "
                     f"torque-limited {100 * m['torque_saturated_ratio']:.1f}%")
                 results.append(res)

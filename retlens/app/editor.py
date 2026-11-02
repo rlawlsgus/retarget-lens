@@ -6,14 +6,14 @@ editor-style dockable panels.
 Layout (like Blender / Unity; every panel can be moved, tabbed, floated or closed and
 the layout is remembered; 보기 > 레이아웃 초기화 restores this one):
 
-    +-- menu bar / toolbar ------------------------------------+
-    |                                     | 계층 (loaded motions)|
+    +-- menu bar / toolbar (열기 · 물리 모드 ▾ · 겹쳐 비교 · 카메라) --+
+    |                                     | 계층 (motions, score)|
     |         scene view (3D, viser)      +---------------------+
     |                                     | 인스펙터 | 씬 설정    |
     +-------------------------------------+                     |
-    | 타임라인 (transport, one track per motion, labels, falls)  |
-    | 프로젝트 (data folders) | 분석 | 콘솔                       |
-    +-- status bar: physics mode, Isaac jobs, time ------------+
+    | 타임라인 (transport, problems, one track per motion, labels)|
+    | 프로젝트 (data folders) | 분석 | 비교 | 데이터셋 (콘솔: 보기)   |
+    +-- status bar: only what needs attention (jobs, physics, 환경 ⚠) +
 
 The 3D view is the viser scene of retlens/app/scene.py served on 127.0.0.1 and shown in
 a Qt WebEngine view with viser's own control panel hidden; every control lives in Qt.
@@ -29,8 +29,8 @@ import time
 from html import escape
 
 import numpy as np
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF, QSettings, Qt,
-                            QThread, QTimer, QUrl, Signal)
+from PySide6.QtCore import (QAbstractTableModel, QEvent, QModelIndex, QObject, QPoint, QPointF, QRect, QRectF,
+                            QSettings, QSortFilterProxyModel, Qt, QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServices, QFont, QFontMetrics, QIcon,
                            QKeySequence, QPainter, QPalette, QPen, QPixmap)
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
@@ -44,12 +44,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QStyle, QTableView, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import autolabel, cmu_labels, motion_labels
+from .. import autolabel, batch, cmu_labels, motion_labels, problems
 from .. import paths as app_paths  # "paths" is a common local name here
 from .. import settings
 from ..compare import MOTION_EXT, Item, library_files
-from .scene import (BALANCE, GRAPH_FIXED, METRIC_DESC, METRIC_HELP, METRIC_HELP_FOOTER, RETARGET_NOTE, RETARGET_TIPS,
-                    SWING_CLEARANCE_CM, MotionScene, rel)
+from .scene import (BALANCE, GRAPH_FIXED, METRIC_DESC, METRIC_HELP, METRIC_HELP_FOOTER, PROBLEM_NAMES, RETARGET_NOTE,
+                    RETARGET_TIPS, SWING_CLEARANCE_CM, MotionScene, rel, retarget_text)
 
 APP_NAME = "RetLens"  # Retarget Lens
 APP_TAGLINE = "Retarget Lens · 모캡 리타게팅 검증 편집기"
@@ -63,12 +63,15 @@ HIDE_VISER_PANEL_JS = """
 """
 ASSIST_LABELS = {1.0: "켬 (기본)", 0.0: "끔 (보조 없음)"}
 BALANCE_TIPS = {
-    "isaac": "Isaac Sim PhysX에서 골반 보조 힘(가상 하네스)이 균형을 대신 잡습니다(지금까지의 물리 모드). "
-             "배율은 '물리 > 골반 보조 힘 (Isaac)'에서 바꿉니다",
+    "harness": "MuJoCo에서 리타겟 관절각을 높은 게인의 PD로 따라가고, 골반 보조 힘(가상 하네스)이 균형을 대신 잡습니다"
+               "(기본). 보조 힘이 체중의 몇 %인지가 그 동작이 발만으로 균형을 잡기 얼마나 어려운지 보여 줍니다. "
+               "따로 설치할 것이 없고 클립 하나에 몇 초면 끝납니다",
     "pd": "MuJoCo에서 리타겟 관절각을 높은 게인의 PD로 그대로 따라갑니다. 균형 제어도 보조 힘도 없어 걷기도 대부분 "
-          "1–2초 안에 넘어집니다(Isaac 보조 힘 끔과 같은 개루프 재생)",
+          "1–2초 안에 넘어집니다(보조 힘 (MuJoCo)에서 보조 힘만 뺀 개루프 재생)",
     "gmt": "MuJoCo에서 공개된 G1 범용 추적 정책 GMT가 기준 동작과 로봇 자신의 상태를 보고 관절 목표를 냅니다"
            "(실제 로봇이 모캡을 따라 하는 방식). 보조 힘은 없습니다",
+    "isaac": "Isaac Sim PhysX에서 골반 보조 힘(가상 하네스)이 균형을 대신 잡습니다(0.6.0까지의 기본 물리 모드). "
+             "Isaac Sim 설치와 NVIDIA EULA 동의가 필요합니다. 배율은 '물리 > 골반 보조 힘 (Isaac)'에서 바꿉니다",
 }
 
 
@@ -106,7 +109,8 @@ def app_settings() -> QSettings:
 # The repository's editor and the installed RetLens share one QSettings store. The Isaac EULA consent is
 # the user's either way; the window layout, the file dialog's folder and the first-run check are per layout,
 # so one program closing last no longer decides the other's layout.
-LAYOUT_KEYS = ("window/geometry", "window/state", "layout/has_compare", "dialog/dir", "setup/checked")
+LAYOUT_KEYS = ("window/geometry", "window/state", "layout/has_compare", "layout/has_dataset", "layout/tidy_v1",
+               "dialog/dir", "setup/checked")
 
 
 def layout_key(key: str) -> str:
@@ -150,6 +154,95 @@ def dark_palette() -> QPalette:
     return p
 
 
+class _PassShortcuts(QObject):
+    """Lets the window's one-key shortcuts (Space, N, P, O, F, ...) through a focused number box, which would
+    otherwise take them; digits, arrows and Home / End stay the box's."""
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.ShortcutOverride and (e.key() == Qt.Key_Space or Qt.Key_A <= e.key() <= Qt.Key_Z):
+            e.ignore()
+            return True
+        return False
+
+
+_pass_filter: _PassShortcuts | None = None
+
+
+def pass_shortcuts(box: QWidget) -> QWidget:
+    global _pass_filter
+    if _pass_filter is None:
+        _pass_filter = _PassShortcuts()
+    box.installEventFilter(_pass_filter)
+    return box
+
+
+SECTION_CSS = "margin-top: 10px; border-bottom: 1px solid rgba(128,128,128,0.4)"
+
+
+def section_label(text: str) -> QLabel:
+    """A bold section heading with a line under it (인스펙터, 씬 설정)."""
+    lab = QLabel(text)
+    f = lab.font()
+    f.setBold(True)
+    lab.setFont(f)
+    lab.setStyleSheet(SECTION_CSS)
+    return lab
+
+
+class Fold(QWidget):
+    """A section that opens and closes from its heading (▸ / ▾); whether it is open is kept by key in `opened`
+    (the caller saves it). `extra` sits on the heading's right, visible while closed too."""
+
+    def __init__(self, title: str, key: str, opened: set, extra: QWidget | None = None, on_toggle=None, tip: str = ""):
+        super().__init__()
+        self.key, self.opened, self.on_toggle = key, opened, on_toggle
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 8, 0, 0)
+        lay.setSpacing(2)
+        head = QWidget()
+        head.setObjectName("fold_head")
+        head.setStyleSheet("#fold_head { border-bottom: 1px solid rgba(128,128,128,0.4) }")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 2)
+        self.button = QToolButton()
+        self.button.setText(title)
+        self.button.setToolTip(tip)
+        self.button.setCheckable(True)
+        self.button.setAutoRaise(True)
+        self.button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.button.setStyleSheet("QToolButton { text-align: left; font-weight: bold; border: none; padding: 1px }")
+        hl.addWidget(self.button, 1)
+        if extra is not None:
+            hl.addWidget(extra)
+        lay.addWidget(head)
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(4, 2, 0, 0)
+        lay.addWidget(self.body)
+        on = key in opened
+        self.button.setChecked(on)
+        self._show(on)
+        self.button.toggled.connect(self._toggled)
+
+    def is_open(self) -> bool:
+        return self.button.isChecked()
+
+    def set_title(self, title: str) -> None:
+        if self.button.text() != title:
+            self.button.setText(title)
+
+    def _show(self, on: bool) -> None:
+        self.button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self.body.setVisible(on)
+
+    def _toggled(self, on: bool) -> None:
+        self._show(on)
+        (self.opened.add if on else self.opened.discard)(self.key)
+        if self.on_toggle is not None:
+            self.on_toggle(on)
+
+
 class _GuiInvoker(QObject):
     """Runs a callable on the GUI thread for another thread and waits for it (the AI API)."""
     call = Signal(object)
@@ -172,6 +265,7 @@ class SceneBridge(QObject):
     added = Signal(object)  # Item, or an error text
     labelled = Signal(object)  # (job, item, automatic labels) made off the GUI thread
     log = Signal(str)
+    gui = Signal(object)  # a callable a worker thread hands to the GUI thread (EditorWindow._run_on_gui)
 
 
 # ------------------------------------------------------------------------------ scene view
@@ -232,11 +326,23 @@ class SceneView(QWebEngineView):
 
 
 # ------------------------------------------------------------------------------ hierarchy
+QC_COLORS = {"FAIL": QColor(230, 90, 80), "WARN": QColor(230, 160, 60)}
+
+
+def score_text(it: Item) -> str:
+    """'78 WARN': the retargeting score and QC of a motion (QC alone for a robot motion)."""
+    m = it.metrics
+    score = m.get("retarget_score")
+    qc = str(m.get("qc") or "")
+    return f"{score:.0f} {qc}".strip() if isinstance(score, (int, float)) else qc
+
+
 class HierarchyPanel(QTreeWidget):
     def __init__(self, win: "EditorWindow"):
         super().__init__()
         self.win = win
-        self.setHeaderLabels(["이름", "종류", "물리"])
+        self.setHeaderLabels(["이름", "점수", "물리"])
+        self.headerItem().setToolTip(1, "리타게팅 점수(0–100)와 QC. 마우스를 올리면 감점 이유가 나옵니다")
         self.setRootIsDecorated(False)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -244,6 +350,9 @@ class HierarchyPanel(QTreeWidget):
         self.itemSelectionChanged.connect(self._selected)
         self.itemChanged.connect(self._changed)
         self.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in (1, 2):
+            self.header().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.setColumnHidden(2, True)  # while no motion has physics
         self._filling = False
 
     def rebuild(self) -> None:
@@ -251,12 +360,12 @@ class HierarchyPanel(QTreeWidget):
         sel = self.win.selected
         self.clear()
         for it in self.win.scene.items:
-            row = QTreeWidgetItem([it.label, it.kind, ""])
+            row = QTreeWidgetItem([it.label, "", ""])
             row.setIcon(0, color_icon(it.color))
             row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
             row.setCheckState(0, Qt.Checked if it.visible else Qt.Unchecked)
             row.setData(0, Qt.UserRole, id(it))
-            row.setToolTip(0, rel(it.source))
+            row.setToolTip(0, f"{rel(it.source)}\n{it.kind}")
             self.addTopLevelItem(row)
             if it is sel:
                 row.setSelected(True)
@@ -265,7 +374,8 @@ class HierarchyPanel(QTreeWidget):
 
     def refresh(self) -> None:
         sc = self.win.scene
-        self._filling = True  # the visibility check follows the scene (e.g. the inspector's 보이기)
+        self._filling = True  # the visibility check follows the scene (e.g. the API)
+        phys_any = False
         for i in range(self.topLevelItemCount()):
             row = self.topLevelItem(i)
             it = self.win.item_by_id(row.data(0, Qt.UserRole))
@@ -274,9 +384,20 @@ class HierarchyPanel(QTreeWidget):
             state = Qt.Checked if it.visible else Qt.Unchecked
             if row.checkState(0) != state:
                 row.setCheckState(0, state)
-            text = sc.job_text(it) if (sc.physics_on or it.handles.get("phys") or sc.is_sim_result(it)) else ""
+            score = score_text(it)
+            if row.text(1) != score:  # 다시 리타게팅 changes it
+                row.setText(1, score)
+                row.setForeground(1, QBrush(QC_COLORS.get(it.metrics.get("qc"), self.palette().color(QPalette.Text))))
+                facts = dict(sc.item_facts(it))
+                notes = it.metrics.get("qc_notes")
+                row.setToolTip(1, "\n".join(x for x in (facts.get("리타게팅 점수"), f"QC: {notes}" if notes else "") if x))
+            has_phys = sc.physics_on or bool(it.handles.get("phys")) or sc.is_sim_result(it)
+            phys_any |= has_phys
+            text = sc.job_text(it) if has_phys else ""
             row.setText(2, text.split(" · ")[0] if text else "")
             row.setToolTip(2, text)
+        if self.isColumnHidden(2) == phys_any:
+            self.setColumnHidden(2, not phys_any)
         self._filling = False
 
     def select(self, item: Item | None) -> None:
@@ -306,28 +427,24 @@ class HierarchyPanel(QTreeWidget):
             return
         self.win.select(it)
         m = QMenu(self)
-        m.addAction("동영상 저장", lambda: self.win.save_video(it))
-        if self.win.scene.video_file(it):
-            m.addAction("저장된 동영상 열기", lambda: self.win.open_path(self.win.scene.video_file(it)))
-        m.addAction("파일 위치 열기", lambda: self.win.open_path(os.path.dirname(it.source)))
-        m.addSeparator()
-        self.win.add_label_actions(m, it)
-        m.addSeparator()
-        m.addAction("겹쳐 비교: 기준(A)으로", lambda: self.win.start_compare(ref=it))
-        m.addAction("겹쳐 비교: 대상(B)으로", lambda: self.win.start_compare(item=it))
-        m.addSeparator()
-        m.addAction("제거", lambda: self.win.remove(it))
+        self.win.motion_menu(m, it)
         m.exec(self.viewport().mapToGlobal(pos))
 
 
 # ------------------------------------------------------------------------------ inspector
 class InspectorPanel(QScrollArea):
+    """The selected motion: a summary (what it is, its score, QC and problems), then sections that fold (세부 정보,
+    보정, 지표; open or closed as last left), 라벨, and 물리 / 동영상 only when there is something to say."""
+    SUMMARY = ("종류", "파일", "길이", "QC", "리타게팅 점수", "다시 리타게팅", "물체", "손–물체", "C3D 마커",
+               "마커 QC")  # item_facts rows
+
     def __init__(self, win: "EditorWindow"):
         super().__init__()
         self.win = win
         self.setWidgetResizable(True)
         self.item: Item | None = None
         self._labels_shown = None
+        self._open = set(win.settings.value("inspector/open", [], type=list) or [])  # the folds left open
         self._build_empty()
 
     def _clear(self) -> QVBoxLayout:
@@ -339,20 +456,37 @@ class InspectorPanel(QScrollArea):
 
     def _build_empty(self) -> None:
         lay = self._clear()
-        hint = QLabel("선택한 모션이 없습니다.\n\n계층 패널이나 타임라인에서 모션을 고르면 여기에 속성과 지표가 나옵니다. "
-                      "모션은 프로젝트 패널에서 두 번 클릭하거나, 파일 > 열기, 또는 탐색기에서 끌어다 놓아 추가합니다.")
+        hint = QLabel("선택한 모션이 없습니다.\n\n계층 패널이나 타임라인에서 모션을 고르면 여기에 점수와 문제가 나옵니다. "
+                      "모션은 파일 > 열기 (Ctrl+O), 프로젝트 패널에서 두 번 클릭, 또는 탐색기에서 끌어다 놓아 추가합니다.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray")
         lay.addWidget(hint)
 
+    def _fold(self, title: str, key: str, extra: QWidget | None = None, tip: str = "", on_toggle=None) -> Fold:
+        def toggled(on: bool) -> None:
+            self.win.settings.setValue("inspector/open", sorted(self._open))
+            if on_toggle is not None:
+                on_toggle(on)
+
+        return Fold(title, key, self._open, extra, toggled, tip)
+
+    @staticmethod
+    def _value(text: str, tip: str = "") -> QLabel:
+        lab = QLabel(text)
+        lab.setWordWrap(True)
+        lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lab.setToolTip(tip)
+        return lab
+
     def show_item(self, item: Item | None) -> None:
+        scroll = self.verticalScrollBar().value() if item is not None and item is self.item else None
         self.item = item
         if item is None:
             self._build_empty()
             return
         sc = self.win.scene
         lay = self._clear()
-        title = QLabel(f"<span style='color:rgb{tuple(item.color)}'>■</span> <b>{item.label}</b>")
+        title = QLabel(f"<span style='color:rgb{tuple(item.color)}'>■</span> <b>{escape(item.label)}</b>")
         title.setTextFormat(Qt.RichText)
         f = title.font()
         f.setPointSize(f.pointSize() + 2)
@@ -366,116 +500,168 @@ class InspectorPanel(QScrollArea):
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft)
+        details = []
         for k, v in sc.item_facts(item):
+            if k not in self.SUMMARY:
+                details.append((k, v))
+                continue
+            tip = ""
             if k == "파일":  # let long paths wrap at the separators
                 v = v.replace("\\", "/").replace("/", "/​")
-            lab = QLabel(v)
-            lab.setWordWrap(True)
-            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            form.addRow(f"{k}", lab)
+            elif k == "종류":  # 'FBX -> GMR, foot-flat': the corrections stay, the smoothing goes to the tip
+                v, tip = ", ".join(x for x in (p.strip() for p in v.split(",")) if not x.startswith("smooth")), v
+            lab = self._value(v, tip)
+            notes = item.metrics.get("qc_notes")
+            if k == "QC" and notes and v != "PASS":  # why it is not PASS
+                lab.setTextFormat(Qt.RichText)
+                lab.setText(f"{escape(v)}<br><span style='color:gray'>{escape(notes)}</span>")
+            form.addRow(k, lab)
+        self.problem_lab = self._value("")
+        form.addRow("문제 구간", self.problem_lab)
         lay.addLayout(form)
 
-        lay.addWidget(self._section("표시"))
-        self.vis = QCheckBox("보이기")
-        self.vis.setChecked(item.visible)
-        self.vis.toggled.connect(lambda on: sc.set_visible(item, on))
-        lay.addWidget(self.vis)
+        row = QHBoxLayout()  # this motion's display: its skeleton, its start on the shared timeline
         self.hv = None
         if item.human is not None:
             self.hv = QCheckBox("사람 스켈레톤")
+            self.hv.setToolTip("이 모션의 사람 스켈레톤 (모든 모션: 씬 설정)")
             self.hv.setChecked(item.show_human)
             self.hv.toggled.connect(lambda on: sc.set_show_human(item, on))
-            lay.addWidget(self.hv)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("시간 오프셋 (s)"))
-        self.offset = QDoubleSpinBox()
+            row.addWidget(self.hv)
+        row.addStretch(1)
+        self.offset_label = QLabel("시간 오프셋 (s)")
+        row.addWidget(self.offset_label)
+        self.offset = pass_shortcuts(QDoubleSpinBox())
         self.offset.setRange(-600.0, 600.0)
         self.offset.setDecimals(3)
         self.offset.setSingleStep(1 / 30)
         self.offset.setValue(item.offset)
+        self.offset.setToolTip("공통 시간축에서 이 모션이 시작하는 시각. 분석 탭의 '기준에 시간 자동 정렬'로도 맞춥니다")
         self.offset.valueChanged.connect(lambda v: sc.set_offset(item, v))
         row.addWidget(self.offset)
         lay.addLayout(row)
 
-        lay.addWidget(self._section("라벨"))
+        if details:  # what the summary leaves out
+            fold = self._fold(f"세부 정보 ({len(details)})", "details")
+            dform = QFormLayout()
+            dform.setLabelAlignment(Qt.AlignLeft)
+            for k, v in details:
+                dform.addRow(k, self._value(v))
+            fold.body_layout.addLayout(dform)
+            lay.addWidget(fold)
+
+        if item.retarget:  # 이 모션의 보정: retarget this one again, or find the corrections that score best
+            r = item.retarget
+            swing_cm = r.get("swing_clearance_cm") or SWING_CLEARANCE_CM
+            now = (bool(r.get("foot_flat")), r.get("swing_clearance_cm", 0) > 0, bool(r.get("self_collision")))
+            rec = QPushButton("추천 보정 찾기")
+            rec.setToolTip("보정 조합 8가지로 이 모션을 리타게팅해 리타게팅 점수가 가장 높은 조합을 보여 주고, 고르면 "
+                           "그 보정으로 바꿉니다. 처음에는 리타게팅 8번이라 몇 분 걸리고, 다음부터는 바로 나옵니다")
+            rec.clicked.connect(lambda: self.win.recommend_retarget(item))
+            text = retarget_text(now[0], r.get("swing_clearance_cm", 0.0), now[2])
+            fold = self._fold(f"보정: {'없음' if text == '보정 없음' else text}", "retarget", rec,
+                              "이 모션만 다른 보정으로 다시 리타게팅합니다. 새로 여는 모션의 보정은 리타게팅 메뉴에서 정합니다")
+            boxes = []
+            for label, on, tip in (("디딤발 평평", now[0], RETARGET_TIPS["foot_flat"]),
+                                   (f"스윙 발 보정 ({swing_cm:g} cm)", now[1], RETARGET_TIPS["swing"]),
+                                   ("자기 관통 보정", now[2], RETARGET_TIPS["self_collision"])):
+                b = QCheckBox(label)
+                b.setToolTip(tip)
+                b.setChecked(on)
+                fold.body_layout.addWidget(b)
+                boxes.append(b)
+            again = QPushButton("다시 리타게팅")
+            again.setToolTip("위 보정으로 이 모션만 다시 리타게팅해 같은 자리에 바꿔 넣습니다(이름·색·오프셋·라벨 유지). "
+                             "전후 점수는 위 '다시 리타게팅' 줄에 나옵니다. 리타게팅 메뉴의 설정은 바뀌지 않습니다")
+            again.setEnabled(False)  # until a box differs from how it was retargeted
+            for b in boxes:
+                b.toggled.connect(lambda _on: again.setEnabled(tuple(x.isChecked() for x in boxes) != now))
+            again.clicked.connect(lambda: self.win.retarget_item(item, boxes[0].isChecked(),
+                                                                 swing_cm if boxes[1].isChecked() else 0.0,
+                                                                 boxes[2].isChecked()))
+            fold.body_layout.addWidget(again)
+            lay.addWidget(fold)
+
+        lay.addWidget(section_label("라벨"))
         self._build_labels(lay, item)
 
-        lay.addWidget(self._section("물리"))
-        self.phys = QLabel()
-        self.phys.setWordWrap(True)
-        lay.addWidget(self.phys)
+        self.phys_box = QWidget()  # shown while physics mode is on, or results were computed
+        pl = QVBoxLayout(self.phys_box)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.addWidget(section_label("물리"))
+        self.phys = self._value("")
+        pl.addWidget(self.phys)
+        lay.addWidget(self.phys_box)
 
-        lay.addWidget(self._section("동영상"))
-        vrow = QHBoxLayout()
-        b = QPushButton("동영상 저장")
-        b.setToolTip("Isaac Sim에서 사람(원본이 있으면)과 로봇을 나란히 녹화해 MP4로 저장합니다. "
-                     "물리 모드가 켜져 있으면 물리 시뮬레이션 결과를 녹화합니다")
-        b.clicked.connect(lambda: self.win.save_video(item))
-        vrow.addWidget(b)
-        self.open_video = QPushButton("열기")
-        self.open_video.clicked.connect(lambda: self.win.open_path(sc.video_file(item)))
-        vrow.addWidget(self.open_video)
-        self.open_folder = QPushButton("폴더")
-        self.open_folder.clicked.connect(lambda: self.win.open_path(os.path.dirname(sc.video_file(item) or "")))
-        vrow.addWidget(self.open_folder)
-        lay.addLayout(vrow)
+        self.video_box = QWidget()  # shown once a video was asked for (파일 menu, Ctrl+E, right-click)
+        vl = QVBoxLayout(self.video_box)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.addWidget(section_label("동영상"))
         self.video = QLabel()
         self.video.setWordWrap(True)
-        self.video.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        lay.addWidget(self.video)
+        self.video.setTextFormat(Qt.RichText)
+        self.video.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.video.linkActivated.connect(lambda link: self.win.open_path(
+            sc.video_file(item) if link == "file" else os.path.dirname(sc.video_file(item) or "")))
+        vl.addWidget(self.video)
+        lay.addWidget(self.video_box)
 
-        lay.addWidget(self._section("지표"))
+        self.metrics_fold = self._fold("지표", "metrics", help_button("지표 설명", metric_help_html(), icon_only=True),
+                                       on_toggle=lambda on: on and self.refresh())
         self.metrics = QTableWidget(0, 2)
         self.metrics.setHorizontalHeaderLabels(["지표", "값"])
         self.metrics.verticalHeader().setVisible(False)
         self.metrics.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.metrics.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.metrics.setMinimumHeight(260)
-        lay.addWidget(self.metrics)
-
-        rm = QPushButton("제거")
-        rm.setStyleSheet("color: rgb(230,90,80)")
-        rm.clicked.connect(lambda: self.win.remove(item))
-        lay.addWidget(rm)
+        self.metrics.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # as tall as its rows: the panel scrolls
+        self.metrics_fold.body_layout.addWidget(self.metrics)
+        lay.addWidget(self.metrics_fold)
         self.refresh()
+        if scroll is not None:  # rebuilt for the same motion (labels changed): stay where the user was
+            QTimer.singleShot(0, lambda: self.verticalScrollBar().setValue(scroll))
 
     def _build_labels(self, lay: QVBoxLayout, item: Item) -> None:
-        """Where the motion's labels come from (or why there are none), load / reload / remove, and
-        its segments (a click goes to the segment's start)."""
+        """Where the motion's labels come from (or '라벨 없음', the how-to on hover), load / automatic labels /
+        rule file, the rest under ⋯ (the right-click menu's 라벨 entries), and its segments (a click goes to the
+        segment's start)."""
         # read once (other threads replace them); refresh() rebuilds when they change (menu, API, drop)
         self._labels_shown = lab = item.labels
-        info = QLabel(labels_text(item, lab))
-        info.setWordWrap(True)
-        info.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        if lab is None or lab.error:
-            info.setStyleSheet("color: gray" if lab is None else "color: rgb(230,150,60)")
+        if lab is None:
+            info = self._value("라벨 없음", labels_text(item, None))
+            info.setStyleSheet("color: gray")
+        else:
+            info = self._value(labels_text(item, lab))
+            if lab.error:
+                info.setStyleSheet("color: rgb(230,150,60)")
         lay.addWidget(info)
         segs = lab.segments if lab is not None else []
         rules = autolabel.rules_file()
-        for buttons in (
-                (("불러오기...", "CSV·JSON 라벨 파일을 골라 이 모션에 붙입니다(파일은 바꾸지 않음)",
-                  lambda: self.win.load_labels_dialog(item), True),
-                 ("다시 읽기", "라벨 파일을 고친 뒤 다시 읽습니다(자동 라벨은 규칙 파일로 다시 붙임). "
-                               "붙은 파일이 없으면 모션 옆에서 다시 찾습니다",
-                  lambda: self.win.reload_labels(item), True),
-                 ("빼기", "이 모션에서 라벨을 뺍니다(파일은 그대로)", lambda: self.win.scene.set_labels(item, None),
-                  lab is not None)),
-                (("자동 라벨", ("규칙 파일대로 이 모션의 사람 동작을 보고 라벨을 붙입니다"
-                                + (f"\n규칙: {rules}" if rules else "\n(규칙 파일을 먼저 고릅니다)"))
-                  if self.win.scene.has_skeleton(item) else "사람 골격이 없는 로봇 모션에는 붙지 않습니다",
-                  lambda: self.win.auto_label(item), self.win.scene.has_skeleton(item)),
-                 ("규칙 파일...", "자동 라벨에 쓸 규칙 파일(YAML·JSON)을 고릅니다" + (f"\n지금: {rules}" if rules else ""),
-                  lambda: self.win.pick_label_rules(item), True),
-                 ("CSV로 저장...", "지금 붙은 구간을 라벨 CSV로 저장합니다. 모션 옆에 <이름>.labels.csv로 두면 열 때 붙습니다",
-                  lambda: self.win.save_labels_dialog(item), bool(segs)))):
-            row = QHBoxLayout()
-            for text, tip, fn, on in buttons:
-                b = QPushButton(text)
-                b.setToolTip(tip)
-                b.setEnabled(on)
-                b.clicked.connect(fn)
-                row.addWidget(b)
-            lay.addLayout(row)
+        row = QHBoxLayout()
+        load = QPushButton("불러오기...")
+        load.setToolTip("CSV·JSON 라벨 파일을 골라 이 모션에 붙입니다(파일은 바꾸지 않음)")
+        load.clicked.connect(lambda: self.win.load_labels_dialog(item))
+        row.addWidget(load)
+        auto = QPushButton("자동 라벨")
+        auto.setToolTip("규칙 파일대로 이 모션의 사람 동작을 보고 라벨을 붙입니다"
+                        + (f"\n규칙: {rules}" if rules else "\n(규칙 파일을 먼저 고릅니다)"))
+        auto.clicked.connect(lambda: self.win.auto_label(item))
+        auto.setVisible(self.win.scene.has_skeleton(item))  # a robot motion has no person to label
+        row.addWidget(auto)
+        pick = QPushButton("규칙 파일...")
+        pick.setToolTip("자동 라벨에 쓸 규칙 파일(YAML·JSON)을 고릅니다" + (f"\n지금: {rules}" if rules else ""))
+        pick.clicked.connect(lambda: self.win.pick_label_rules(item if self.win.scene.has_skeleton(item) else None))
+        row.addWidget(pick)
+        more = QToolButton()
+        more.setText("⋯")
+        more.setToolTip("다시 읽기, 빼기, CSV로 저장, 라벨 파일 열기, 열린 모션 모두 자동 라벨")
+        more.setPopupMode(QToolButton.InstantPopup)
+        more.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        menu = QMenu(more)
+        menu.aboutToShow.connect(lambda: (menu.clear(), self.win.add_label_actions(menu, item)))
+        more.setMenu(menu)
+        row.addWidget(more)
+        row.addStretch(1)
+        lay.addLayout(row)
         if not segs:
             return
         multi = len(lab.tracks) > 1 or bool(lab.tracks[0])
@@ -492,70 +678,86 @@ class InspectorPanel(QScrollArea):
                                          self.win.scene.seek(item.offset + segs[i.row()].start)))
         lay.addWidget(table)
 
-    @staticmethod
-    def _section(text: str) -> QLabel:
-        lab = QLabel(text)
-        f = lab.font()
-        f.setBold(True)
-        lab.setFont(f)
-        lab.setStyleSheet("margin-top: 10px; border-bottom: 1px solid rgba(128,128,128,0.4)")
-        return lab
-
     def refresh(self, metrics: bool = True) -> None:
-        """metrics=False: only the status lines (job progress), not the metric table."""
+        """metrics=False: only the status lines (job progress), not the problems and the metric table."""
         it, sc = self.item, self.win.scene
         if it is None or it not in sc.items:
             return
         if it.labels is not self._labels_shown:  # loaded, reloaded or removed (menu, API, a dropped file)
             self.show_item(it)
             return
-        if sc.is_sim_result(it):
+        overview = sc.results_overview(it)
+        sim = sc.is_sim_result(it)
+        self.phys_box.setVisible(sim or sc.physics_on or bool(overview))
+        if sim:
             text = sc.job_text(it)
         else:  # this mode's state, then what the other modes gave (they are kept: switching back is instant)
-            text = (f"균형 제어: {sc.mode_label()}\n{sc.job_text(it)}" if sc.physics_on
-                    else "물리 모드가 꺼져 있습니다(툴바나 물리 메뉴에서 켭니다).")
-            others = [(m, r) for m, r in sc.results_overview(it) if not (sc.physics_on and m == sc.mode_label())]
+            lines = [f"{sc.mode_label()}: {sc.job_text(it)}"] if sc.physics_on else []
+            others = [(m, r) for m, r in overview if not (sc.physics_on and m == sc.mode_label())]
             if others:
-                text += "\n\n계산해 둔 다른 결과:\n" + "\n".join(f"· {m}: {r}" for m, r in others)
-        self.phys.setText(text)
-        self.video.setText(sc.video_text(it) or "아직 저장한 동영상이 없습니다.")
-        has = sc.video_file(it) is not None
-        self.open_video.setEnabled(has)
-        self.open_folder.setEnabled(has)
+                lines.append(("계산해 둔 다른 결과:" if sc.physics_on else "계산해 둔 결과 (물리 모드를 켜면 그립니다):")
+                             + "".join(f"\n· {m}: {r}" for m, r in others))
+            text = "\n".join(lines)
+        if self.phys.text() != text:
+            self.phys.setText(text)
+        video, file = sc.video_text(it), sc.video_file(it)
+        self.video_box.setVisible(bool(video))
+        html = (f"동영상 저장됨: <a href='file'>{escape(os.path.basename(file))}</a> · <a href='folder'>폴더</a>"
+                if file else escape(video))
+        if self.video.text() != html:
+            self.video.setText(html)
+        show_offset = len(sc.items) > 1 or abs(it.offset) > 1e-9  # one motion at 0 s: nothing to move
+        self.offset_label.setVisible(show_offset)
+        self.offset.setVisible(show_offset)
         if abs(self.offset.value() - it.offset) > 1e-6:
             self.offset.blockSignals(True)
             self.offset.setValue(it.offset)
             self.offset.blockSignals(False)
-        for box, value in ((self.vis, it.visible), (self.hv, it.show_human)):  # same switches as the hierarchy's
-            if box is not None and box.isChecked() != value:
-                box.blockSignals(True)
-                box.setChecked(value)
-                box.blockSignals(False)
+        if self.hv is not None and self.hv.isChecked() != it.show_human:  # the API can change it
+            self.hv.blockSignals(True)
+            self.hv.setChecked(it.show_human)
+            self.hv.blockSignals(False)
         if not metrics:
+            return
+        probs = sc.problems(it)  # of what is shown: physics mode has its own
+        kinds = [k for k in PROBLEM_NAMES if probs.get(k)]
+        self.problem_lab.setText(" · ".join(f"{PROBLEM_NAMES[k]} {len(probs[k])}" for k in kinds) or "없음")
+        self.problem_lab.setToolTip("\n".join(
+            [f"{PROBLEM_NAMES[k]}: {len(probs[k])}구간 · {sum(b - a for a, b in probs[k]):.1f}초" for k in kinds]
+            + ["N / Shift+N 또는 타임라인의 '문제 ▶'로 다음 / 이전 문제로 갑니다"]))
+        if not self.metrics_fold.is_open():  # nothing to fill while it is folded
             return
         names, cols = sc.metric_table(self.win.analysis.ref_item())
         vals = next((v for c, v in cols if c is it), None)
         if vals is None:
             return
-        self.metrics.setRowCount(len(names))
-        for r, (n, v) in enumerate(zip(names, vals)):
+        rows = [(n, str(v)) for n, v in zip(names, vals) if str(v) not in ("-", "")]  # what this motion has
+        self.metrics.setRowCount(len(rows))
+        for r, (n, v) in enumerate(rows):
             label = QTableWidgetItem(n)
             label.setToolTip(metric_tip(n))
             self.metrics.setItem(r, 0, label)
-            cell = QTableWidgetItem(short_text(str(v), 22))
-            cell.setToolTip(str(v))  # full text, also when the column is too narrow and Qt elides it
+            cell = QTableWidgetItem(short_text(v, 22))
+            cell.setToolTip(v)  # full text, also when the column is too narrow and Qt elides it
             cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.metrics.setItem(r, 1, cell)
+        self.metrics.setFixedHeight(self.metrics.horizontalHeader().height() + 2
+                                    + sum(self.metrics.rowHeight(r) for r in range(len(rows))))
 
 
 # ------------------------------------------------------------------------------ scene settings
 class SceneSettingsPanel(QScrollArea):
+    """How every motion is drawn, in groups: 배치, 사람, 표시, 물체. Rows that cannot apply are off or hidden:
+    간격 only side by side, the skeleton's place only with skeletons, SMPL-X and 물체 only when such a motion is
+    open (refresh)."""
+
     def __init__(self, win: "EditorWindow"):
         super().__init__()
         self.win = win
         self.setWidgetResizable(True)
         w = QWidget()
-        form = QFormLayout(w)
+        lay = QVBoxLayout(w)
+        lay.setAlignment(Qt.AlignTop)
         sc, v = win.scene, win.scene.view
 
         def combo(options, current, apply):
@@ -565,37 +767,86 @@ class SceneSettingsPanel(QScrollArea):
             c.currentTextChanged.connect(apply)
             return c
 
-        def check(text, value, apply):
+        def check(text, value, apply, tip=""):
             c = QCheckBox(text)
             c.setChecked(value)
+            c.setToolTip(tip)
             c.toggled.connect(apply)
             return c
 
-        form.addRow("배치", combo(["나란히", "겹쳐서"], "나란히" if v.side_by_side else "겹쳐서",
-                                lambda t: setattr(v, "side_by_side", t == "나란히")))
-        sp = QDoubleSpinBox()
-        sp.setRange(0.3, 5.0)
-        sp.setSingleStep(0.1)
-        sp.setValue(v.spacing)
-        sp.valueChanged.connect(lambda x: setattr(v, "spacing", float(x)))
-        form.addRow("간격 (m)", sp)
-        form.addRow(check("시작 위치·방향 맞춤", v.align, lambda on: setattr(v, "align", on)))
-        form.addRow(check("사람 스켈레톤", v.show_humans, lambda on: setattr(v, "show_humans", on)))
-        form.addRow("스켈레톤 위치", combo(["로봇 옆", "로봇과 겹쳐서"], "로봇 옆" if v.human_beside else "로봇과 겹쳐서",
-                                     lambda t: setattr(v, "human_beside", t == "로봇 옆")))
-        form.addRow("사람 표시", combo(["막대", "몸 메시 (SMPL-X)"], "몸 메시 (SMPL-X)" if v.body_mesh else "막대",
-                                   lambda t: self._set(body_mesh=t.startswith("몸"))))
-        form.addRow("로봇 표시", combo(["불투명", "반투명"], "반투명" if v.robot_translucent else "불투명",
-                                   lambda t: self._set(robot_translucent=t == "반투명")))
+        def group(title):
+            lay.addWidget(section_label(title))
+            form = QFormLayout()
+            form.setLabelAlignment(Qt.AlignLeft)
+            lay.addLayout(form)
+            return form
+
+        form = group("모션 배치")
+        self.spacing = pass_shortcuts(QDoubleSpinBox())
+        self.spacing.setRange(0.3, 5.0)
+        self.spacing.setSingleStep(0.1)
+        self.spacing.setValue(v.spacing)
+        self.spacing.setSuffix(" m")
+        self.spacing.valueChanged.connect(lambda x: setattr(v, "spacing", float(x)))
+        self.spacing.setEnabled(v.side_by_side)
+
+        def side(text):
+            v.side_by_side = text == "나란히"
+            self.spacing.setEnabled(v.side_by_side)
+
+        form.addRow("배치", combo(["나란히", "겹쳐서"], "나란히" if v.side_by_side else "겹쳐서", side))
+        form.addRow("간격", self.spacing)
+        form.addRow(check("시작 위치·방향 맞춤", v.align, lambda on: setattr(v, "align", on),
+                          "모션마다 시작 위치와 방향을 맞춰 나란히 놓습니다"))
+
+        form = group("사람")
+        self.beside = combo(["로봇 옆", "로봇과 겹쳐서"], "로봇 옆" if v.human_beside else "로봇과 겹쳐서",
+                            lambda t: setattr(v, "human_beside", t == "로봇 옆"))
+        self.beside.setEnabled(v.show_humans)
+
+        def humans(on):
+            v.show_humans = on
+            self.beside.setEnabled(on)
+
+        form.addRow(check("사람 스켈레톤 (모두)", v.show_humans, humans, "모션 하나만 끄려면 인스펙터에서"))
+        form.addRow("스켈레톤 위치", self.beside)
+        self.body_mesh = check("SMPL-X 몸 메시", v.body_mesh, lambda on: self._set(body_mesh=on),
+                               "AMASS SMPL-X 모션의 사람을 막대 대신 몸 표면으로 그립니다(SMPL-X 모델 필요)")
+        form.addRow(self.body_mesh)
+
+        form = group("표시")
+        form.addRow(check("로봇 반투명", v.robot_translucent, lambda on: self._set(robot_translucent=on)))
         form.addRow(check("이름표", v.show_labels, lambda on: setattr(v, "show_labels", on)))
-        now = check("지금 구간 라벨 (이름표 아래)", v.show_label_now, lambda on: setattr(v, "show_label_now", on))
-        now.setToolTip("라벨 파일이 있는 모션은 재생 중인 구간의 라벨을 로봇 위에 띄웁니다(라벨이 없는 시간에는 안 보임)")
-        form.addRow(now)
-        form.addRow(check("균형 표시 (지지다각형·CoM·ZMP)", v.show_balance, lambda on: setattr(v, "show_balance", on)))
-        cam = QPushButton("카메라 맞추기")
-        cam.clicked.connect(sc.fit_camera)
-        form.addRow(cam)
+        form.addRow(check("지금 구간 라벨", v.show_label_now, lambda on: setattr(v, "show_label_now", on),
+                          "라벨 파일이 있는 모션은 재생 중인 구간의 라벨을 로봇 이름표 아래에 띄웁니다(라벨이 없는 시간에는 안 보임)"))
+        form.addRow(check("균형 표시", v.show_balance, lambda on: setattr(v, "show_balance", on),
+                          "바닥에 지지다각형(초록), CoM 투영(파랑), ZMP(빨강)를 그립니다"))
+
+        self.objects_box = QWidget()  # FBX props and furniture: only when an open motion has them
+        ol = QVBoxLayout(self.objects_box)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.addWidget(section_label("물체"))
+        self.paths = check("물체 궤적", v.show_object_paths, lambda on: setattr(v, "show_object_paths", on),
+                           "움직이는 물체가 클립 동안 지나간 길")
+        self.paths.setEnabled(v.show_objects)
+
+        def objects(on):
+            v.show_objects = on
+            self.paths.setEnabled(on)
+
+        ol.addWidget(check("물체", v.show_objects, objects,
+                           "FBX에 사람과 함께 담긴 물체(소품·가구)를 로봇 쪽에 그립니다. 위치는 사람 스켈레톤처럼 로봇 크기에 "
+                           "맞춰 옮기고, 물체 크기는 실제 그대로입니다"))
+        ol.addWidget(self.paths)
+        lay.addWidget(self.objects_box)
         self.setWidget(w)
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Show the rows that apply to the open motions."""
+        items, v = list(self.win.scene.items), self.win.scene.view
+        self.body_mesh.setVisible(v.body_mesh or any(it.kind.startswith("SMPL-X") for it in items))
+        self.objects_box.setVisible(any(it.human is not None and it.human.objects for it in items))
 
     def _set(self, **kw) -> None:
         for k, val in kw.items():
@@ -605,6 +856,7 @@ class SceneSettingsPanel(QScrollArea):
 
 # ------------------------------------------------------------------------------ timeline
 RULER_STEPS = (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600)
+SPEEDS = (0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0)  # the timeline's playback speeds (the API may set any other)
 
 
 def ruler_step(span: float) -> float:
@@ -732,9 +984,9 @@ class TimelineTracks(QWidget):
         back for the next one, which would look unchanged."""
         sc, sel, pal = self.win.scene, self.win.selected, self.palette()
         rows = tuple((_Same(it), it.label, _Same(labels), it.offset, it.visible, it.color, sc.shown(it).robot.duration,
-                      it is sel, tuple(sc.falls(it))) for it, _y, _h, _tracks, labels in
+                      it is sel, tuple(sc.falls(it)), _Same(sc.shown(it).metrics.get("_problems"))) for it, _y, _h, _tracks, labels in
                      (rows if rows is not None else self._rows()))
-        return (self.width(), self.height(), self.devicePixelRatioF(), self._span(), rows,
+        return (self.width(), self.height(), self.devicePixelRatioF(), self._span(), rows, sc.view.show_problems,
                 pal.color(QPalette.Base).rgba(), pal.color(QPalette.Text).rgba(), self.font().key())
 
     def view_key(self) -> tuple:
@@ -822,6 +1074,16 @@ class TimelineTracks(QWidget):
             p.drawRoundedRect(QRectF(x0, y + 4, max(2.0, x1 - x0), self.ROW_H - 8), 3, 3)
             if tracks:
                 self._paint_labels(p, it, labels, y, tracks, small, span)
+            if sc.view.show_problems:  # problem spans as thin strips along the bottom of the bar (retlens.problems)
+                p.setPen(Qt.NoPen)
+                for kind, sp in sc.problems(it).items():
+                    if kind in problems.KINDS:
+                        c = QColor(*problems.KINDS[kind][1])
+                        c.setAlpha(235 if it.visible else 90)
+                        p.setBrush(c)
+                        for a, b in sp:
+                            xa, xb = self._x(it.offset + a, span), self._x(it.offset + min(b, dur), span)
+                            p.drawRect(QRectF(xa, y + self.ROW_H - 7, max(2.0, xb - xa), 3))
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(230, 40, 40))
             for ft, _cause in sc.falls(it):
@@ -880,13 +1142,14 @@ class TimelineTracks(QWidget):
 
     def contextMenuEvent(self, e):
         row = self._row_at(e.pos().y())
-        if row is None:
-            return
-        it = row[0]
-        self.win.select(it)
         m = QMenu(self)
-        self.win.add_label_actions(m, it)
-        m.exec(e.globalPos())
+        if row is not None:
+            self.win.select(row[0])
+            self.win.motion_menu(m, row[0])
+        elif getattr(self.win, "a_show_problems", None) is not None:  # the ruler or below the rows
+            m.addAction(self.win.a_show_problems)
+        if not m.isEmpty():
+            m.exec(e.globalPos())
 
     def _label_tip(self, pos) -> str:
         hit = self.segment_at(pos)
@@ -907,6 +1170,14 @@ class TimelineTracks(QWidget):
         for ft, cause in sc.falls(it):
             if abs(self._x(it.offset + ft) - pos.x()) < 6:
                 return f"{it.label}: 넘어짐 {ft:.2f}s" + (f" · {why} {cause}" if cause else "")
+        if sc.view.show_problems:  # the problem strips under the mouse
+            lo, hi = self._span()
+            px = (hi - lo) / max(1, self.width() - self.NAME_W - 10)
+            t = self._t(pos.x()) - it.offset
+            here = [f"{PROBLEM_NAMES[k]} {a:.2f}–{b:.2f}s" for k, sp in sc.problems(it).items() if k in problems.KINDS
+                    for a, b in sp if a - 2 * px <= t <= b + 2 * px]
+            if here:
+                return f"{it.label}: " + ", ".join(here) + "  (N / Shift+N: 다음 / 이전 문제)"
         return ""
 
 
@@ -919,40 +1190,82 @@ class TimelinePanel(QWidget):
         lay.setContentsMargins(4, 2, 4, 2)
         bar = QHBoxLayout()
         st = self.style()
-        for icon, tip, fn in ((QStyle.SP_MediaSkipBackward, "처음으로 (Home)", lambda: sc.seek(0.0)),
-                              (QStyle.SP_MediaSeekBackward, "이전 프레임 (←)", lambda: sc.step(-1))):
-            b = QPushButton(st.standardIcon(icon), "")
+
+        def tool(tip, fn, icon=None, text=""):
+            b = QToolButton()
+            if icon is not None:
+                b.setIcon(st.standardIcon(icon))
+            b.setText(text)
             b.setToolTip(tip)
+            b.setAutoRaise(True)
             b.clicked.connect(fn)
             bar.addWidget(b)
-        self.play = QPushButton(st.standardIcon(QStyle.SP_MediaPlay), "")
-        self.play.setToolTip("재생 / 일시정지 (Space)")
-        self.play.clicked.connect(sc.toggle_play)
-        bar.addWidget(self.play)
-        b = QPushButton(st.standardIcon(QStyle.SP_MediaSeekForward), "")
-        b.setToolTip("다음 프레임 (→)")
-        b.clicked.connect(lambda: sc.step(1))
-        bar.addWidget(b)
+            return b
+
+        tool("처음으로 (Home)", lambda: sc.seek(0.0), QStyle.SP_MediaSkipBackward)
+        tool("이전 프레임 (←)", lambda: sc.step(-1), QStyle.SP_MediaSeekBackward)
+        self.play = tool("재생 / 일시정지 (Space)", sc.toggle_play, QStyle.SP_MediaPlay)
+        tool("다음 프레임 (→)", lambda: sc.step(1), QStyle.SP_MediaSeekForward)
+        bar.addSpacing(6)
+        # problem spans (retlens.problems): the window's goto_problem, looked up when clicked
+        tool("이전 문제로 (Shift+N)", lambda: self.win.goto_problem(-1), text="◀ 문제")
+        tool("다음 문제로 (N): 발 미끄러짐·바닥 관통·스윙 발 바닥 근접·자기 충돌·관절 한계·마커 공백·넘어짐",
+             lambda: self.win.goto_problem(1), text="문제 ▶")
+        bar.addSpacing(6)
         self.time = QLabel()
-        self.time.setMinimumWidth(190)
+        self.time.setMinimumWidth(110)
         bar.addWidget(self.time)
         self.now = QLabel()  # the selected motion's label(s) at the playhead
         self.now.setToolTip("고른 모션의 지금 구간 라벨")
         self.now.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         bar.addWidget(self.now, 1)
-        bar.addWidget(QLabel("속도"))
-        speed = QDoubleSpinBox()
-        speed.setRange(0.05, 4.0)
-        speed.setSingleStep(0.05)
-        speed.setValue(sc.view.speed)
-        speed.setSuffix("x")
-        speed.valueChanged.connect(lambda v: setattr(sc.view, "speed", float(v)))
-        bar.addWidget(speed)
-        loop = QCheckBox("반복")
-        loop.setChecked(sc.view.loop)
-        loop.toggled.connect(lambda on: setattr(sc.view, "loop", on))
-        bar.addWidget(loop)
+        self.speed = QComboBox()  # follows the scene (the API sets it too)
+        self.speed.setToolTip("재생 속도")
+        for v in SPEEDS:
+            self.speed.addItem(f"{v:g}x", v)
+        self.speed.activated.connect(lambda i: setattr(sc.view, "speed", float(self.speed.itemData(i))))
+        bar.addWidget(self.speed)
+        self.loop = QCheckBox("반복")
+        self.loop.setChecked(sc.view.loop)
+        self.loop.toggled.connect(lambda on: setattr(sc.view, "loop", on))
+        bar.addWidget(self.loop)
         lay.addLayout(bar)
+        # 유형별 재생: the segments of one label, one after another (MotionScene.play_segments); shown while
+        # an open motion has labels
+        self.seg_row = QWidget()
+        seg = QHBoxLayout(self.seg_row)
+        seg.setContentsMargins(0, 0, 0, 0)
+        seg.addWidget(QLabel("라벨 구간"))
+        self.seg_box = QComboBox()
+        self.seg_box.setMinimumWidth(160)
+        self.seg_box.setToolTip("열린 모션들의 라벨(라벨 파일·자동 라벨)을 '트랙: 라벨'별로 모은 목록. 고르면 그 구간들만 "
+                                "차례로 봅니다")
+        self.seg_box.activated.connect(lambda _i: self._seg_restart())
+        seg.addWidget(self.seg_box, 1)
+        self.seg_prev = QToolButton()
+        self.seg_prev.setText("◀")
+        self.seg_prev.setToolTip("이전 라벨 구간")
+        self.seg_prev.clicked.connect(lambda: self._seg_step(-1))
+        self.seg_next = QToolButton()
+        self.seg_next.setText("▶")
+        self.seg_next.setToolTip("다음 라벨 구간")
+        self.seg_next.clicked.connect(lambda: self._seg_step(1))
+        self.seg_play = QPushButton("이어 재생")
+        self.seg_play.setCheckable(True)
+        self.seg_play.setToolTip("고른 라벨의 구간을 처음부터 끝까지 차례로 재생합니다(반복이 켜져 있으면 다시 처음으로)")
+        self.seg_play.toggled.connect(self._seg_toggle)
+        self.seg_solo = QCheckBox("그 모션만")
+        self.seg_solo.setToolTip("구간을 보는 동안 그 구간의 모션만 보이게 합니다(끝나면 원래대로)")
+        self.seg_solo.toggled.connect(lambda _on: self._seg_restart(keep=True))
+        self.seg_info = QLabel()
+        self.seg_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        for w in (self.seg_prev, self.seg_next, self.seg_play, self.seg_solo):
+            seg.addWidget(w)
+        seg.addWidget(self.seg_info, 1)
+        self.seg_row.setVisible(False)
+        lay.addWidget(self.seg_row)
+        self._cat_key = None  # what the label list was built from
+        self._speed = None  # the speed the box shows
         self.tracks = TimelineTracks(win)
         # label lanes make the rows taller: they scroll, instead of the timeline pushing the 3D view smaller
         self.scroll = QScrollArea()
@@ -970,11 +1283,26 @@ class TimelinePanel(QWidget):
         """Called every GUI tick (EditorWindow._tick): widgets are touched only when what they show changed."""
         sc = self.win.scene
         lo, hi = sc.time_range()
-        fps = 30.0
-        text = f"{sc.t:6.2f} / {hi:.2f} s   (frame {int(round(sc.t * fps))})"
+        text = f"{sc.t:6.2f} / {hi:.2f} s"
+        it = self.win.selected
         if self.time.text() != text:
             self.time.setText(text)
-        it, now = self.win.selected, ""
+        tip = (f"{it.label}: 프레임 {int(round((sc.t - it.offset) * it.robot.fps))}" if it is not None
+               else "모션을 고르면 그 모션의 프레임이 나옵니다")
+        if self.time.toolTip() != tip:  # the selected motion's own frame (its offset and fps)
+            self.time.setToolTip(tip)
+        if self._speed != sc.view.speed:  # the API may set a speed the list does not have
+            self._speed = sc.view.speed
+            i = self.speed.findData(sc.view.speed)
+            if i < 0:
+                self.speed.addItem(f"{sc.view.speed:g}x", sc.view.speed)
+                i = self.speed.count() - 1
+            self.speed.setCurrentIndex(i)
+        if self.loop.isChecked() != sc.view.loop:
+            self.loop.blockSignals(True)
+            self.loop.setChecked(sc.view.loop)
+            self.loop.blockSignals(False)
+        now = ""
         labels = it.labels if it is not None else None  # read once: other threads replace it
         if labels is not None and labels.segments:
             local = sc.t - it.offset
@@ -989,6 +1317,73 @@ class TimelinePanel(QWidget):
         if view != self._view:  # refreshed every frame: repainted only when something moved or changed
             self._view = view
             self.tracks.update()
+        self._seg_refresh()
+
+    # ---------------------------------------------------------------- 유형별 재생
+    def _seg_key(self) -> str | None:
+        return self.seg_box.currentData()
+
+    def _seg_refresh(self) -> None:
+        sc = self.win.scene
+        key = tuple((id(it), id(it.labels), len(it.labels.segments) if it.labels is not None else -1)
+                    for it in list(sc.items))
+        if key != self._cat_key:  # the motions or their labels changed: the list again (not every frame)
+            self._cat_key = key
+            cur = self._seg_key()
+            self.seg_box.blockSignals(True)
+            self.seg_box.clear()
+            for c in sc.label_catalog():
+                self.seg_box.addItem(f"{c['key']} · {c['segments']}개", c["key"])
+                self.seg_box.setItemData(self.seg_box.count() - 1, f"구간 {c['segments']}개 · {c['seconds']:.0f}초 · "
+                                         f"모션 {len(c['motions'])}개", Qt.ToolTipRole)
+            i = self.seg_box.findData(cur)
+            self.seg_box.setCurrentIndex(max(i, 0))
+            self.seg_box.blockSignals(False)
+            self.seg_row.setVisible(self.seg_box.count() > 0)
+        on = self._seg_key() is not None
+        for w in (self.seg_prev, self.seg_next, self.seg_play, self.seg_solo):
+            if w.isEnabled() != on:
+                w.setEnabled(on)
+        st = sc.playlist_state()
+        if self.seg_play.isChecked() != (st is not None):
+            self.seg_play.blockSignals(True)
+            self.seg_play.setChecked(st is not None)
+            self.seg_play.blockSignals(False)
+        text = "" if st is None else f"{st['index'] + 1}/{st['count']} · {st['id']} {st['start_s']:.2f}–{st['end_s']:.2f}s"
+        if self.seg_info.text() != text:
+            self.seg_info.setText(text)
+
+    def _seg_toggle(self, on: bool) -> None:
+        sc = self.win.scene
+        if not on:
+            sc.stop_segments()
+            sc.set_playing(False)
+            return
+        key = self._seg_key()
+        if key is None or not sc.play_segments(key, solo=self.seg_solo.isChecked()):
+            self.seg_play.setChecked(False)
+
+    def _seg_step(self, direction: int) -> None:
+        sc = self.win.scene
+        if sc.playlist is None or sc.playlist["key"] != self._seg_key():
+            key = self._seg_key()
+            if key is None or not sc.play_segments(key, solo=self.seg_solo.isChecked(), play=False):
+                return
+            if direction < 0:
+                sc.step_segment(-1)  # from the first one back round to the last
+            return
+        sc.step_segment(direction)
+
+    def _seg_restart(self, keep: bool = False) -> None:
+        """Another label (or solo turned on / off) while segments play: play that one from its first segment
+        (keep: the same position)."""
+        sc = self.win.scene
+        st = sc.playlist_state()
+        if st is None:
+            return
+        playing, index = sc.playing, st["index"]
+        if sc.play_segments(self._seg_key(), solo=self.seg_solo.isChecked(), play=playing) and keep:
+            sc.step_segment(index)
 
     def relayout(self) -> None:
         self.tracks.updateGeometry()
@@ -1007,26 +1402,32 @@ class ProjectPanel(QWidget):
         lay.setContentsMargins(2, 2, 2, 2)
         top = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("이름 검색 (예: 143_11) 또는 동작 설명 검색 (예: walk, dance)")
+        self.search.setPlaceholderText("이름·동작 검색 (예: 143_11, walk)")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._fill_files)
         top.addWidget(self.search, 1)
-        for text, tip, fn in (("추가", "선택한 파일을 씬에 추가 (두 번 클릭도 됨)", self._add_selected),
-                              ("파일 열기...", "PC의 아무 폴더에서 모션 파일 열기", win.open_dialog),
-                              ("새로고침", "폴더를 다시 읽기", self.reload)):
-            b = QPushButton(text)
-            b.setToolTip(tip)
-            b.clicked.connect(fn)
-            top.addWidget(b)
+        add = QPushButton("추가")
+        add.setToolTip("선택한 파일을 씬에 추가 (두 번 클릭이나 끌어다 놓기도 됨). 다른 폴더의 파일은 파일 > 열기 (Ctrl+O)")
+        add.clicked.connect(self._add_selected)
+        top.addWidget(add)
+        again = QToolButton()
+        again.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        again.setToolTip("폴더 다시 읽기 (모션 폴더는 환경 설정에서 정합니다)")
+        again.setAutoRaise(True)
+        again.clicked.connect(self.reload)
+        top.addWidget(again)
         lay.addLayout(top)
         split = QSplitter()
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["폴더", "파일"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.itemSelectionChanged.connect(self._fill_files)
+        self.tree.currentItemChanged.connect(lambda cur, _prev: cur is not None and self.win.settings.setValue(
+            layout_key("project/folder"), cur.data(0, Qt.UserRole)))
         split.addWidget(self.tree)
         self.files = QTableWidget(0, 3)
-        self.files.setHorizontalHeaderLabels(["이름", "동작 (CMU 설명)", "폴더"])
+        self.files.setHorizontalHeaderLabels(["이름", "설명", "폴더"])
+        self.files.horizontalHeaderItem(1).setToolTip("CMU 동작 설명 (CMU 모션이 아니면 숨김)")
         self.files.verticalHeader().setVisible(False)
         self.files.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.files.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1062,9 +1463,12 @@ class ProjectPanel(QWidget):
         for key, node in nodes.items():
             if key.count("/") <= 1:
                 node.setExpanded(True)
-        start = nodes.get("data/raw/cmu_bvh") or next(iter(nodes.values()), None)
+        last = self.win.settings.value(layout_key("project/folder"), "")  # where the user was last time
+        start = nodes.get(last) or nodes.get("data/raw/cmu_bvh") or next(iter(nodes.values()), None)
         if start is not None:
+            self.tree.blockSignals(True)  # keep the remembered folder: this is not the user's pick
             self.tree.setCurrentItem(start)
+            self.tree.blockSignals(False)
         self._fill_files()
 
     def _paths_in(self, key: str) -> list[str]:
@@ -1072,23 +1476,33 @@ class ProjectPanel(QWidget):
 
     def _fill_files(self) -> None:
         q = self.search.text().strip().lower()
+        cap = 500 if q else 2000
         if q:
             all_paths = [p for ps in self._library.values() for p in ps]
             hits = [p for p in all_paths if q in os.path.basename(p).lower() or q in cmu_labels.label_for(p).lower()]
             hits.sort(key=lambda p: not os.path.basename(p).lower().startswith(q))
-            paths = hits[:500]
+            found = hits
         else:
             cur = self.tree.currentItem()
-            paths = self._paths_in(cur.data(0, Qt.UserRole)) if cur else []
-            paths = paths[:2000]
+            found = self._paths_in(cur.data(0, Qt.UserRole)) if cur else []
+        paths = found[:cap]
+        self.search.setToolTip(f"{len(found)}개 중 {cap}개만 보입니다. 더 좁혀 검색하세요" if len(found) > cap else "")
         self.files.setRowCount(len(paths))
+        descs, folders = [], set()
         for r, p in enumerate(paths):
             name = QTableWidgetItem(os.path.basename(p))
             name.setData(Qt.UserRole, p)
             name.setToolTip(rel(p))
             self.files.setItem(r, 0, name)
-            self.files.setItem(r, 1, QTableWidgetItem(cmu_labels.label_for(p)))
-            self.files.setItem(r, 2, QTableWidgetItem(rel(os.path.dirname(p)).replace(os.sep, "/")))
+            descs.append(cmu_labels.label_for(p))
+            self.files.setItem(r, 1, QTableWidgetItem(descs[-1]))
+            folder = rel(os.path.dirname(p)).replace(os.sep, "/")
+            folders.add(folder)
+            self.files.setItem(r, 2, QTableWidgetItem(folder))
+        self.files.setColumnHidden(1, not any(descs))  # only CMU motions have descriptions
+        head = self.files.horizontalHeader()  # the widest visible column takes the room
+        head.setSectionResizeMode(0, QHeaderView.Interactive if any(descs) else QHeaderView.Stretch)
+        self.files.setColumnHidden(2, len(folders) <= 1)  # all from the folder picked on the left
         self.files.resizeColumnToContents(0)
 
     def _add_row(self, r: int) -> None:
@@ -1102,6 +1516,10 @@ class ProjectPanel(QWidget):
 
 
 # ------------------------------------------------------------------------------ analysis
+FOLLOW_SPANS = (("따라가기 끔", 0.0), ("5초 따라가기", 5.0), ("10초 따라가기", 10.0), ("30초 따라가기", 30.0),
+                ("전체 보기", -1.0))  # 분석 graph: seconds shown around the playhead
+
+
 def nice_step(span: float, max_ticks: int = 8) -> float:
     raw = max(span, 1e-9) / max_ticks
     mag = 10 ** np.floor(np.log10(raw))
@@ -1248,36 +1666,29 @@ class AnalysisPanel(QWidget):
         self.ref = QComboBox()
         self.ref.currentIndexChanged.connect(lambda _: self.win.refresh_analysis())
         bar.addWidget(self.ref, 1)
-        b = QPushButton("기준에 시간 자동 정렬")
-        b.setToolTip("다리 관절각 차이가 가장 작아지는 시간 오프셋을 찾습니다")
-        b.clicked.connect(self._align)
-        bar.addWidget(b)
+        self.align_btn = QPushButton("기준에 시간 자동 정렬")
+        self.align_btn.setToolTip("다른 모션들의 시간 오프셋을 다리 관절각 차이가 가장 작아지게 맞춥니다")
+        self.align_btn.clicked.connect(self._align)
+        bar.addWidget(self.align_btn)
         bar.addWidget(QLabel("그래프"))
         self.key = QComboBox()
         self.key.currentIndexChanged.connect(lambda _: self.rebuild_chart())
         bar.addWidget(self.key, 1)
-        self.follow = QPushButton("타임라인 따라가기")
-        self.follow.setCheckable(True)
-        self.follow.setChecked(True)
-        self.follow.setStyleSheet("QPushButton:checked { background: palette(highlight); color: palette(highlighted-text); }")
-        self.follow.setToolTip("켜 두면 타임라인을 재생하거나 옮길 때 그래프가 현재 시점을 가운데에 두고 따라 움직입니다. "
-                               "그래프를 끌거나 휠로 확대·축소하면 꺼지고, 그래프를 두 번 클릭하면 다시 켜집니다")
-        self.follow.toggled.connect(lambda _: self.update_view(force=True))
+        self.follow = QComboBox()  # how much of the timeline the graph shows around the playhead (0: off)
+        for text, span in FOLLOW_SPANS:
+            self.follow.addItem(text, span)
+        self.follow.setCurrentIndex(self.follow.findData(10.0))
+        self.follow.setToolTip("그래프가 재생 위치를 가운데에 두고 따라가며 보일 길이. 그래프를 끌거나 휠로 확대·축소하면 "
+                               "'따라가기 끔'이 되고, 두 번 클릭하면 다시 따라갑니다")
+        self.follow.currentIndexChanged.connect(lambda _: self.update_view(force=True))
+        self._follow_last = 10.0  # what double-clicking the graph goes back to
         bar.addWidget(self.follow)
-        bar.addWidget(QLabel("구간"))
-        self.window = QDoubleSpinBox()
-        self.window.setRange(0.0, 600.0)
-        self.window.setValue(10.0)
-        self.window.setSuffix(" s")
-        self.window.setToolTip("따라가기를 켰을 때 현재 시점 앞뒤로 보일 길이. 0 = 전체")
-        self.window.valueChanged.connect(lambda _: self.update_view(force=True))
-        bar.addWidget(self.window)
         bar.addWidget(help_button("지표 설명", metric_help_html()))
         lay.addLayout(bar)
         split = QSplitter()
         self.plot = LinePlot()
-        self.plot.panned.connect(lambda: self.follow.setChecked(False))
-        self.plot.follow_requested.connect(lambda: self.follow.setChecked(True))
+        self.plot.panned.connect(self._stop_following)
+        self.plot.follow_requested.connect(lambda: self.follow.setCurrentIndex(self.follow.findData(self._follow_last)))
         split.addWidget(self.plot)
         right = QWidget()
         rl = QVBoxLayout(right)
@@ -1295,6 +1706,12 @@ class AnalysisPanel(QWidget):
         """On screen (not behind another tab, not closed): only then is the chart redrawn."""
         return self.isVisible() and not self.visibleRegion().isEmpty()
 
+    def _stop_following(self) -> None:
+        span = self.follow.currentData()
+        if span != 0.0:
+            self._follow_last = span
+            self.follow.setCurrentIndex(self.follow.findData(0.0))
+
     def ref_item(self) -> Item | None:
         key = self.ref.currentData()
         return self.win.item_by_id(key) if key is not None else None
@@ -1309,6 +1726,7 @@ class AnalysisPanel(QWidget):
         i = self.ref.findData(cur_ref)
         self.ref.setCurrentIndex(i if i >= 0 else 0)
         self.ref.blockSignals(False)
+        self.align_btn.setEnabled(len(sc.items) > 1)
         keys = sc.graph_keys()
         self.key.blockSignals(True)
         self.key.clear()
@@ -1330,8 +1748,9 @@ class AnalysisPanel(QWidget):
         self.table.setVerticalHeaderLabels(names)
         for r, n in enumerate(names):  # what each row measures, on hover
             self.table.verticalHeaderItem(r).setToolTip(metric_tip(n))
+        stems = [it.label.split("/")[-1] for it, _v in cols]  # '02_01'; the folder too when two share a name
         for c, (it, vals) in enumerate(cols):
-            head = QTableWidgetItem(f"■ {c + 1}")
+            head = QTableWidgetItem(f"■ {short_text(stems[c] if stems.count(stems[c]) == 1 else it.label, 16)}")
             head.setForeground(QBrush(QColor(*it.color)))
             head.setToolTip(f"{it.label} ({it.kind})")
             self.table.setHorizontalHeaderItem(c, head)
@@ -1340,6 +1759,10 @@ class AnalysisPanel(QWidget):
                 cell.setToolTip(str(v))  # full text, also when the column is too narrow and Qt elides it
                 cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(r, c, cell)
+        for r, n in enumerate(names):  # rows that say nothing here: no motion has the value, all kinematic, no reference
+            vals = {str(v[r]) for _it, v in cols}
+            self.table.setRowHidden(r, vals <= {"-", ""} or (n == "재생 방식" and vals == {"기구학"})
+                                    or ("RMSE" in n and len(cols) < 2))
         self.table.resizeColumnsToContents()
 
     # ---------------------------------------------------------------- chart
@@ -1360,9 +1783,9 @@ class AnalysisPanel(QWidget):
         if not force and sc.t == self._shown_t:
             return
         self._shown_t = sc.t
-        if self.follow.isChecked():
-            w = float(self.window.value())
-            lo, hi = (sc.t - w / 2, sc.t + w / 2) if w > 0 else sc.time_range()
+        span = self.follow.currentData()
+        if span:  # following: the span around the playhead (-1: the whole timeline)
+            lo, hi = (sc.t - span / 2, sc.t + span / 2) if span > 0 else sc.time_range()
         else:  # where the user dragged / zoomed to
             lo, hi = self.plot.x0, self.plot.x1
         self.plot.set_view(lo, hi, sc.t)
@@ -1372,7 +1795,7 @@ class AnalysisPanel(QWidget):
 REGION_COLORS = {"전체 (부위 평균)": QColor(235, 235, 240), "몸통·머리": QColor(160, 160, 175), "왼팔": QColor(90, 170, 255),
                  "오른팔": QColor(255, 120, 90), "왼다리": QColor(80, 205, 140), "오른다리": QColor(235, 195, 60)}
 COMPARE_HELP = [
-    ("맞춤", "대상(B)의 골반을 기준(A)의 골반 위치로 옮깁니다. '골반 위치 + 방향'이면 골반이 향한 방향(수직축 회전)도 "
+    ("맞춤", "대상(B)의 골반을 기준(A)의 골반 위치로 옮깁니다. '방향도 맞춤'을 켜면 골반이 향한 방향(수직축 회전)도 "
            "A에 맞춥니다. 걸어간 경로·방향의 차이는 빠지고 자세의 차이만 남습니다."),
     ("색", "A는 회색 반투명으로 그립니다. B는 A와의 거리가 허용 오차를 넘는 부위만 그리고, 노랑(허용 오차) → 주황(2배) → "
           "빨강(3배 이상)으로 칠합니다. 회색만 보이는 곳은 두 모션이 겹치는 곳이고, 색이 칠해진 B 부위 옆의 회색이 A가 있던 자리입니다."),
@@ -1448,34 +1871,34 @@ class ComparePanel(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         bar = QHBoxLayout()
-        self.toggle = QPushButton("겹쳐 보기")
+        self.toggle = QPushButton("겹쳐 비교")
         self.toggle.setCheckable(True)
         self.toggle.setStyleSheet("QPushButton:checked { background: palette(highlight); color: palette(highlighted-text); }")
-        self.toggle.setToolTip("켜면 대상(B)을 기준(A)의 골반 위치에 겹쳐 그립니다 (단축키 O)")
+        self.toggle.setToolTip("켜면 대상(B)을 기준(A)의 골반 위치에 겹쳐 그립니다 (O). 모션이 둘 이상 있어야 합니다")
         self.toggle.toggled.connect(self._toggled)
         bar.addWidget(self.toggle)
         bar.addWidget(QLabel("기준 A"))
         self.ref = QComboBox()
         self.ref.setToolTip("회색 반투명으로 그릴 모션")
         bar.addWidget(self.ref, 1)
-        swap = QToolButton()
-        swap.setText("⇄")
-        swap.setToolTip("A와 B 바꾸기")
-        swap.clicked.connect(self._swap)
-        bar.addWidget(swap)
+        self.swap = QToolButton()
+        self.swap.setText("⇄")
+        self.swap.setToolTip("A와 B 바꾸기")
+        self.swap.clicked.connect(self._swap)
+        bar.addWidget(self.swap)
         bar.addWidget(QLabel("대상 B"))
         self.item = QComboBox()
         self.item.setToolTip("A의 골반 위치로 옮겨, 벗어난 부위만 색칠해 그릴 모션")
         bar.addWidget(self.item, 1)
         for combo in (self.ref, self.item):
             combo.currentIndexChanged.connect(lambda _: self._pair_changed())
-        bar.addWidget(QLabel("맞춤"))
-        self.align = QComboBox()
-        self.align.addItems(["골반 위치 + 방향", "골반 위치만"])
-        self.align.currentIndexChanged.connect(lambda i: self.win.scene.set_compare(heading=(i == 0)))
-        bar.addWidget(self.align)
+        self.heading = QCheckBox("방향도 맞춤")
+        self.heading.setToolTip("B의 골반을 A의 골반 위치로 옮기면서, 골반이 향한 방향(수직축 회전)도 A에 맞춥니다. "
+                                "끄면 위치만 맞춥니다")
+        self.heading.toggled.connect(lambda on: self._filling or self.win.scene.set_compare(heading=on))
+        bar.addWidget(self.heading)
         bar.addWidget(QLabel("허용 오차"))
-        self.tol = QDoubleSpinBox()
+        self.tol = pass_shortcuts(QDoubleSpinBox())
         self.tol.setRange(0.5, 50.0)
         self.tol.setSingleStep(0.5)
         self.tol.setValue(self.win.scene.compare.tol_cm)
@@ -1497,7 +1920,8 @@ class ComparePanel(QWidget):
         self.plot.follow_requested.connect(self._full_view)
         split.addWidget(self.plot)
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["부위", "평균 (cm)", "최대 (cm)", "최대 시각 (s)", "허용 오차 넘음 (%)"])
+        self.table.setHorizontalHeaderLabels(["부위", "평균 (cm)", "최대 (cm)", "최대 시각 (s)", "넘음 (%)"])
+        self.table.horizontalHeaderItem(4).setToolTip("허용 오차를 넘은 시간 비율")
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1544,11 +1968,15 @@ class ComparePanel(QWidget):
             i = combo.findData(id(cur)) if cur is not None else -1
             combo.setCurrentIndex(i if i >= 0 else (1 if combo is self.item and combo.count() > 1 else 0))
         self.toggle.setChecked(sc.compare_pair() is not None)
-        self.align.setCurrentIndex(0 if c.heading else 1)
+        self.heading.setChecked(c.heading)
         if abs(self.tol.value() - c.tol_cm) > 1e-9:
             self.tol.setValue(c.tol_cm)
         self._filling = False
+        two = len(sc.items) > 1  # a pair to compare
+        for w in (self.toggle, self.ref, self.swap, self.item):
+            w.setEnabled(two)
         self.legend.set_tol(c.tol_cm)
+        self.legend.setVisible(sc.compare_pair() is not None)
         self.rebuild()
 
     def rebuild(self) -> None:
@@ -1556,15 +1984,14 @@ class ComparePanel(QWidget):
         s = sc.compare_series() if sc.compare_pair() is not None else None
         self.table.setRowCount(0)
         if s is None or not len(s["t"]):
-            self.plot.set_data([], "겹쳐 보기를 켜면 B − A 부위 차이(cm)가 시간에 따라 나옵니다"
-                               if s is None else "두 모션이 함께 재생되는 구간이 없습니다 (시간 오프셋 확인)")
+            self.plot.set_data([], "" if s is None else "두 모션이 함께 재생되는 구간이 없습니다 (시간 오프셋 확인)")
             self.plot.set_view(*sc.time_range(), sc.t)
             return
         t, tol = s["t"], sc.compare.tol_cm
         series = [("전체 (부위 평균)", REGION_COLORS["전체 (부위 평균)"], t, s["mean"])]
         series += [(r, REGION_COLORS.get(r, QColor(200, 200, 200)), t, v) for r, v in s["regions"].items()]
         series.append((f"허용 오차 {tol:g} cm", QColor(130, 130, 140), t, np.full(len(t), tol)))
-        self.plot.set_data(series, "B − A 부위 차이 (cm), 골반 맞춤")
+        self.plot.set_data(series, "B − A 부위 차이 (cm)")
         self._full_view()
         rows = sc.compare_table()
         self.table.setRowCount(len(rows))
@@ -1597,12 +2024,13 @@ class ComparePanel(QWidget):
         self.plot.set_view(self.plot.x0, self.plot.x1, sc.t)
         now = sc.compare_now
         if sc.compare_pair() is None:
-            text = "꺼짐: 툴바의 '겹쳐 비교'(O)나 이 탭의 '겹쳐 보기'로 켭니다. 계층 패널 우클릭으로 A·B를 고를 수도 있습니다."
+            text = ("꺼짐: '겹쳐 비교'(O)로 켭니다. A·B는 위에서 고르거나 계층 패널 우클릭으로 정합니다."
+                    if len(sc.items) > 1 else "겹쳐 비교에는 모션이 둘 이상 있어야 합니다.")
         elif now is None:
             text = "지금 시각에는 A나 B가 보이지 않습니다(숨김)."
         else:
             worst = now["worst"]
-            text = (f"지금 {sc.t:.2f} s · 평균 {now['mean']:.1f} cm · 허용 오차 넘은 부품 {now['over']}/{now['parts']}"
+            text = (f"지금 평균 {now['mean']:.1f} cm · 허용 오차 넘은 부품 {now['over']}/{now['parts']}"
                     + (f" · 가장 큰 차이: {worst} {now['regions'][worst]:.1f} cm" if worst else ""))
         if text != self._now_text:
             self._now_text = text
@@ -1629,16 +2057,400 @@ def metric_help_html() -> str:
             f"<p style='color:#a0a0a8'>{escape(METRIC_HELP_FOOTER)} 표의 행 이름에 마우스를 올려도 설명이 나옵니다.</p>")
 
 
-def help_button(text: str, html: str) -> QToolButton:
-    """A '?' button that shows `html` on hover, and on click (no hover delay, stays longer)."""
+def help_button(text: str, html: str, icon_only: bool = False) -> QToolButton:
+    """A '?' button that shows `html` on hover, and on click (no hover delay, stays longer); icon_only: just the
+    '?', its text as the tip's heading."""
     b = QToolButton()
     b.setText(text)
     b.setIcon(b.style().standardIcon(QStyle.SP_MessageBoxQuestion))
-    b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+    b.setToolButtonStyle(Qt.ToolButtonIconOnly if icon_only else Qt.ToolButtonTextBesideIcon)
     b.setAutoRaise(True)
+    if icon_only:
+        html = f"<b>{escape(text)}</b><br>{html}"
     b.setToolTip(html)
     b.clicked.connect(lambda: QToolTip.showText(b.mapToGlobal(QPoint(0, b.height())), html, b, QRect(), 60000))
     return b
+
+
+# ------------------------------------------------------------------------------ dataset (일괄 처리)
+LABEL_SOURCES = {"file": "파일", "auto": "자동"}  # where a row's labels came from (retlens.batch)
+# the 데이터셋 table's columns (retlens.batch.COLUMNS): shown at first, shown once a row has a value, the rest from
+# the header's right-click menu (the user's picks are kept)
+BATCH_SHOWN = ("name", "folder", "duration_s", "retarget_score", "qc", "main_loss", "problems_s", "worst_problem")
+BATCH_WHEN_FILLED = ("objects", "hand_obj_reach_pct", "labels", "label_segments", "phys_falls", "phys_harness_pct",
+                     "phys_ok", "error")
+
+
+class BatchModel(QAbstractTableModel):
+    """The rows of a 일괄 처리 run (retlens.batch), one per motion file; sorted by value (Qt.UserRole)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rows: list[dict] = []
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(batch.COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return batch.COLUMNS[section][1]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        r = self.rows[index.row()]
+        key, _title, fmt = batch.COLUMNS[index.column()]
+        if role == Qt.DisplayRole:
+            return LABEL_SOURCES.get(r.get(key), r.get(key)) if key == "labels" else batch.cell(r, key, fmt)
+        if role == Qt.UserRole:  # sorting: numbers as numbers, blanks last
+            v = r.get(key)
+            return (1, 0.0, "") if v is None or v == "" else (0, float(v), "") if isinstance(v, (int, float)) else (0, 0.0, str(v))
+        if role == Qt.ToolTipRole:
+            return "\n".join(x for x in (r.get("file"), r.get("error"), r.get("qc_notes"), r.get("phys_ok"),
+                                         r.get("phys_error")) if x)
+        if role == Qt.ForegroundRole:
+            if r.get("error"):
+                return QBrush(QC_COLORS["FAIL"])
+            if key == "qc" and r.get("qc") in QC_COLORS:
+                return QBrush(QC_COLORS[r["qc"]])
+        if role == Qt.TextAlignmentRole and fmt != "{}":
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        return None
+
+    def add(self, row: dict) -> None:
+        self.beginInsertRows(QModelIndex(), len(self.rows), len(self.rows))
+        self.rows.append(row)
+        self.endInsertRows()
+
+    def clear(self) -> None:
+        self.beginResetModel()
+        self.rows = []
+        self.endResetModel()
+
+
+class BatchFilter(QSortFilterProxyModel):
+    """The table's filter: words to find in the motion's name, folder, QC, worst problem, cost or error, and a
+    QC / error choice."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.text, self.qc = "", ""
+        self.setSortRole(Qt.UserRole)
+
+    def set(self, text: str | None = None, qc: str | None = None) -> None:
+        self.text = self.text if text is None else text.strip().lower()
+        self.qc = self.qc if qc is None else qc
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        r = self.sourceModel().rows[source_row]
+        if self.qc == "error" and not r.get("error") or self.qc in ("FAIL", "WARN", "PASS") and r.get("qc") != self.qc:
+            return False
+        if self.qc == "falls" and not r.get("phys_falls"):
+            return False
+        if self.text:
+            hay = " ".join(str(r.get(k) or "") for k in ("name", "folder", "qc", "worst_problem", "main_loss", "error",
+                                                         "labels", "kind")).lower() + " " + LABEL_SOURCES.get(r.get("labels"), "")
+            return all(w in hay for w in self.text.split())
+        return True
+
+    def lessThan(self, a, b):
+        return self.sourceModel().data(a, Qt.UserRole) < self.sourceModel().data(b, Qt.UserRole)
+
+
+class DatasetPanel(QWidget):
+    """데이터셋 일괄 처리: folders of motions retargeted (with the 리타게팅 menu's corrections) and measured in the
+    background, a row each in a table to sort and filter, the worst first if wanted; a double click opens a
+    motion. Rows are cached (retlens.batch): a stopped run, or the same folders again, pick up where they were.
+    The filter row and the progress show once there is something to filter or to wait for."""
+
+    def __init__(self, win: "EditorWindow"):
+        super().__init__()
+        self.win = win
+        self.folders: list[str] = []
+        self._stop = False
+        self._running = False
+        self._filled: set[str] = set()  # columns some row has a value in
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        top = QHBoxLayout()
+        add = QPushButton("폴더 추가...")
+        add.setToolTip("촬영 세션 폴더를 고릅니다. 그 아래의 모션 파일을 모두 처리합니다(여러 폴더를 더할 수 있음)")
+        add.clicked.connect(self._add_folder)
+        top.addWidget(add)
+        self.where = QLabel()
+        self.where.setStyleSheet("color: gray")
+        self.where.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        top.addWidget(self.where, 1)
+        self.physics = QCheckBox("물리 (MuJoCo 보조 힘)")
+        self.physics.setToolTip("모션마다 MuJoCo 골반 보조 힘 검사도 돌립니다(클립당 1–3초 더)")
+        top.addWidget(self.physics)
+        self.auto = QCheckBox("자동 라벨")
+        self.auto.setToolTip("라벨 파일이 없는 모션은 규칙 파일대로 자동 라벨을 붙여 셉니다(규칙 파일: ⋯ 메뉴나 인스펙터)")
+        top.addWidget(self.auto)
+        self.start = QPushButton("시작")
+        self.start.setToolTip("폴더의 모션을 리타게팅 메뉴의 보정으로 리타게팅하고 잽니다. 처음 리타게팅하는 모션은 하나에 "
+                              "수십 초, 계산해 둔 것은 바로 나옵니다")
+        self.start.clicked.connect(self.run)
+        top.addWidget(self.start)
+        self.stop = QPushButton("멈춤")  # in 시작's place while it runs
+        self.stop.setToolTip("지금 모션이 끝나면 멈춥니다. 다시 시작하면 남은 것부터 합니다")
+        self.stop.setVisible(False)
+        self.stop.clicked.connect(self._request_stop)
+        top.addWidget(self.stop)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
+        self.progress.setMaximumWidth(200)
+        self.progress.setVisible(False)
+        top.addWidget(self.progress)
+        more = QToolButton()
+        more.setText("⋯")
+        more.setToolTip("자동 라벨 규칙 파일, CSV로 저장, 비우기")
+        more.setPopupMode(QToolButton.InstantPopup)
+        more.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        menu = QMenu(more)
+        menu.addAction("자동 라벨 규칙 파일...", lambda: self.win.pick_label_rules())
+        menu.addSeparator()
+        self.a_csv = menu.addAction("CSV로 저장...", self._save_csv)
+        self.a_clear = menu.addAction("비우기", self._clear)
+        self.a_clear.setToolTip("폴더 목록과 표를 비웁니다(계산해 둔 결과는 남아, 다시 돌리면 바로 나옵니다)")
+        menu.setToolTipsVisible(True)
+        menu.aboutToShow.connect(lambda: (self.a_csv.setEnabled(bool(self.model.rows)),
+                                          self.a_clear.setEnabled(not self._running and bool(self.folders or self.model.rows))))
+        more.setMenu(menu)
+        top.addWidget(more)
+        lay.addLayout(top)
+        self.filter_row = QWidget()  # once there are rows
+        mid = QHBoxLayout(self.filter_row)
+        mid.setContentsMargins(0, 0, 0, 0)
+        self.find = QLineEdit()
+        self.find.setPlaceholderText("거르기: 이름·폴더·QC·문제·감점·오류 (띄어 쓰면 모두)")
+        self.find.setClearButtonEnabled(True)
+        self.find.textChanged.connect(lambda t: self.proxy.set(text=t))
+        mid.addWidget(self.find, 1)
+        self.qc = QComboBox()
+        for text, key in (("전체", ""), ("QC FAIL", "FAIL"), ("QC WARN", "WARN"), ("QC PASS", "PASS"),
+                          ("물리 넘어짐", "falls"), ("오류", "error")):
+            self.qc.addItem(text, key)
+        self.qc.currentIndexChanged.connect(lambda _i: self.proxy.set(qc=self.qc.currentData()))
+        mid.addWidget(self.qc)
+        self.filter_row.setVisible(False)
+        lay.addWidget(self.filter_row)
+        self.model = BatchModel(self)
+        self.proxy = BatchFilter(self)
+        self.proxy.setSourceModel(self.model)
+        self.table = QTableView()
+        self.table.setModel(self.proxy)
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(-1, Qt.AscendingOrder)  # the files' order until a header is clicked (Qt starts descending)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(22)
+        head = self.table.horizontalHeader()
+        head.setSectionResizeMode(QHeaderView.Interactive)
+        head.setContextMenuPolicy(Qt.CustomContextMenu)
+        head.customContextMenuRequested.connect(self._columns_menu)
+        self.table.setToolTip("머리글을 눌러 정렬합니다(점수 낮은 순, 문제 긴 순 등). 두 번 누르면 그 모션을 엽니다. "
+                              "머리글 우클릭: 보일 열")
+        self.table.doubleClicked.connect(self._open)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._row_menu)
+        lay.addWidget(self.table, 1)
+        self.summary = QLabel()
+        self.summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self.summary)
+        self._picked = self._saved_columns()
+        self._apply_columns()
+        self.add_folders([])
+        self._show_totals()
+
+    # ------------------------------------------------------------ columns
+    def _saved_columns(self) -> dict[str, bool]:
+        """The columns the user turned on or off (the header's menu), by key."""
+        raw = self.win.settings.value("dataset/columns", "") if hasattr(self.win, "settings") else ""
+        out = {}
+        for part in str(raw or "").split(","):
+            key, _, on = part.partition("=")
+            if key:
+                out[key] = on == "1"
+        return out
+
+    def _apply_columns(self) -> None:
+        for c, (key, _t, _f) in enumerate(batch.COLUMNS):
+            shown = self._picked.get(key, key in BATCH_SHOWN or (key in BATCH_WHEN_FILLED and key in self._filled))
+            if self.table.isColumnHidden(c) == shown:
+                self.table.setColumnHidden(c, not shown)
+
+    def _columns_menu(self, pos) -> None:
+        m = QMenu(self)
+        for c, (key, title, _f) in enumerate(batch.COLUMNS):
+            a = m.addAction(title)
+            a.setCheckable(True)
+            a.setChecked(not self.table.isColumnHidden(c))
+            a.toggled.connect(lambda on, k=key: self._pick_column(k, on))
+        m.addSeparator()
+        m.addAction("처음 열로", lambda: self._pick_column(None, False))
+        m.exec(self.table.horizontalHeader().mapToGlobal(pos))
+
+    def _pick_column(self, key: str | None, on: bool) -> None:
+        if key is None:  # back to the defaults
+            self._picked = {}
+        else:
+            self._picked[key] = on
+        if hasattr(self.win, "settings"):
+            self.win.settings.setValue("dataset/columns", ",".join(f"{k}={int(v)}" for k, v in self._picked.items()))
+        self._apply_columns()
+
+    # ------------------------------------------------------------ actions
+    def _add_folder(self) -> None:
+        start = self.folders[-1] if self.folders else os.path.expanduser("~")
+        path = QFileDialog.getExistingDirectory(self, "모션 폴더 고르기", start)
+        if path:
+            self.add_folders([path])
+
+    def add_folders(self, folders: list[str]) -> None:
+        for f in folders:
+            f = os.path.abspath(f)
+            if f not in self.folders:
+                self.folders.append(f)
+        self.where.setText(" · ".join(os.path.basename(f) or f for f in self.folders) or "폴더를 더하세요")
+        self.where.setToolTip("\n".join(self.folders))
+        if not self.model.rows and not self._running:
+            self._show_totals()
+
+    def _clear(self) -> None:
+        if self._running:
+            return
+        self.folders = []
+        self.model.clear()
+        self._filled = set()
+        self.add_folders([])
+        self.progress.reset()
+        self.filter_row.setVisible(False)
+        self._apply_columns()
+        self._show_totals()
+
+    def _request_stop(self) -> None:
+        self._stop = True
+        self.stop.setEnabled(False)
+        self.win.status("일괄 처리: 지금 모션이 끝나면 멈춥니다")
+
+    def options(self) -> batch.BatchOptions:
+        o = self.win.scene.opts
+        rules = autolabel.rules_file() if self.auto.isChecked() else None
+        return batch.BatchOptions(robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps,
+                                  smpl_model_dir=o.smpl_model_dir, foot_flat=o.foot_flat,
+                                  swing_clearance_cm=o.swing_clearance_cm, self_collision=o.self_collision,
+                                  physics=self.physics.isChecked(), rules=rules or None)
+
+    def run(self) -> None:
+        """Process the folders in the background; rows come in as they are done."""
+        if self._running:
+            return
+        files = batch.motion_files(self.folders)
+        if not files:
+            self.win.status("일괄 처리: 모션 파일이 없습니다(폴더를 더하세요)", 5000)
+            return
+        opts = self.options()
+        if self.auto.isChecked() and not opts.rules:
+            self.win.status("일괄 처리: 자동 라벨 규칙 파일이 없습니다(⋯ > 자동 라벨 규칙 파일...). 라벨 파일만 셉니다", 8000)
+        self.model.clear()
+        self._filled = set()
+        self._stop, self._running, self._total = False, True, len(files)
+        self.start.setVisible(False)
+        self.stop.setEnabled(True)
+        self.stop.setVisible(True)
+        self.progress.setRange(0, len(files))
+        self.progress.setValue(0)
+        self.progress.setFormat(f"%v / {len(files)}")
+        self.progress.setVisible(True)
+        self._apply_columns()
+        self._show_totals()
+        runner = batch.Batch(opts, log=self.win.scene.log)
+
+        def progress(done, total, row):
+            self.win.bridge.gui.emit(lambda: self._row_done(done, total, row))
+
+        def work():
+            try:
+                runner.run(files, progress=progress, cancel=lambda: self._stop)
+            finally:
+                self.win.bridge.gui.emit(self._finished)
+
+        threading.Thread(target=work, daemon=True, name="batch").start()
+
+    def _row_done(self, done: int, total: int, row: dict) -> None:
+        self.model.add(row)
+        self.progress.setValue(done)
+        filled = {k for k in BATCH_WHEN_FILLED  # a count of 0 says nothing, except 0 falls
+                  if row.get(k) not in (None, "") and (row.get(k) != 0 or k == "phys_falls")}
+        if not filled <= self._filled:
+            self._filled |= filled
+            self._apply_columns()
+        self.filter_row.setVisible(True)
+        self._show_totals()
+        if done == 1:
+            self.table.resizeColumnsToContents()
+
+    def _finished(self) -> None:
+        self._running = False
+        self.start.setVisible(True)
+        self.stop.setVisible(False)
+        self.progress.setVisible(False)
+        self._show_totals()
+        t = batch.totals(self.model.rows)
+        self.win.status(f"일괄 처리 {'멈춤' if self._stop else '끝'}: 모션 {t['read']}개 · 오류 {t['errors']}개", 8000)
+
+    _total = 0  # files of the last run
+
+    def _show_totals(self) -> None:
+        if not self.model.rows:
+            self.summary.setText("" if self._running else
+                                 "폴더 추가...로 촬영 폴더를 고르고 시작을 누릅니다." if not self.folders else
+                                 "시작을 누르면 폴더의 모션을 리타게팅하고 재서 한 줄씩 모읍니다.")
+            return
+        t = batch.totals(self.model.rows)
+        parts = [f"모션 {t['read']}개", f"{t['total_s'] / 60:.1f}분", f"QC FAIL {t['qc_fail']}", f"WARN {t['qc_warn']}"]
+        n = len(self.model.rows)
+        if n < self._total:  # still running, or stopped: how far it got
+            parts.insert(0, f"{n} / {self._total} 처리" + ("" if self._running else " (멈춤, 다시 시작하면 남은 것부터)"))
+        if self.physics.isChecked():
+            parts.append(f"물리 넘어짐 있는 모션 {t['with_falls']}")
+        parts += [f"{name} {t[k]}" for k, name in (("labelled", "라벨 있음"), ("with_objects", "물체 있음"),
+                                                   ("errors", "오류")) if t[k]]
+        self.summary.setText(" · ".join(parts))
+
+    def _row(self, index) -> dict:
+        return self.model.rows[self.proxy.mapToSource(index).row()]
+
+    def _open(self, index) -> None:
+        row = self._row(index)
+        if row.get("file"):
+            self.win.add_paths([row["file"]])
+
+    def _row_menu(self, pos) -> None:
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        row = self._row(index)
+        if not row.get("file"):
+            return
+        m = QMenu(self)
+        m.addAction("열기", lambda: self.win.add_paths([row["file"]]))
+        m.addAction("파일 위치 열기", lambda: self.win.open_path(os.path.dirname(row["file"])))
+        m.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _save_csv(self) -> None:
+        if not self.model.rows:
+            self.win.status("저장할 표가 없습니다", 4000)
+            return
+        start = os.path.join(self.folders[0] if self.folders else os.path.expanduser("~"), "retlens_batch.csv")
+        path, _ = QFileDialog.getSaveFileName(self, "일괄 처리 표 저장", start, "CSV (*.csv)")
+        if path:
+            self.win.status(f"저장함: {batch.write_csv(self.model.rows, path)}", 6000)
 
 
 class SegmentModel(QAbstractTableModel):
@@ -1764,7 +2576,8 @@ class SettingsDialog(QDialog):
         ("robot_usd", "로봇 USD (선택)", "USD (*.usd *.usda *.usdc *.usdz);;모든 파일 (*)", "robot_usd"),
         ("video", "동영상 저장 폴더", None, "video_dir"),
     ]
-    TIPS = {"isaac": "물리 모드와 동영상 저장에 씁니다. 설치 폴더(python.bat이 있는 곳)나 python.bat을 고르세요.",
+    TIPS = {"isaac": "동영상 저장과 물리 모드의 '보조 힘 (Isaac)'에 씁니다. 설치 폴더(python.bat이 있는 곳)나 python.bat을 "
+                     "고르세요.",
             "robot_usd": "Isaac이 시뮬레이션·녹화에 쓰는 로봇 USD입니다. 비우면 NVIDIA 에셋 서버의 Unitree G1을 받아 씁니다"
                          "(인터넷 필요). 오프라인이면 로컬에 둔 G1 USD(참조 파일 포함)나 사내 Nucleus 주소를 지정하세요. "
                          "바꾸면 물리 결과를 따로 계산합니다.",
@@ -1792,6 +2605,7 @@ class SettingsDialog(QDialog):
         grid.setColumnStretch(1, 1)
         self.edits: dict[str, QLineEdit] = {}
         self.status: dict[str, QLabel] = {}
+        self.fetch: dict[str, QPushButton] = {}  # 받는 곳: shown while that one is missing
         for r, (key, label, filt, field_name) in enumerate(self.ROWS):
             name = QLabel(f"<b>{label}</b>")
             name.setToolTip(self.TIPS[key])
@@ -1810,6 +2624,7 @@ class SettingsDialog(QDialog):
                 get.setToolTip(url)
                 get.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
                 grid.addWidget(get, 2 * r, 3)
+                self.fetch[key] = get
             st = QLabel()
             st.setWordWrap(True)
             st.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1925,6 +2740,8 @@ class SettingsDialog(QDialog):
             else:
                 self.edits[key].setPlaceholderText(f"자동: {found_auto[key]}" if found_auto[key] else "자동: 찾지 못함")
             self.status[key].setText(check_html(checks[key]))
+            if key in self.fetch:
+                self.fetch[key].setVisible(not checks[key].ok)
         for key, st in self.prog_status.items():
             st.setText(check_html(checks[key]))
         self.libs.clear()
@@ -2237,6 +3054,7 @@ class EditorWindow(QMainWindow):
         self.bridge.event.connect(self._on_scene)
         self.bridge.added.connect(self._on_added)
         self.bridge.labelled.connect(self._on_labelled)
+        self.bridge.gui.connect(self._run_on_gui)
         self._label_jobs: dict[Item, dict] = {}  # 자동 라벨 being made off the GUI thread: each motion's latest request
         self.bridge.log.connect(self._append_log)
         scene.listen(lambda e, p: self.bridge.event.emit(e, p))
@@ -2261,6 +3079,7 @@ class EditorWindow(QMainWindow):
         self.project = ProjectPanel(self, library)
         self.analysis = AnalysisPanel(self)
         self.compare_panel = ComparePanel(self)
+        self.dataset = DatasetPanel(self)
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(5000)
@@ -2280,7 +3099,14 @@ class EditorWindow(QMainWindow):
             self.restoreState(state)
             if not self.settings.value(layout_key("layout/has_compare"), False, type=bool):  # saved before the 비교 tab
                 self.tabifyDockWidget(self.docks["analysis"], self.docks["compare"])
+            if not self.settings.value(layout_key("layout/has_dataset"), False, type=bool):  # saved before 데이터셋
+                self.tabifyDockWidget(self.docks["compare"], self.docks["dataset"])
+            if not self.settings.value(layout_key("layout/tidy_v1"), False, type=bool):  # saved before 콘솔 was hidden
+                for key in self.DEFAULT_HIDDEN:
+                    self.docks[key].hide()
         self.settings.setValue(layout_key("layout/has_compare"), True)
+        self.settings.setValue(layout_key("layout/has_dataset"), True)
+        self.settings.setValue(layout_key("layout/tidy_v1"), True)
 
         # The scene is posed on its own thread at 30 Hz, so the window (and the embedded 3D view,
         # which Qt composites on this thread) never waits for it; the timer below only refreshes
@@ -2329,15 +3155,21 @@ class EditorWindow(QMainWindow):
         proj = self._dock("project", "프로젝트", self.project, B)
         ana = self._dock("analysis", "분석", self.analysis, B)
         cmp = self._dock("compare", "비교", self.compare_panel, B)
+        data = self._dock("dataset", "데이터셋", self.dataset, B)
         con = self._dock("console", "콘솔", self.console, B)
         self.splitDockWidget(tl, proj, Qt.Vertical)
         self.tabifyDockWidget(proj, ana)
         self.tabifyDockWidget(ana, cmp)
-        self.tabifyDockWidget(cmp, con)
+        self.tabifyDockWidget(cmp, data)
+        self.tabifyDockWidget(data, con)
         proj.raise_()
-        self.resizeDocks([hier, insp], [220, 520], Qt.Vertical)
+        for key in self.DEFAULT_HIDDEN:  # 보기 menu shows them
+            self.docks[key].hide()
+        self.resizeDocks([hier, insp], [160, 580], Qt.Vertical)
         self.resizeDocks([hier], [420], Qt.Horizontal)
         self.resizeDocks([tl, proj], [110, 260], Qt.Vertical)
+
+    DEFAULT_HIDDEN = ("console",)  # docks the default layout keeps closed (보기 opens them)
 
     def _build_actions(self) -> None:
         st, sc = self.style(), self.scene
@@ -2361,23 +3193,34 @@ class EditorWindow(QMainWindow):
         self.a_video = act("선택한 모션 동영상 저장", lambda: self.save_video(self.selected), "Ctrl+E",
                            QStyle.SP_DialogSaveButton, tip="선택한 모션을 Isaac Sim으로 녹화해 MP4로 저장")
         self.a_video_dir = act("동영상 폴더 열기", lambda: self.open_path(sc.opts.video_dir))
+        self.a_batch = act("폴더 일괄 처리...", lambda: (self.docks["dataset"].show(), self.docks["dataset"].raise_(),
+                                                    self.dataset._add_folder()),
+                           tip="촬영 세션 폴더의 모션을 모두 리타게팅·측정해 데이터셋 탭의 표에 모읍니다")
         self.a_quit = act("종료", self.close, "Ctrl+Q")
         self.a_remove = act("선택한 모션 제거", lambda: self.remove(self.selected), "Delete")
-        self.a_remove_all = act("모두 제거", self.remove_all)
+        self.a_remove_all = act("모두 제거...", self.remove_all)
+        for a in (self.a_video, self.a_remove, self.a_remove_all):  # select() / the items event turn them on
+            a.setEnabled(False)
         self.a_play = act("재생 / 일시정지", sc.toggle_play, "Space", QStyle.SP_MediaPlay)
         self.a_home = act("처음으로", lambda: sc.seek(0.0), "Home", QStyle.SP_MediaSkipBackward)
         self.a_prev = act("이전 프레임", lambda: sc.step(-1), "Left", QStyle.SP_MediaSeekBackward)
         self.a_next = act("다음 프레임", lambda: sc.step(1), "Right", QStyle.SP_MediaSeekForward)
-        self.a_physics = act("물리 모드", self.set_physics, "P", QStyle.SP_ComputerIcon, checkable=True,
-                             tip="켜면 각 로봇을 시뮬레이션한 결과로 바꿔 그립니다. 균형 제어에 따라 Isaac Sim PhysX"
-                                 "(골반 보조 힘, 짧은 클립 약 1분) 또는 MuJoCo(제어기 없음 / GMT 추적 정책, 클립당 몇 초)로 "
-                                 "백그라운드에서 계산합니다")
+        self.a_next_problem = act("다음 문제로", lambda: self.goto_problem(1), "N",
+                                  tip="고른 모션(없으면 보이는 모든 모션)의 다음 문제 시작으로 (N)")
+        self.a_prev_problem = act("이전 문제로", lambda: self.goto_problem(-1), "Shift+N",
+                                  tip="고른 모션(없으면 보이는 모든 모션)의 이전 문제 시작으로 (Shift+N)")
+        self.a_show_problems = act("타임라인에 문제 구간 표시", lambda on: setattr(sc.view, "show_problems", on), checkable=True,
+                                   tip="모션 막대 아래쪽에 문제 구간을 색 띠로 그립니다(마우스를 올리면 종류와 시각)")
+        self.a_show_problems.setChecked(sc.view.show_problems)
+        self.a_physics = act("물리 모드", self.set_physics, "P", checkable=True,
+                             tip="로봇을 물리 시뮬레이션 결과로 그립니다 (P). ▾에서 균형 제어를 고릅니다")
         self.a_cancel = act("작업 취소", sc.cancel_jobs, icon=QStyle.SP_BrowserStop,
                             tip="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화를 멈춥니다")
-        self.a_compare = act("겹쳐 비교", lambda on: self.start_compare(on=on), "O", QStyle.SP_FileDialogContentsView,
-                             checkable=True, tip="대상(B)을 기준(A)의 골반 위치에 겹쳐 그리고, A에서 벗어난 B의 부위만 색칠합니다 "
-                                                 "(A·B는 '비교' 탭이나 계층 패널 우클릭에서 고름)")
-        self.a_fit = act("카메라 맞추기", sc.fit_camera, "F", QStyle.SP_DesktopIcon)
+        self.a_cancel.setEnabled(False)  # while jobs run (_refresh_status)
+        self.a_compare = act("겹쳐 비교", lambda on: self.start_compare(on=on), "O", checkable=True,
+                             tip="대상(B)을 기준(A)의 골반에 겹쳐, 벗어난 부위만 색칠합니다 (O). A·B는 비교 탭이나 "
+                                 "계층 우클릭에서 고릅니다")
+        self.a_fit = act("카메라 맞추기", sc.fit_camera, "F", tip="보이는 모션이 모두 들어오게 카메라를 옮깁니다 (F)")
         self.a_reset = act("레이아웃 초기화", self.reset_layout)
         self.a_browser = act("브라우저에서 씬 열기", lambda: QDesktopServices.openUrl(QUrl(self.url)))
         self.a_readme = act("사용 설명서", lambda: self.open_path(app_paths.doc("docs", "manual.md")))
@@ -2399,10 +3242,16 @@ class EditorWindow(QMainWindow):
                                     tip=f"{RETARGET_TIPS['self_collision']}. {RETARGET_NOTE}")
         self._sync_retarget()
 
+        tb = QToolBar("도구 모음", self)
+        tb.setObjectName("toolbar_main")
+        tb.setMovable(True)
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+
         mb = self.menuBar()
         m = mb.addMenu("파일(&F)")
-        for a in (self.a_open, None, self.a_video, self.a_video_dir, self.a_folders, None, self.a_settings, self.a_setup, None,
-                  self.a_quit):
+        m.setToolTipsVisible(True)
+        for a in (self.a_open, self.a_batch, None, self.a_video, self.a_video_dir, self.a_folders, None, self.a_settings,
+                  self.a_setup, None, self.a_quit):
             m.addSeparator() if a is None else m.addAction(a)
         m = mb.addMenu("편집(&E)")
         m.addAction(self.a_remove)
@@ -2410,28 +3259,32 @@ class EditorWindow(QMainWindow):
         m = mb.addMenu("보기(&V)")
         for d in self.docks.values():
             m.addAction(d.toggleViewAction())
+        m.addAction(tb.toggleViewAction())
         m.addSeparator()
         for a in (self.a_compare, self.a_fit, self.a_reset, self.a_browser):
             m.addAction(a)
         m = mb.addMenu("재생(&P)")
-        for a in (self.a_play, self.a_home, self.a_prev, self.a_next):
-            m.addAction(a)
+        m.setToolTipsVisible(True)
+        for a in (self.a_play, self.a_home, self.a_prev, self.a_next, None, self.a_next_problem, self.a_prev_problem,
+                  self.a_show_problems):
+            m.addAction(a) if a is not None else m.addSeparator()
         # 리타게팅 보정 of the human motions opened next (open ones keep theirs: reopen to compare)
         m = mb.addMenu("리타게팅(&R)")
         m.setToolTipsVisible(True)
+        m.addSection("새로 여는 모션에 적용")  # an open motion: 인스펙터 > 보정
         m.addAction(self.a_foot_flat)
         m.addAction(self.a_swing)
         m.addAction(self.a_self_collision)
         m = mb.addMenu("물리(&S)")
+        m.setToolTipsVisible(True)
         m.addAction(self.a_physics)
         # 균형 제어: what keeps the simulated robot up. A mode whose files are not here yet (GMT before the
-        # setup assistant fetched it) says so in its label and tip; picking it explains and offers the assistant
-        sub = m.addMenu("균형 제어")
+        # setup assistant fetched it) says so in its label and tip; picking it explains and offers the assistant.
+        # The same menu drops down from the toolbar's 물리 모드 button
+        sub = self.m_balance = m.addMenu("균형 제어")
         sub.setToolTipsVisible(True)
         grp = QActionGroup(self)
         self.a_balance = {}
-        self.balance_box = QComboBox()
-        self.balance_box.setToolTip("물리 모드의 균형 제어 (물리 메뉴에도 있음). 고르면 물리 모드를 켭니다")
         for key, label in BALANCE.items():
             a = QAction(label, self, checkable=True)
             a.setChecked(key == sc.balance)
@@ -2439,10 +3292,7 @@ class EditorWindow(QMainWindow):
             grp.addAction(a)
             sub.addAction(a)
             self.a_balance[key] = a
-            self.balance_box.addItem(label, key)
         self._refresh_balance_entries()
-        self.balance_box.setCurrentIndex(self.balance_box.findData(sc.balance))
-        self.balance_box.activated.connect(lambda i: self.set_balance(self.balance_box.itemData(i)))
         self.m_assist = m.addMenu("골반 보조 힘 (Isaac)")
         grp = QActionGroup(self)
         self.a_assist = {}
@@ -2458,29 +3308,34 @@ class EditorWindow(QMainWindow):
         for a in (self.a_readme, self.a_labels, self.a_about):
             m.addAction(a)
 
-        tb = QToolBar("도구", self)
-        tb.setObjectName("toolbar_main")
-        tb.setMovable(True)
-        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        for a in (self.a_open, None, self.a_home, self.a_prev, self.a_play, self.a_next, None, self.a_physics,
-                  self.balance_box, self.a_cancel, None, self.a_compare, self.a_fit, self.a_video):
+        # the toolbar: what is used all the time; playback is the timeline's, the rest is in the menus
+        self.physics_btn = QToolButton()  # 물리 모드, and its 균형 제어 from the ▾
+        self.physics_btn.setDefaultAction(self.a_physics)
+        self.physics_btn.setMenu(self.m_balance)
+        self.physics_btn.setPopupMode(QToolButton.MenuButtonPopup)
+        self.physics_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        for a in (self.a_open, None, self.physics_btn, self.a_compare, self.a_fit):
             tb.addSeparator() if a is None else tb.addWidget(a) if isinstance(a, QWidget) else tb.addAction(a)
         self.addToolBar(Qt.TopToolBarArea, tb)
 
     def _build_status(self) -> None:
+        """Permanent items show only when they matter: running jobs (with ✕ to cancel), physics mode while it is
+        on, 환경 ⚠ when something is missing, the AI API when it failed to start."""
         sb = self.statusBar()
-        self.st_env = QToolButton()  # 환경 점검 at a glance; opens 환경 설정
+        self.st_jobs = QLabel()
+        self.st_cancel = QToolButton()
+        self.st_cancel.setDefaultAction(self.a_cancel)
+        self.st_cancel.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.st_cancel.setAutoRaise(True)
+        self.st_physics = QLabel()
+        self.st_env = QToolButton()  # what is missing; opens 환경 설정
         self.st_env.setAutoRaise(True)
         self.st_env.clicked.connect(lambda: self.open_settings())
-        sb.addPermanentWidget(self.st_env)
-        self.st_api = QLabel("API")  # the AI API's port (retlens/app/api_server.py)
-        self.st_api.setContentsMargins(8, 0, 8, 0)
-        sb.addPermanentWidget(self.st_api)
-        self.st_physics = QLabel()
-        self.st_jobs = QLabel()
-        self.st_time = QLabel()
-        for w in (self.st_jobs, self.st_physics, self.st_time):
-            w.setContentsMargins(8, 0, 8, 0)
+        self.st_api = QLabel()  # the AI API (retlens/app/api_server.py), when it could not start
+        for w in (self.st_jobs, self.st_cancel, self.st_physics, self.st_env, self.st_api):
+            if isinstance(w, QLabel):
+                w.setContentsMargins(8, 0, 8, 0)
+            w.hide()
             sb.addPermanentWidget(w)
 
     # ---------------------------------------------------------------- 환경 설정
@@ -2489,10 +3344,8 @@ class EditorWindow(QMainWindow):
     def _refresh_env(self, checks: list | None = None) -> list:
         checks = checks if checks is not None else settings.check_all()
         missing = [c for c in checks if not c.ok]
-        if not missing:
-            self.st_env.setText("환경 ✓")
-            self.st_env.setToolTip("모든 기능을 쓸 수 있습니다 (눌러서 환경 설정)")
-        else:
+        self.st_env.setVisible(bool(missing))
+        if missing:
             self.st_env.setText(f"환경 ⚠ {len(missing)}")
             self.st_env.setToolTip("쓸 수 없는 기능이 있습니다 (눌러서 환경 설정):\n" + "\n".join(
                 f"- {c.name}: {c.needed_for}" for c in missing))
@@ -2533,19 +3386,21 @@ class EditorWindow(QMainWindow):
                                                and self._api_port_asked != s.api_port):
             self._stop_api()
             self._start_api()
+        self._refresh_api_status()  # turned off: a failure from before no longer matters
         if not quiet:
             self.status("환경 설정을 저장했습니다", 4000)
 
     # ---------------------------------------------------------------- AI API
     api = None
     _api_port_asked = None
+    _api_error = ""  # why the API did not start (the status bar says so)
 
     def _start_api(self) -> None:
         """The local HTTP API for AI agents (retlens/app/api_server.py), when 환경 설정 has it on."""
         from .api_server import ApiBackend, ApiServer, discovery_path
 
         s = settings.load()
-        self._api_port_asked = s.api_port
+        self._api_port_asked, self._api_error = s.api_port, ""
         if not s.api_enabled:
             self._refresh_api_status()
             return
@@ -2554,7 +3409,8 @@ class EditorWindow(QMainWindow):
             self.scene.log(f"AI용 로컬 API: {self.api.url} (토큰: {discovery_path()})")
         except Exception as e:
             self.api = None
-            self.scene.log(f"AI용 로컬 API를 열지 못함: {type(e).__name__}: {e}")
+            self._api_error = f"{type(e).__name__}: {e}"
+            self.scene.log(f"AI용 로컬 API를 열지 못함: {self._api_error}")
         self._refresh_api_status()
 
     def _stop_api(self) -> None:
@@ -2563,12 +3419,10 @@ class EditorWindow(QMainWindow):
             self.api = None
 
     def _refresh_api_status(self) -> None:
-        if self.api is not None:
-            self.st_api.setText(f"API :{self.api.port}")
-            self.st_api.setToolTip(f"AI용 로컬 API가 {self.api.url}에서 동작 중입니다 (토큰 필요, 환경 설정에서 끔)")
-        else:
-            self.st_api.setText("API 꺼짐")
-            self.st_api.setToolTip("AI용 로컬 API가 꺼져 있습니다 (환경 설정 > AI 연동)")
+        """Only a failure shows: the running API's address is in 환경 설정 > AI 연동."""
+        self.st_api.setVisible(bool(self._api_error) and self.api is None and settings.load().api_enabled)
+        self.st_api.setText("API 시작 실패")
+        self.st_api.setToolTip(f"AI용 로컬 API를 열지 못했습니다: {self._api_error}\n(환경 설정 > AI 연동에서 포트를 바꿉니다)")
 
     def _gui_call(self, fn):
         """Run fn on the GUI thread and return its result (from the API's request threads)."""
@@ -2628,8 +3482,8 @@ class EditorWindow(QMainWindow):
 
     def reset_layout(self) -> None:
         self.restoreState(self._default_state)
-        for d in self.docks.values():
-            d.show()
+        for key, d in self.docks.items():
+            d.setVisible(key not in self.DEFAULT_HIDDEN)
 
     # ---------------------------------------------------------------- selection / items
     def item_by_id(self, key) -> Item | None:
@@ -2668,24 +3522,43 @@ class EditorWindow(QMainWindow):
             sc.set_compare(on=False)
 
     def remove_all(self) -> None:
-        for it in list(self.scene.items):
-            self.scene.remove(it)
+        items = list(self.scene.items)
+        if items and QMessageBox.question(self, "모두 제거", f"열린 모션 {len(items)}개를 모두 제거할까요?\n"
+                                                            "(파일은 그대로입니다)") == QMessageBox.Yes:
+            for it in items:
+                self.scene.remove(it)
+
+    def motion_menu(self, m: QMenu, it: Item) -> None:
+        """A motion's right-click menu (계층, 타임라인)."""
+        m.addAction("동영상 저장", lambda: self.save_video(it))
+        if self.scene.video_file(it):
+            m.addAction("저장된 동영상 열기", lambda: self.open_path(self.scene.video_file(it)))
+        m.addAction("파일 위치 열기", lambda: self.open_path(os.path.dirname(it.source)))
+        m.addSeparator()
+        self.add_label_actions(m.addMenu("라벨"), it)
+        m.addSeparator()
+        m.addAction("겹쳐 비교: 기준(A)으로", lambda: self.start_compare(ref=it))
+        m.addAction("겹쳐 비교: 대상(B)으로", lambda: self.start_compare(item=it))
+        m.addSeparator()
+        m.addAction("제거", lambda: self.remove(it))
 
     # ---------------------------------------------------------------- labels (retlens.motion_labels)
     def add_label_actions(self, m: QMenu, it: Item) -> None:
-        """라벨 entries of a motion's menus (timeline, hierarchy)."""
+        """라벨 entries of a motion (the right-click menu's 라벨, the inspector's ⋯)."""
         sc, lab = self.scene, it.labels
         m.addAction("라벨 불러오기...", lambda: self.load_labels_dialog(it))
         if lab is not None and lab.path:
             m.addAction("라벨 다시 읽기", lambda: self.reload_labels(it))
             m.addAction("규칙 파일 열기" if lab.auto else "라벨 파일 열기", lambda: self.open_path(lab.path))
+        else:  # its own label file may have been put next to it since
+            m.addAction("라벨 파일 다시 찾기", lambda: self.reload_labels(it))
         if lab is not None:
             m.addAction("라벨 빼기", lambda: sc.set_labels(it, None))
         if sc.has_skeleton(it):
             m.addAction("자동 라벨 붙이기", lambda: self.auto_label(it))
         if len(sc.items) > 1:
             m.addAction("열린 모션 모두 자동 라벨", self.auto_label_all)
-        m.addAction("자동 라벨 규칙 파일 고르기...", lambda: self.pick_label_rules(it))
+        m.addAction("자동 라벨 규칙 파일 고르기...", lambda: self.pick_label_rules(it if sc.has_skeleton(it) else None))
         if lab is not None and lab.segments:
             m.addAction("라벨을 CSV로 저장...", lambda: self.save_labels_dialog(it))
 
@@ -2821,6 +3694,80 @@ class EditorWindow(QMainWindow):
             self.status(f"자동 라벨: {it.label}에 구간 {len(lab.segments)}개 ({lab.auto})", 8000)
         elif lab is not None:
             self.status(f"라벨: {it.label}에 구간 {len(lab.segments)}개 ({os.path.basename(lab.path)})", 8000)
+
+    @staticmethod
+    def _run_on_gui(fn) -> None:
+        fn()
+
+    # ---------------------------------------------------------------- 이 모션의 보정 (B1)
+    def retarget_item(self, item: Item, foot_flat: bool, swing_clearance_cm: float, self_collision: bool) -> None:
+        """다시 리타게팅 with these corrections in the background; the new motion takes the old one's place."""
+        if item.handles.get("ui_busy"):
+            return
+        item.handles["ui_busy"] = True
+        self.status(f"{item.label}: 다시 리타게팅 중 ({retarget_text(foot_flat, swing_clearance_cm, self_collision)}; "
+                    "처음 쓰는 보정이면 수십 초)")
+
+        def work():
+            try:
+                new = self.scene.retarget_again(item, foot_flat, swing_clearance_cm, self_collision)
+                done = lambda: (self.select(new), self.status(  # noqa: E731
+                    f"{new.label}: 다시 리타게팅함 · 점수 {item.metrics.get('retarget_score', 0):.0f} → "
+                    f"{new.metrics.get('retarget_score', 0):.0f}", 10000))
+            except Exception as e:
+                item.handles.pop("ui_busy", None)
+                done = lambda e=e: self.status(f"{item.label}: 다시 리타게팅하지 못함 ({type(e).__name__}: {e})", 10000)  # noqa: E731
+            self.bridge.gui.emit(done)
+
+        threading.Thread(target=work, daemon=True, name="retarget-again").start()
+
+    def recommend_retarget(self, item: Item) -> None:
+        """추천 보정: the 8 combinations of corrections in the background, ranked by score; offers the best."""
+        if item.handles.get("ui_busy"):
+            return
+        item.handles["ui_busy"] = True
+
+        def progress(done, total, text):
+            self.bridge.gui.emit(lambda: self.status(f"{item.label}: 추천 보정 찾는 중 {done}/{total}"
+                                                     + (f" ({text})" if text else "")))
+
+        def work():
+            try:
+                ranked = self.scene.recommend_retarget(item, progress)
+                done = lambda: self._offer_recommendation(item, ranked)  # noqa: E731
+            except Exception as e:
+                done = lambda e=e: self.status(f"{item.label}: 추천 보정을 찾지 못함 ({type(e).__name__}: {e})", 10000)  # noqa: E731
+            item.handles.pop("ui_busy", None)
+            self.bridge.gui.emit(done)
+
+        threading.Thread(target=work, daemon=True, name="recommend-retarget").start()
+
+    def _offer_recommendation(self, item: Item, ranked: list[dict]) -> None:
+        r = item.retarget
+        now = retarget_text(r.get("foot_flat", False), r.get("swing_clearance_cm", 0.0), r.get("self_collision", False))
+        best = ranked[0]
+        lines = "\n".join(f"{c['score']:.0f}점  {c['text']}" if c["score"] is not None else f"-  {c['text']}" for c in ranked)
+        box = QMessageBox(self)
+        box.setWindowTitle("추천 보정")
+        box.setText(f"{item.label}\n\n지금: {now} · {item.metrics.get('retarget_score', 0):.0f}점\n"
+                    f"추천: {best['text']} · {best['score']:.0f}점\n\n보정 조합별 리타게팅 점수:\n{lines}")
+        apply = box.addButton("추천 보정으로 다시 리타게팅", QMessageBox.AcceptRole)
+        box.addButton("닫기", QMessageBox.RejectRole)
+        if best["text"] == now:
+            apply.setEnabled(False)
+        box.exec()
+        if box.clickedButton() is apply and item in self.scene.items:
+            self.retarget_item(item, best["foot_flat"], best["swing_clearance_cm"], best["self_collision"])
+
+    def goto_problem(self, direction: int) -> None:
+        """다음 / 이전 문제로: the selected motion's problems, or every visible motion's when none is selected."""
+        stop = self.scene.next_problem(direction, self.selected)
+        if stop is None:
+            self.status(f"{'다음' if direction > 0 else '이전'} 문제가 없습니다"
+                        + (f" ({self.selected.label})" if self.selected is not None else ""), 4000)
+        else:
+            t, kind, it = stop
+            self.status(f"{it.label}: {PROBLEM_NAMES.get(kind, kind)} {t - it.offset:.2f}s", 6000)
 
     def add_paths(self, paths: list[str]) -> None:
         """Load motion files in the background (retargeting can take tens of seconds)."""
@@ -2972,20 +3919,18 @@ class EditorWindow(QMainWindow):
                 a.blockSignals(False)
 
     def _refresh_balance_entries(self) -> None:
-        """Labels and tips of the 균형 제어 menu and box: '(설치 필요)' on a mode that cannot run yet."""
-        for i, (key, label) in enumerate(BALANCE.items()):
+        """Labels and tips of the 균형 제어 menu: '(설치 필요)' on a mode that cannot run yet."""
+        for key, label in BALANCE.items():
             why = self.scene.balance_problem(key)
             tip = f"아직 쓸 수 없음: {why}" if why else BALANCE_TIPS[key]
-            text = label + (" (설치 필요)" if why else "")
             a = self.a_balance[key]
-            a.setText(text)
+            a.setText(label + (" (설치 필요)" if why else ""))
             a.setToolTip(tip)
             a.setStatusTip(tip)
-            self.balance_box.setItemText(i, text)
-            self.balance_box.setItemData(i, tip, Qt.ToolTipRole)
 
     def _balance_ready(self, mode: str) -> bool:
-        """What the mode needs is there (Isaac: installed and its EULA accepted; MuJoCo: GMT's files);
+        """What the mode needs is there (Isaac: installed and its EULA accepted; MuJoCo: the G1 model, and
+        GMT's policy for GMT);
         otherwise say what is missing and offer the setup assistant."""
         if mode == "isaac":
             return self.need("isaac", "물리 모드 (보조 힘, Isaac)") and self._ensure_eula()
@@ -3029,16 +3974,17 @@ class EditorWindow(QMainWindow):
         if event == "items":
             if self.selected is not None and self.selected not in self.scene.items:
                 self.select(None)
+            self.a_remove_all.setEnabled(bool(self.scene.items))
             self.hierarchy.rebuild()
             self.analysis.refresh_lists()
+            self.scene_settings.refresh()
             self.timeline.relayout()
             self.refresh_analysis()
         elif event in ("item", "status"):
             if event == "item":
                 self.timeline.relayout()  # labels may have added or removed lanes
             self.hierarchy.refresh()
-            self.inspector.refresh()
-            self.refresh_analysis()
+            self.refresh_analysis()  # the inspector too
             self._refresh_status()
         elif event == "log":
             self._append_log(str(payload))
@@ -3058,30 +4004,32 @@ class EditorWindow(QMainWindow):
 
     def _refresh_status(self) -> None:
         sc = self.scene
+        self.st_physics.setVisible(sc.physics_on)
         self.st_physics.setText(sc.physics_status())
         self.st_physics.setToolTip("\n".join(f"{it.label}: {sc.job_text(it)}" for it in list(sc.items)
                                              if not sc.is_sim_result(it)) if sc.physics_on else "")
         jobs = sc.jobs_summary()
-        self.st_jobs.setText(f"작업: {jobs}" if jobs else "작업 없음")
+        self.st_jobs.setText(f"작업: {jobs}")
+        for w in (self.st_jobs, self.st_cancel):
+            w.setVisible(bool(jobs))
+        self.a_cancel.setEnabled(bool(jobs))
         if self.a_physics.isChecked() != sc.physics_on:
             self.a_physics.blockSignals(True)
             self.a_physics.setChecked(sc.physics_on)
             self.a_physics.blockSignals(False)
+        self.a_physics.setToolTip(f"물리 모드 (P) · 균형 제어: {BALANCE.get(sc.balance, sc.balance)}. ▾에서 바꿉니다")
         for val, a in self.a_assist.items():
             a.setChecked(val == sc.assist)
-        self.m_assist.setEnabled(sc.balance == "isaac")
+        self.m_assist.menuAction().setVisible(sc.balance == "isaac")  # Isaac's own setting
         for key, a in self.a_balance.items():
             a.setChecked(key == sc.balance)
-        i = self.balance_box.findData(sc.balance)
-        if self.balance_box.currentIndex() != i:
-            self.balance_box.blockSignals(True)
-            self.balance_box.setCurrentIndex(i)
-            self.balance_box.blockSignals(False)
         self._sync_retarget()
 
     def _refresh_all(self) -> None:
         self.hierarchy.rebuild()
         self.analysis.refresh_lists()
+        self.scene_settings.refresh()
+        self.a_remove_all.setEnabled(bool(self.scene.items))
         self.refresh_analysis()
         self._refresh_status()
         self.compare_panel.refresh()
@@ -3093,7 +4041,6 @@ class EditorWindow(QMainWindow):
         prev, self._last_ui = self._last_ui, now
         sc = self.scene
         self.timeline.refresh()
-        self.st_time.setText(f"t = {sc.t:.2f} s")
         if self._play_icon != sc.playing:
             self._play_icon = sc.playing
             self.a_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if sc.playing else QStyle.SP_MediaPlay))
@@ -3115,7 +4062,8 @@ class EditorWindow(QMainWindow):
         from .. import __version__
 
         QMessageBox.about(self, APP_NAME, f"<b>{APP_NAME} {__version__}</b><br>{APP_TAGLINE}<br><br>"
-                                          f"씬: viser ({self.url})<br>물리·녹화: NVIDIA Isaac Sim (PhysX)<br>"
+                                          f"씬: viser ({self.url})<br>물리: MuJoCo (기본), NVIDIA Isaac Sim (PhysX, 선택)<br>"
+                                          f"녹화: NVIDIA Isaac Sim<br>"
                                           f"균형 제어 (MuJoCo): GMT 추적 정책 (Apache-2.0, 공개 모델은 연구용)<br><br>"
                                           f"<b>파일 위치</b><table>{where}</table>")
 

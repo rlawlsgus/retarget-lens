@@ -1,6 +1,6 @@
 """retlens-cli: RetLens without a window, for scripts and AI agents. Every command prints one
 JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"error": ...});
-autolabel: 1 = no motion labelled, 2 = some not (their rows have labels.error).
+autolabel / summary / batch: 1 = no motion done, 2 = some not (their rows say why).
 
     retlens-cli info                        # version, file locations, 환경 점검
     retlens-cli library --query walk        # motion files (with CMU descriptions)
@@ -12,9 +12,12 @@ autolabel: 1 = no motion labelled, 2 = some not (their rows have labels.error).
       (commands that open motions take --smooth HZ, --foot-flat, --swing-clearance CM and --self-collision
        for human ones)
     retlens-cli autolabel FILE [FILE ...] [--rules R.yaml] [--out DIR]   # 자동 라벨 by a rule file (no retargeting)
+    retlens-cli summary FILE|DIR ... [--rules R.yaml] [--csv OUT.csv]   # 데이터셋 요약: length, label time, objects
+    retlens-cli batch FILE|DIR ... [--physics] [--rules R.yaml] [--csv OUT.csv]   # 일괄 처리: retarget + measure each
     retlens-cli c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
-    retlens-cli physics FILE [--assist 1]   # Isaac PhysX check (needs the EULA accepted)
-    retlens-cli video FILE --out X.mp4 [--physics]
+    retlens-cli physics FILE [--balance harness]   # physics check: MuJoCo with the pelvis harness (seconds);
+                                            # --balance pd / gmt (MuJoCo), isaac [--assist 1] (needs the EULA accepted)
+    retlens-cli video FILE --out X.mp4 [--physics [--balance B]]   # Isaac recording (needs the EULA accepted)
     retlens-cli setup [--offline]           # 설치 도우미: what is here, what is missing, what can be installed
     retlens-cli setup --install blender     # install one, only when needed (gmt / isaac: --accept-license)
     retlens-cli api                         # the running RetLens window's HTTP API (url, token)
@@ -116,6 +119,10 @@ def run(args) -> dict:
         return api_core.jsonable({os.path.basename(f): marker_qc(load_c3d(f)) for f in args.files})
     if c == "autolabel":
         return autolabel(args)
+    if c == "summary":
+        return summary(args)
+    if c == "batch":
+        return batch(args)
     if c == "retarget":
         from retlens.compare import load_item
 
@@ -144,15 +151,22 @@ def run(args) -> dict:
                 scene.auto_align(a)
             return api_core.compare(scene, a, b, heading=not args.no_heading, tol_cm=args.tol)
         if c in ("physics", "video"):
-            if not (api_core.eula_accepted() or args.isaac_accept_eula):
-                raise PermissionError("Isaac Sim needs the NVIDIA Omniverse EULA accepted by the user: open RetLens and "
-                                      "turn physics mode on once (or the user passes --isaac-accept-eula themselves)")
-            scene.runner.accept_eula = True
+            isaac = c == "video" or args.balance == "isaac"  # videos are Isaac recordings
+            if isaac:
+                if not (api_core.eula_accepted() or args.isaac_accept_eula):
+                    raise PermissionError("Isaac Sim needs the NVIDIA Omniverse EULA accepted by the user: open RetLens "
+                                          "and accept it once (or the user passes --isaac-accept-eula themselves)")
+                scene.runner.accept_eula = True
+            why = scene.balance_problem(args.balance)
+            if why:
+                raise RuntimeError(f"{args.balance}: {why}")
+            scene.set_balance(args.balance)
             (item,) = _open(scene, [args.file])
             if c == "physics":
                 scene.set_assist(args.assist)
                 scene.set_physics(True, "cli")
-                _log("waiting for Isaac (about a minute for a short clip)")
+                _log("waiting for Isaac (about a minute for a short clip)" if args.balance == "isaac"
+                     else "waiting for MuJoCo (a few seconds per clip)")
                 done = api_core.wait_jobs(scene, args.timeout)
                 return {"finished": done, **api_core.item_info(scene, item)}
             scene.set_physics(bool(args.physics), "cli")
@@ -177,6 +191,112 @@ def _smpl():
     from retlens import paths, settings
 
     return settings.find_smpl().path or paths.smpl_model_dir()
+
+
+def batch(args) -> dict:
+    """데이터셋 일괄 처리 (retlens.batch): every motion retargeted with the given corrections and measured, a row
+    each (cached: a run again, or after a stop, skips what is done); --physics adds the MuJoCo harness check,
+    --rules 자동 라벨 for motions without a label file. --csv writes the table. Exit code 1 when no motion
+    could be read, 2 when some could not."""
+    from retlens import batch as bt
+    from retlens.app import api_core
+
+    if args.rules:
+        from retlens import autolabel
+
+        autolabel.check_rules(args.rules)  # a broken rule file stops here, not once per motion
+    if not 0.0 <= args.swing_clearance <= 10.0:
+        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    opts = bt.BatchOptions(smooth=args.smooth, smpl_model_dir=_smpl(), foot_flat=args.foot_flat,
+                           swing_clearance_cm=args.swing_clearance, self_collision=args.self_collision,
+                           physics=args.physics, rules=args.rules)
+    files = bt.motion_files(args.inputs)
+    rows = bt.Batch(opts).run(files, progress=lambda done, total, row: _log(
+        f"{done}/{total} {row['name']}: " + (f"error {row['error']}" if row.get("error") else
+                                            f"{row.get('qc')}, score {row.get('retarget_score')}"
+                                            + (" (cached)" if row.get("cached") else ""))))
+    out = {**bt.totals(rows), "options": api_core.jsonable(vars(opts)), "rows": api_core.jsonable(rows)}
+    if args.csv:
+        out["csv"] = bt.write_csv(rows, args.csv)
+    errors = sum(bool(r.get("error")) for r in rows)
+    return _Exit(out, 1) if rows and errors == len(rows) else _Exit(out, 2) if errors else out
+
+
+def summary(args) -> dict:
+    """데이터셋 요약 without retargeting: every motion's length, its labels (the label file next to it, or
+    자동 라벨 by --rules) and the objects captured with it (FBX); totals per folder and per label (seconds of
+    each track's segments, clipped to the motion). --csv writes one row per motion. C3D files are left out
+    (their take's solved file counts). Exit code 1 when no motion could be read, 2 when some could not."""
+    import csv
+
+    from retlens import autolabel as al
+    from retlens import motion_labels
+    from retlens.compare import human_format, load_skeleton
+    from retlens.io import load_motion
+
+    rules = args.rules
+    if rules:
+        al.check_rules(rules)
+    from retlens.batch import motion_files
+
+    files = [f for f in motion_files(args.inputs) if not f.lower().endswith(".c3d")]
+    rows, total, per_folder, per_label, failed = [], 0.0, {}, {}, 0
+    for f in files:
+        _log(f"reading {f}")
+        row = {"file": os.path.abspath(f), "folder": os.path.basename(os.path.dirname(os.path.abspath(f)))}
+        try:
+            human = load_skeleton(f, smpl_model_dir=_smpl()) if human_format(f) else None
+            fps, dur = (human.fps, human.duration) if human else (lambda m: (m.fps, m.duration))(load_motion(f))
+            lab = al.label_motion(human, rules, dur) if rules and human else motion_labels.load_for(f, fps, dur)
+            if lab is not None and lab.error:
+                row["labels_error"] = lab.error
+                lab = None
+        except Exception as e:
+            failed += 1
+            rows.append({**row, "error": f"{type(e).__name__}: {e}"})
+            continue
+        secs = {}
+        for s in lab.segments if lab is not None else []:
+            key = f"{s.track}: {s.label}" if s.track else s.label
+            secs[key] = secs.get(key, 0.0) + max(0.0, min(s.end, dur) - max(s.start, 0.0))
+        objs = human.objects if human else []
+        row.update({"duration_s": round(dur, 3), "labels": ("auto" if lab.auto else "file") if lab is not None else None,
+                    "label_seconds": {k: round(v, 3) for k, v in secs.items()},
+                    "objects": [o.name for o in objs], "moving_objects": sum(o.moves for o in objs)})
+        rows.append(row)
+        total += dur
+        fo = per_folder.setdefault(row["folder"], {"motions": 0, "seconds": 0.0, "labelled": 0, "with_objects": 0})
+        fo["motions"] += 1
+        fo["seconds"] += dur
+        fo["labelled"] += lab is not None
+        fo["with_objects"] += bool(objs)
+        for k, v in secs.items():
+            pl = per_label.setdefault(k, {"seconds": 0.0, "segments": 0})
+            pl["seconds"] += v
+            pl["segments"] += sum(1 for s in lab.segments if (f"{s.track}: {s.label}" if s.track else s.label) == k)
+    out = {"motions": len(rows) - failed, "failed": failed, "total_s": round(total, 2), "total_h": round(total / 3600, 3),
+           "rules": rules or None,
+           "per_folder": {k: {**v, "seconds": round(v["seconds"], 2)} for k, v in sorted(per_folder.items())},
+           "per_label": {k: {**v, "seconds": round(v["seconds"], 2),
+                             "share_pct": round(100 * v["seconds"] / total, 1) if total else 0.0}
+                         for k, v in sorted(per_label.items(), key=lambda kv: -kv[1]["seconds"])},
+           "files": rows}
+    if args.csv:
+        labels = list(out["per_label"])
+        os.makedirs(os.path.dirname(os.path.abspath(args.csv)) or ".", exist_ok=True)
+        with open(args.csv, "w", newline="", encoding="utf-8-sig") as fh:  # BOM: Excel reads the Korean labels
+            w = csv.writer(fh)
+            w.writerow(["file", "folder", "duration_s", "labels", "objects", "moving_objects", "error", *labels])
+            for r in rows:
+                w.writerow([r["file"], r["folder"], r.get("duration_s", ""), r.get("labels") or "",
+                            ";".join(r.get("objects", [])), r.get("moving_objects", ""), r.get("error", ""),
+                            *[r.get("label_seconds", {}).get(k, 0.0) for k in labels]])
+        out["csv"] = os.path.abspath(args.csv)
+    if not out["motions"] and failed:
+        out = _Exit(out, 1)
+    elif failed:
+        out = _Exit(out, 2)
+    return out
 
 
 def autolabel(args) -> dict:
@@ -319,17 +439,32 @@ def parser() -> argparse.ArgumentParser:
                    help="folder for <stem>.labels.csv of each motion (same names: their folders below it; "
                         "a motion that fails: an earlier run's CSV there is removed)")
     p.add_argument("--summary", action="store_true", help="counts and tracks only, not every segment")
+    p = sub.add_parser("batch", help="데이터셋 일괄 처리: retarget and measure every motion of folders, a row each (cached)")
+    p.add_argument("inputs", nargs="+", help="motion files or folders (searched below)")
+    _retarget_options(p)
+    p.add_argument("--physics", action="store_true", help="also the MuJoCo harness check of each (1-3 s per clip)")
+    p.add_argument("--rules", default=None, help="자동 라벨 by this rule file for motions without a label file")
+    p.add_argument("--csv", default=None, help="also write the table here")
+    p = sub.add_parser("summary", help="데이터셋 요약: length, label time and objects of motions (no retargeting)")
+    p.add_argument("inputs", nargs="+", help="motion files or folders (searched below)")
+    p.add_argument("--rules", default=None, help="자동 라벨 by this rule file instead of the label files next to the motions")
+    p.add_argument("--csv", default=None, help="also write one row per motion here")
     p = sub.add_parser("c3d-qc", help="raw marker QC of C3D files")
     p.add_argument("files", nargs="+")
     for name in ("physics", "video"):
-        p = sub.add_parser(name, help="Isaac Sim " + ("physics check" if name == "physics" else "recording"))
+        p = sub.add_parser(name, help="physics check (MuJoCo, or Isaac PhysX)" if name == "physics"
+                           else "Isaac Sim recording")
         p.add_argument("file")
         _retarget_options(p)
         p.add_argument("--timeout", type=float, default=1200.0)
         p.add_argument("--isaac-accept-eula", action="store_true",
                        help="only when the user accepted the NVIDIA Omniverse EULA (never on their behalf)")
+        p.add_argument("--balance", choices=("harness", "pd", "gmt", "isaac"), default="harness",  # scene.BALANCE
+                       help="balance control: harness = MuJoCo with the pelvis harness (default), pd = MuJoCo with no "
+                            "controller, gmt = MuJoCo with GMT's policy, isaac = Isaac PhysX with the harness"
+                            + ("" if name == "physics" else " (with --physics)"))
         if name == "physics":
-            p.add_argument("--assist", type=float, default=1.0, help="pelvis harness scale (0 = none)")
+            p.add_argument("--assist", type=float, default=1.0, help="isaac: pelvis harness scale (0 = none)")
         else:
             p.add_argument("--out", default=None, help="the .mp4 to write (default: the video folder)")
             p.add_argument("--physics", action="store_true", help="record the simulated motion")

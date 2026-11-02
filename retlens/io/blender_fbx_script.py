@@ -2,12 +2,17 @@
 
 Not imported by retlens: retlens.io.fbx starts Blender with it.
 
-    dump    <in.fbx> <out.npz> [take]   world joint positions / frames of the armature
+    dump    <in.fbx> <out.npz> [take]   world joint positions / frames of the armature, and the objects
     bvh2fbx <in.bvh> <out.fbx> <scale>  BVH -> FBX (armature only, every frame baked)
 
 Blender's FBX importer converts the file to Blender's frame (Z-up, -Y forward,
 meters), which is the project frame too. Joint = bone head; joint frame = the
 bone's world matrix (Blender bone axes, rest and motion alike).
+
+Objects (props, furniture, rigid bodies) are every other mesh or empty in the file: a mesh not deformed
+by the armature (the character's skinned body is left out) and an empty with no mesh under it (a
+rigid-body node of a mocap export). Per frame their world matrices, once their mesh in the object's own
+frame (triangulated, modifiers applied).
 """
 
 import os
@@ -16,7 +21,7 @@ import sys
 import bpy
 import numpy as np
 
-VERSION = 1
+VERSION = 2  # 2: objects
 
 
 def fail(msg):
@@ -34,6 +39,39 @@ def armature_with_action():
 
 def to_np(m):
     return np.array([list(r) for r in m], dtype=np.float64)
+
+
+def deformed_by(o, arm):
+    """A mesh the armature deforms (the character's body) or one parented to it as skin."""
+    return any(m.type == "ARMATURE" and m.object == arm for m in o.modifiers) or (
+        o.parent == arm and o.parent_type == "ARMATURE")
+
+
+def scene_objects(arm):
+    """The objects besides the character: meshes the armature does not deform, and empties with no
+    mesh under them. Sorted by name."""
+    out = []
+    for o in bpy.context.scene.objects:
+        if o == arm or (o.type == "MESH" and deformed_by(o, arm)):
+            continue
+        if o.type == "MESH" or (o.type == "EMPTY" and not any(c.type == "MESH" for c in o.children_recursive)):
+            out.append(o)
+    return sorted(out, key=lambda o: o.name)
+
+
+def object_mesh(o):
+    """Triangles of a mesh object in its own frame, modifiers applied: (vertices (V, 3), faces (F, 3))."""
+    if o.type != "MESH":
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+    ev = o.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    me = ev.to_mesh()
+    try:
+        me.calc_loop_triangles()
+        v = np.array([tuple(p.co) for p in me.vertices], dtype=np.float64).reshape(-1, 3)
+        f = np.array([tuple(t.vertices) for t in me.loop_triangles], dtype=np.int64).reshape(-1, 3)
+    finally:
+        ev.to_mesh_clear()
+    return v, f
 
 
 def dump(src, out, take=""):
@@ -63,16 +101,27 @@ def dump(src, out, take=""):
     scene.frame_set(f0)
     W = to_np(arm.matrix_world)
     rest = np.stack([W @ to_np(b.matrix_local) for b in bones])
+    objs = scene_objects(arm)
+    meshes = [object_mesh(o) for o in objs]
     T = f1 - f0 + 1
     mats = np.empty((T, len(bones), 4, 4))
+    obj_mats = np.empty((T, len(objs), 4, 4))
     for k in range(T):
         scene.frame_set(f0 + k)
         W = to_np(arm.matrix_world)
         mats[k] = [W @ to_np(pb.matrix) for pb in pbones]
+        if objs:
+            obj_mats[k] = [to_np(o.matrix_world) for o in objs]
+    nv = np.cumsum([0] + [len(v) for v, _ in meshes])
+    nf = np.cumsum([0] + [len(f) for _, f in meshes])
     np.savez(out, names=np.array(names), parents=np.array(parents), mats=mats, rest=rest, fps=fps,
              frame_start=f0, take=act.name if act is not None else "", takes=np.array(actions),
-             armature=arm.name, blender=bpy.app.version_string, script_version=VERSION)
-    print(f"[blender_fbx] {src}: {len(names)} bones, {T} frames @ {fps:g} fps -> {out}", flush=True)
+             armature=arm.name, blender=bpy.app.version_string, script_version=VERSION,
+             obj_names=np.array([o.name for o in objs], dtype=str), obj_kinds=np.array([o.type.lower() for o in objs], dtype=str),
+             obj_mats=obj_mats, obj_vert_start=nv, obj_face_start=nf,
+             obj_verts=np.concatenate([v for v, _ in meshes]) if objs else np.zeros((0, 3)),
+             obj_faces=np.concatenate([f for _, f in meshes]) if objs else np.zeros((0, 3), dtype=np.int64))
+    print(f"[blender_fbx] {src}: {len(names)} bones, {len(objs)} objects, {T} frames @ {fps:g} fps -> {out}", flush=True)
 
 
 def bvh2fbx(src, out, scale):

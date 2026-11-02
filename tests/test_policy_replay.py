@@ -37,6 +37,36 @@ def test_quaternion_helpers_match_scipy():
     roll, pitch = pr.roll_pitch_xyzw(qa)
     eul = a.as_euler("xyz")  # extrinsic xyz = GMT's roll / pitch / yaw convention
     assert np.allclose(roll, eul[:, 0]) and np.allclose(pitch, eul[:, 1])
+    assert np.allclose(pr.matrix_xyzw(qa), a.as_matrix())  # the harness's orientation spring
+    small = d.as_rotvec()
+    keep = np.linalg.norm(small, axis=1) < np.pi - 1e-3
+    assert np.allclose(pr.log_rot(pr.matrix_xyzw(qb) @ np.swapaxes(pr.matrix_xyzw(qa), -1, -2))[keep], small[keep],
+                       atol=1e-6)
+
+
+def test_harness_holds_up_the_open_loop_replay():
+    """The pelvis harness (tools/isaac_replay.py's, in MuJoCo): where the open-loop PD replay falls, it holds
+    the robot up and says how hard it pulls; standing still it hardly pulls."""
+    files = _gmt()
+    import policy_replay as tool
+
+    ref = pr.Reference.from_motion(tool.gmt_sample("squat"))
+    pd = pr.run(pr.G1Sim(files["model"], "pd"), ref, hold_s=0.5).metrics
+    sim = pr.G1Sim(files["model"], "harness")
+    m = pr.run(sim, ref, hold_s=0.5).metrics
+    assert pd["falls"] >= 1 and "harness_force_per_body_weight" not in pd
+    assert m["falls"] == 0 and 0.0 < m["harness_force_per_body_weight"]["mean"] < 0.5
+    assert m["robot_mass_kg"] > 30 and isinstance(m["consistent"], bool) and isinstance(m["issues"], list)
+    robot = sim.model.geom_bodyid != 0  # the robot's parts pass through each other, as in the Isaac replay
+    assert set(sim.model.geom_contype[robot & (sim.model.geom_contype != 0)]) <= {2}
+
+    n, fps = 60, 30.0  # standing in the default pose
+    pos = np.tile([0.0, 0.0, 0.793], (n, 1))
+    still = pr.Reference(pos, np.tile([0.0, 0.0, 0.0, 1.0], (n, 1)), np.tile(pr.GMT_DEFAULT, (n, 1)), fps)
+    v, w = still.harness_velocity([0.5, still.length + 1.0])
+    assert not np.any(v) and not np.any(w)
+    stand = pr.run(pr.G1Sim(files["model"], "harness"), still, hold_s=0.0).metrics
+    assert stand["falls"] == 0 and stand["harness_force_per_body_weight"]["mean"] < 0.05
 
 
 def test_reference_sampling():

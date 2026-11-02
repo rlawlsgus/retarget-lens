@@ -24,12 +24,12 @@ from typing import Callable
 
 import numpy as np
 
-from .. import analysis, motion_labels, paths, policy_runner, settings
+from .. import analysis, motion_labels, objects, paths, policy_runner, problems, settings
 from ..compare import Item, compute_metrics, load_item, load_skeleton
 from ..diagnosis import CAUSE_KO
 from ..io import urdf_joint_limits
 from ..physics_runner import PHYSICS_CONFIG, PhysicsJob, PhysicsRunner
-from ..rotations import quat_mul, quat_to_matrix
+from ..rotations import matrix_to_quat, quat_mul, quat_to_matrix
 from .robots import REGIONS, OverlayBatch, RobotBatch, align_on_pelvis, set_props
 
 ROOT = paths.REPO_ROOT
@@ -37,10 +37,11 @@ DEFAULT_URDF = paths.robot_urdf()  # dev: ..\GMR\assets\unitree_g1\...; installe
 PHYSICS_CACHE = paths.cache_dir("physics")
 POLICY_CACHE = paths.cache_dir("policy")
 VIDEO_DIR = paths.video_dir()
-# 균형 제어 in physics mode: Isaac PhysX with the pelvis harness (its scale: MotionScene.assist), or
-# MuJoCo with no controller / with GMT's tracking policy (retlens/policy_runner.py)
-BALANCE = {"isaac": "보조 힘 (Isaac)", "pd": "없음 (MuJoCo)", "gmt": "추적 정책 (GMT)"}
-BALANCE_TAG = {"pd": "MuJoCo 제어 없음", "gmt": "GMT"}  # in the robots' labels
+# 균형 제어 in physics mode: MuJoCo with the pelvis harness / with no controller / with GMT's tracking
+# policy (retlens/policy_runner.py), or Isaac PhysX with the pelvis harness (its scale: MotionScene.assist)
+BALANCE = {"harness": "보조 힘 (MuJoCo)", "pd": "없음 (MuJoCo)", "gmt": "추적 정책 (GMT)", "isaac": "보조 힘 (Isaac)"}
+BALANCE_TAG = {"harness": "MuJoCo 보조 힘", "pd": "MuJoCo 제어 없음", "gmt": "GMT"}  # in the robots' labels
+MODE_SHORT = {"harness": "보조 힘", "pd": "없음", "gmt": "GMT"}  # the metric table's 재생 방식 row
 # 리타게팅 보정 (MotionScene.set_retarget) as the front ends offer it
 SWING_CLEARANCE_CM = 2.0  # the recommended swing clearance
 RETARGET_NOTE = "다음에 여는 사람 모션부터 적용됩니다. 이미 연 모션은 그대로라, 같은 파일을 다시 열면 보정 전후를 나란히 봅니다"
@@ -61,6 +62,7 @@ METRIC_ROWS = [  # (label, metrics key, format)
     ("리타게팅 점수", "retarget_grade", "{}"), ("자세 재현 오차 (°)", "pose_err_deg", "{:.1f}"),
     ("발 접촉 불일치 (%)", "contact_mismatch_pct", "{:.1f}"), ("관절 한계 걸림 (%)", "joint_limit_pct", "{:.1f}"),
     ("자기 충돌 (%)", "self_collision_pct", "{:.1f}"),
+    ("물체 닿음 재현 (%)", "hand_obj_reach_pct", "{:.0f}"), ("손–물체 거리 (cm)", "hand_obj_err_cm", "{:.1f}"),
     ("관절 가속도 (rad/s²)", "acc_mean", "{:.1f}"),
     ("관절 저크 (rad/s³)", "jerk_mean", "{:.0f}"), ("최대 관절속도 (rad/s)", "vel_max", "{:.1f}"),
     ("발 미끄러짐 (%)", "planted_slip_pct", "{:.2f}"), ("바닥 관통 (%)", "penetration_pct", "{:.2f}"),
@@ -72,20 +74,22 @@ METRIC_ROWS = [  # (label, metrics key, format)
     ("물리: 토크 한계 초과 (%)", "phys_saturated_pct", "{:.1f}"), ("물리 판정", "phys_ok", "{}"),
 ]
 # properties of the retarget itself: the table keeps them in physics mode (from the kinematic motion)
-RETARGET_ROWS = {"retarget_grade", "pose_err_deg", "contact_mismatch_pct", "joint_limit_pct", "self_collision_pct"}
+RETARGET_ROWS = {"retarget_grade", "pose_err_deg", "contact_mismatch_pct", "joint_limit_pct", "self_collision_pct",
+                 "hand_obj_reach_pct", "hand_obj_err_cm"}
 METRIC_NOTES = (
     "RMSE: 기준과 겹치는 구간의 관절별 RMSE 중앙값(시간 오프셋 반영). 발 미끄러짐: 발바닥 전체가 붙은 채 0.3 m/s 이상으로 "
     "0.1 s 이상 움직인 프레임 비율. 바닥 관통: 발 최저점 -2 cm 아래 프레임 비율. 스윙 발 바닥 근접: 가장 느린 발바닥 점까지 "
     "0.5 m/s 넘게 움직이는 발이 그때의 바닥(디딤발 높이를 따라감) 1 cm 안을 지나는 비율(물리에서 발끝이 걸림). 물리 행: "
     "시뮬레이션 결과(물리 모드, 또는 isaac_replay.py --physics / policy_replay.py 결과 파일)만 - 골반 보조 힘 평균(체중 대비, "
-    "MuJoCo는 0), 넘어짐 수, 몸 위치 오차(MuJoCo만), 관절 토크 한계를 넘은 비율. 물리 모드에서는 다른 행도 시뮬레이션된 "
+    "MuJoCo 없음·GMT는 0), 넘어짐 수, 몸 위치 오차(MuJoCo만), 관절 토크 한계를 넘은 비율. 물리 모드에서는 다른 행도 시뮬레이션된 "
     "동작으로 잽니다.")
 # Every row of metric_table, by topic, with what it measures (the editor shows these on hover).
 METRIC_HELP = [
     ("기본", [
-        ("재생 방식", "기구학 = 리타게팅 결과를 그대로 재생합니다. 물리 x1 = Isaac PhysX로 시뮬레이션한 결과이고, "
-                   "x 뒤 숫자는 골반 보조 힘 배율입니다(x0 = 보조 없음). MuJoCo · 없음 / GMT = MuJoCo에서 제어기 없이(개루프 PD) "
-                   "또는 GMT 추적 정책으로 보조 힘 없이 시뮬레이션한 결과입니다."),
+        ("재생 방식", "기구학 = 리타게팅 결과를 그대로 재생합니다. MuJoCo · 보조 힘 = MuJoCo에서 관절 PD와 골반 보조 힘으로 "
+                   "시뮬레이션한 결과입니다. MuJoCo · 없음 / GMT = 같은 MuJoCo에서 제어기 없이(개루프 PD) 또는 GMT 추적 정책으로 "
+                   "보조 힘 없이 시뮬레이션한 결과입니다. 물리 x1 = Isaac PhysX로 시뮬레이션한 결과이고, x 뒤 숫자는 골반 보조 힘 "
+                   "배율입니다(x0 = 보조 없음)."),
         ("길이 (s)", "모션 길이."),
     ]),
     ("리타게팅 품질 (사람 모션을 리타게팅한 것만, 로봇끼리 같은 기준)", [
@@ -100,6 +104,12 @@ METRIC_HELP = [
                            "돌지 못한다는 뜻입니다."),
         ("자기 충돌 (%)", "로봇 몸끼리 3 cm 넘게 파고든 프레임 비율(모델의 충돌 형상 기준). 손이 엉덩이·몸통·다른 손을 "
                         "뚫는 경우가 대부분입니다."),
+    ]),
+    ("물체 (FBX에 사람과 물체가 함께 담긴 것만)", [
+        ("물체 닿음 재현 (%)", "사람 손(손바닥 가운데)이 물체 표면 6 cm 안에 있는 프레임에서, 로봇의 같은 손도 그 물체 6 cm 안에 "
+                           "있는 비율. 물체 위치는 사람 스켈레톤처럼 로봇 크기에 맞춰 옮기고, 물체 크기는 실제 그대로입니다."),
+        ("손–물체 거리 (cm)", "같은 프레임들에서 로봇 손과 그 물체 표면 사이 거리의 평균. 크면 리타겟된 손이 물체를 잡지 "
+                            "못합니다(팔 길이·비율 차이)."),
     ]),
     ("매끄러움 (클수록 떨림)", [
         ("관절 가속도 (rad/s²)", "모든 관절 각가속도 크기의 평균."),
@@ -125,16 +135,25 @@ METRIC_HELP = [
         ("QC", "검증 결과: PASS / WARN / FAIL (사용 설명서의 \"검증(QC) 기준\")."),
     ]),
     ("물리 (시뮬레이션 결과에만)", [
-        ("물리: 보조 힘 (체중 %)", "골반을 받쳐 준 보조 힘의 평균, 체중 대비. MuJoCo(균형 제어 없음·GMT)는 보조 힘이 없어 0입니다."),
+        ("물리: 보조 힘 (체중 %)", "골반을 받쳐 준 보조 힘의 평균, 체중 대비(보조 힘 모드: MuJoCo, Isaac). MuJoCo 균형 제어 "
+                                "없음·GMT는 보조 힘이 없어 0입니다."),
         ("물리: 넘어짐", "시뮬레이션에서 넘어진 횟수(클립 안). 넘어지면 그 시각의 원본 자세로 다시 시작해 셉니다."),
         ("물리: 몸 위치 오차 (cm)", "MuJoCo 결과만: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치가 원본과 다른 정도의 평균. "
                               "추적 정책은 관절을 바꿔서라도 몸을 원본 자리에 두려 하므로, 관절 RMSE보다 이 값이 따라간 정도를 잘 보여 줍니다."),
         ("물리: 토크 한계 초과 (%)", "관절 토크가 모터 한계를 넘은 비율(Isaac은 프레임, MuJoCo는 1 ms 스텝)."),
-        ("물리 판정", "통과, 또는 걸린 기준들(넘어짐, 보조 힘 과다, 토크 한계 초과 등; MuJoCo는 넘어짐만). 칸에는 첫 항목만 나옵니다."),
+        ("물리 판정", "통과, 또는 걸린 기준들(넘어짐, 보조 힘 과다, 토크 한계 초과 등; MuJoCo 없음·GMT는 넘어짐만). 칸에는 "
+                     "첫 항목만 나옵니다."),
     ]),
 ]
 METRIC_HELP_FOOTER = "물리 모드에서는 물리 행 말고 다른 행도 시뮬레이션된 동작으로 잽니다."
 METRIC_DESC = {name: desc for _, rows in METRIC_HELP for name, desc in rows}
+
+
+def retarget_text(foot_flat: bool, swing_clearance_cm: float, self_collision: bool) -> str:
+    """'디딤발 평평 + 스윙 발 2 cm' / '보정 없음': the corrections a motion was retargeted with."""
+    on = [name for name, yes in (("디딤발 평평", foot_flat), (f"스윙 발 {swing_clearance_cm:g} cm", swing_clearance_cm > 0),
+                                 ("자기 관통", self_collision)) if yes]
+    return " + ".join(on) or "보정 없음"
 
 
 def rel(path: str) -> str:
@@ -165,15 +184,7 @@ def heading(q_wxyz: np.ndarray) -> float:
 
 def human_scale(item: Item) -> float:
     """Uniform scale that puts the source skeleton on the robot (GMR scales positions)."""
-    h, r = item.human, item.robot
-    hips = next((i for i, n in enumerate(h.joint_names) if n.lower() in ("hips", "pelvis", "hip")), 0)
-    tr = np.arange(r.num_frames) / r.fps
-    hp = h.positions[np.clip(np.round(tr * h.fps).astype(int), 0, h.num_frames - 1), hips]
-    dh = hp[:, :2] - hp[:1, :2]
-    dr = r.root_pos[:, :2] - r.root_pos[:1, :2]
-    if np.nanmax(np.linalg.norm(dh, axis=1)) > 0.5:
-        return float(np.nansum(dh * dr) / max(np.nansum(dh * dh), 1e-9))
-    return float(np.nanmean(r.root_pos[:, 2]) / max(np.nanmean(hp[:, 2]), 1e-6))
+    return objects.human_scale(item.human, item.robot)
 
 
 def decimate(mesh, cell: float):
@@ -227,7 +238,7 @@ class SceneOptions:
     isaac_accept_eula: bool = False
     video_dir: str = VIDEO_DIR
     library: list | None = None
-    balance: str = "isaac"  # 균형 제어 in physics mode (BALANCE)
+    balance: str = "harness"  # 균형 제어 in physics mode (BALANCE)
 
 
 def add_scene_arguments(ap) -> None:
@@ -255,9 +266,10 @@ def add_scene_arguments(ap) -> None:
                     help="folder to list in the motion picker (repeatable; default: data/raw, data/samples, "
                          "data/retargeted, data/uploads, reports and the 환경 설정 folders)")
     ap.add_argument("--physics", action="store_true", help="start in physics mode")
-    ap.add_argument("--balance", choices=tuple(BALANCE), default="isaac",
-                    help="physics mode's balance control: isaac = Isaac PhysX with the pelvis harness (default), "
-                         "pd = MuJoCo with no controller, gmt = MuJoCo with GMT's tracking policy")
+    ap.add_argument("--balance", choices=tuple(BALANCE), default="harness",
+                    help="physics mode's balance control: harness = MuJoCo with the pelvis harness (default), "
+                         "pd = MuJoCo with no controller, gmt = MuJoCo with GMT's tracking policy, "
+                         "isaac = Isaac PhysX with the pelvis harness")
     ap.add_argument("--video-dir", default=None, help="where \"동영상 저장\" writes its MP4s (default: 환경 설정, "
                                                       "else reports/videos/viewer)")
     ap.add_argument("--physics-config", default=PHYSICS_CONFIG, help="PhysX settings for physics mode (yaml)")
@@ -274,7 +286,7 @@ def scene_options(args) -> SceneOptions:
                         fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
                         physics_config=args.physics_config, isaac_accept_eula=args.isaac_accept_eula,
                         video_dir=args.video_dir or settings.video_dir(s), library=args.library,
-                        balance=getattr(args, "balance", "isaac"))
+                        balance=getattr(args, "balance", "harness"))
 
 
 @dataclass
@@ -290,11 +302,18 @@ class ViewSettings:
     show_labels: bool = True
     show_label_now: bool = True  # the labelled segment being played, under each robot's name tag (motion_labels)
     show_balance: bool = True
+    show_objects: bool = True  # props and furniture of the capture (FBX), with the robot
+    show_object_paths: bool = True  # where the moving ones go over the clip
+    show_problems: bool = True  # problem spans on the timeline's motion bars (retlens.problems)
     speed: float = 1.0
     loop: bool = True
 
 
 GHOST_COLOR = (200, 206, 218)  # the reference motion in an overlay comparison
+PROBLEM_NAMES = {**{k: name for k, (name, _c) in problems.KINDS.items()}, "fall": "넘어짐"}
+OBJECT_COLORS = [(214, 170, 92), (120, 170, 200), (160, 196, 120), (200, 140, 170), (170, 150, 210), (190, 190, 190)]
+OBJECT_MAX_FACES = 6000  # object meshes above this are simplified for the view (on a 5 mm grid)
+OBJECT_PATH_STEP_S = 0.1  # spacing of the path points
 DIFF_COLORS = ((245, 205, 40), (240, 130, 30), (220, 40, 35))  # at 1x, 2x, 3x the tolerance
 
 
@@ -341,9 +360,10 @@ class MotionScene:
         self.playing = False
         self.physics_on = False
         self.assist = 1.0
-        self.balance = self.opts.balance if self.opts.balance in BALANCE else "isaac"
+        self.balance = self.opts.balance if self.opts.balance in BALANCE else "harness"
         self._phys_errors: dict = {}  # per phys_key: why its runs cannot start
         self._solved_skeletons: dict = {}  # C3D solved takes' skeletons for 자동 라벨 (_skeleton), the last few
+        self.playlist: dict | None = None  # 라벨 구간 이어 재생 (play_segments)
         self._version = 0  # bumped by every event; with the time and settings it decides redraws
         self._drawn_key, self._drawn_at = None, 0.0
         self._listeners: list[Callable[[str, object], None]] = []
@@ -701,18 +721,82 @@ class MotionScene:
             item.handles["scale"] = human_scale(item)
             bones = hm.meta.get("bones", []) if hm.kind == "markers" else hm.bones()
             item.handles["bones"] = np.array(bones, dtype=int).reshape(-1, 2)
-            root = hm.positions[:, 0]
-            ok = np.isfinite(root).all(axis=1)
-            item.handles["anchor"] = root[int(np.argmax(ok))].copy() if ok.any() else np.zeros(3)  # first seen pelvis
+            item.handles["anchor"] = objects.anchor(hm)  # first seen pelvis
             if hm.kind == "markers":  # C3D: every placed marker as a dot, besides the marker-set sticks
                 item.handles["dots"] = np.array(hm.meta.get("dots") or range(1, len(hm.joint_names)), dtype=int)
                 item.handles["markers"] = s.scene.add_point_cloud(
                     f"{node}/markers", np.zeros((1, 3), np.float32), np.array(item.color, np.uint8), point_size=0.022,
                     point_shape="circle", precision="float32", point_shading="flat")
+            if hm.objects:
+                self._build_objects(item, node)
         # transform that starts the robot at the origin facing +x (applied when "align" is on)
         item.handles["yaw0"] = heading(item.robot.root_quat[0])
         item.handles["p0"] = item.robot.root_pos[0].copy()
         item.handles["index"] = index
+
+    def _build_objects(self, item: Item, node: str) -> None:
+        """The capture's objects: a mesh each (a bare node as axes), and one set of path lines for the
+        moving ones. Placed every frame by _pose_objects."""
+        s, hm = self.server, item.human
+        for i, o in enumerate(hm.objects):
+            color = OBJECT_COLORS[i % len(OBJECT_COLORS)]
+            if len(o.faces):
+                import trimesh
+
+                mesh = trimesh.Trimesh(o.vertices, o.faces, process=False)
+                if len(o.faces) > OBJECT_MAX_FACES:
+                    mesh = decimate(mesh, 0.005)
+                item.handles[f"obj{i}"] = s.scene.add_mesh_simple(
+                    f"{node}/obj{i}", np.asarray(mesh.vertices, np.float32), np.asarray(mesh.faces, np.uint32),
+                    color=color, opacity=0.95)
+            else:
+                item.handles[f"obj{i}"] = s.scene.add_frame(f"{node}/obj{i}", axes_length=0.12, axes_radius=0.006)
+        moving = [o for o in hm.objects if o.moves]
+        if moving:
+            step = max(1, int(round(OBJECT_PATH_STEP_S * hm.fps)))
+            segs = [np.stack([o.positions[:-step:step], o.positions[step::step]], axis=1) for o in moving
+                    if len(o.positions) > step]
+            segs = np.concatenate(segs) if segs else np.zeros((0, 2, 3))
+            segs = segs[np.isfinite(segs).all(axis=(1, 2))]
+            if len(segs):
+                item.handles["obj_path_src"] = segs
+                item.handles["obj_path"] = s.scene.add_line_segments(
+                    f"{node}/obj_path", segs.astype(np.float32), np.array(item.color, np.uint8), line_width=2.0)
+
+    def human_world_to_display(self, item: Item, P: np.ndarray, R: np.ndarray, shift: np.ndarray) -> np.ndarray:
+        """Points of the human motion's world (skeleton, objects) where the view draws them with the robot:
+        scaled about the skeleton's start (floor level) as GMR scales positions, put on the robot's start,
+        then the display transform. The skeleton itself may also be set beside the robot (_pose)."""
+        h = item.handles
+        return objects.human_to_robot(P, h["scale"], h["anchor"], item.robot.root_pos[0]) @ R.T + shift
+
+    def _pose_objects(self, item: Item, local: float, R: np.ndarray, shift: np.ndarray, show: bool) -> None:
+        """Place the capture's objects at this time with the robot: their origins moved like the skeleton's
+        points (human_world_to_display), their shapes at real size."""
+        hm, h, v = item.human, item.handles, self.view
+        on = show and bool(v.show_objects)
+        for i in range(len(hm.objects)):
+            self._set_visible(item, f"obj{i}", on)
+        self._set_visible(item, "obj_path", on and bool(v.show_object_paths))
+        if not on:
+            return
+        f = int(np.clip(round(local * hm.fps), 0, hm.num_frames - 1))
+        key = (f, *np.round(R, 6).ravel(), *np.round(shift, 6))
+        if h.get("obj_key") == key:
+            return
+        h["obj_key"] = key
+        for i, o in enumerate(hm.objects):
+            p = o.positions[min(f, len(o.positions) - 1)]
+            if not np.isfinite(p).all():
+                continue
+            node = h[f"obj{i}"]
+            node.position = self.human_world_to_display(item, p[None], R, shift)[0].astype(np.float32)
+            node.wxyz = matrix_to_quat(R @ o.rotations[min(f, len(o.rotations) - 1)]).astype(np.float32)
+        if "obj_path" in h and h.get("obj_path_key") != key[1:]:  # the path moves only with the display transform
+            h["obj_path_key"] = key[1:]
+            src = h["obj_path_src"]
+            h["obj_path"].points = self.human_world_to_display(item, src.reshape(-1, 3), R, shift).reshape(
+                src.shape).astype(np.float32)
 
     def _add_body_mesh(self, item: Item) -> None:
         from ..io.smpl import BodyMeshRig
@@ -750,6 +834,70 @@ class MotionScene:
         o = self.opts
         return {"smooth_hz": o.smooth, "foot_flat": o.foot_flat, "swing_clearance_cm": o.swing_clearance_cm,
                 "self_collision": o.self_collision}
+
+    # ---------------------------------------------------------------- 이 모션의 보정 (B1)
+    def _load_with(self, item: Item, foot_flat: bool, swing_clearance_cm: float, self_collision: bool) -> Item:
+        """This human motion's file retargeted with these corrections (cached like any retarget), measured."""
+        o, r = self.opts, item.retarget
+        new = load_item(item.source, robot=o.robot, smooth=r.get("smooth_hz", o.smooth), fps=o.fps, csv_fps=o.csv_fps,
+                        smpl_model_dir=o.smpl_model_dir, swing_clearance=float(swing_clearance_cm) / 100.0,
+                        foot_flat=bool(foot_flat), self_collision=bool(self_collision), log=self.log)
+        compute_metrics(new, self.fk, self.limits)
+        return new
+
+    def retarget_again(self, item: Item, foot_flat: bool | None = None, swing_clearance_cm: float | None = None,
+                       self_collision: bool | None = None) -> Item:
+        """Retarget this human motion again with other corrections (each left out: its own) and put the new
+        one in its place: same name, colour, time offset, visibility and labels. The new one remembers the
+        corrections and score it replaced (info["previous_retarget"]). Takes as long as a retarget (cached
+        afterwards); raises for a motion that was not retargeted here."""
+        r = item.retarget
+        if not r:
+            raise ValueError(f"{item.label}: 리타게팅한 사람 모션이 아닙니다")
+        ff = r.get("foot_flat", False) if foot_flat is None else foot_flat
+        sw = r.get("swing_clearance_cm", 0.0) if swing_clearance_cm is None else swing_clearance_cm
+        scol = r.get("self_collision", False) if self_collision is None else self_collision
+        new = self._load_with(item, ff, sw, scol)
+        new.info["previous_retarget"] = {**{k: r.get(k) for k in ("foot_flat", "swing_clearance_cm", "self_collision")},
+                                         "score": item.metrics.get("retarget_score")}
+        new.labels, new.label, new.color, new.offset = item.labels, item.label, item.color, item.offset
+        new.visible, new.show_human = item.visible, item.show_human
+        with self.lock:
+            if item not in self.items:
+                raise ValueError(f"{item.label}: 이미 제거된 모션입니다")
+            i = self.items.index(item)
+            self.remove(item)
+            self.items.insert(i, new)
+            for k, it in enumerate(self.items):
+                it.handles["index"] = k
+            self._build_item(new, i)
+            if self.view.body_mesh and new.kind.startswith("SMPL-X"):
+                self._add_body_mesh(new)
+            self._sync_robots()
+        self.log(f"retargeted again {new.label}: {new.kind} (score {item.metrics.get('retarget_score')} -> "
+                 f"{new.metrics.get('retarget_score')})")
+        self.emit("items")
+        self._request_physics(new)
+        return new
+
+    def recommend_retarget(self, item: Item, progress: Callable[[int, int, str], None] | None = None) -> list[dict]:
+        """추천 보정: this motion retargeted with each of the 8 combinations of the three corrections (디딤발 평평,
+        스윙 발 보정 at the recommended clearance, 자기 관통 보정), ranked by 리타게팅 점수 (best first). Slow the
+        first time (8 retargets), cached after. progress(done, total, text) between combinations."""
+        if not item.retarget:
+            raise ValueError(f"{item.label}: 리타게팅한 사람 모션이 아닙니다")
+        combos = [(ff, sw, scol) for ff in (False, True) for sw in (0.0, SWING_CLEARANCE_CM) for scol in (False, True)]
+        out = []
+        for k, (ff, sw, scol) in enumerate(combos):
+            text = retarget_text(ff, sw, scol)
+            if progress:
+                progress(k, len(combos), text)
+            m = self._load_with(item, ff, sw, scol).metrics
+            out.append({"foot_flat": ff, "swing_clearance_cm": sw, "self_collision": scol, "text": text,
+                        "score": m.get("retarget_score"), "grade": m.get("retarget_grade")})
+        if progress:
+            progress(len(combos), len(combos), "")
+        return sorted(out, key=lambda c: -(c["score"] if c["score"] is not None else -1.0))
 
     def set_retarget(self, foot_flat: bool | None = None, swing_clearance_cm: float | None = None,
                      self_collision: bool | None = None) -> dict:
@@ -799,7 +947,9 @@ class MotionScene:
         if self.playing:
             lo, hi = self.time_range()
             self.t += dt * float(self.view.speed)
-            if self.t > hi:
+            if self.playlist is not None:  # 라벨 구간 이어 재생: past this segment's end, on to the next one
+                self._advance_playlist()
+            elif self.t > hi:
                 if self.view.loop:
                     self.t = lo
                 else:
@@ -881,8 +1031,11 @@ class MotionScene:
         mesh = h.get("mesh") if v.body_mesh else None
         self._set_visible(item, "mesh", show_h and mesh is not None)
         self._set_visible(item, "markers", show_h)
+        has_objects = item.human is not None and bool(item.human.objects)
         if not visible:
             self._set_visible(item, "now", False)
+            if has_objects:
+                self._pose_objects(item, 0.0, np.eye(3), np.zeros(3), False)
             return None
         src = self.shown(item)  # the physics result in physics mode
         robot = src.robot
@@ -933,16 +1086,14 @@ class MotionScene:
             if h.get("now_text") != now:
                 h["now"].text = h["now_text"] = now
         balance = self._pose_balance(item, src.balance, local, R, shift) if role is None else None
+        if has_objects:  # with the robot (not beside it with the skeleton): the robot's hands are what is checked
+            self._pose_objects(item, local, R, shift, role is None)
         sticks = None
         if "bones" in h and show_h:
             hm = item.human
-            hips = h["anchor"]
-            start_r = item.robot.root_pos[0]
 
             def to_display(P: np.ndarray) -> np.ndarray:
-                # scale about the skeleton's start point (floor level), then put that point on the robot's start
-                Ps = h["scale"] * (P - np.array([hips[0], hips[1], 0.0])) + np.array([start_r[0], start_r[1], 0.0])
-                Pd = Ps @ R.T + shift
+                Pd = self.human_world_to_display(item, P, R, shift)
                 if v.human_beside:  # inside the robot the lines are hidden by its meshes
                     Pd = Pd + np.array([0.0, 0.8, 0.0])
                 return Pd
@@ -1016,7 +1167,7 @@ class MotionScene:
         self._physics_changed()
 
     def set_balance(self, mode: str) -> None:
-        """균형 제어 (BALANCE): Isaac with the harness, or MuJoCo with no controller / GMT. Each
+        """균형 제어 (BALANCE): MuJoCo with the harness / no controller / GMT, or Isaac with the harness. Each
         motion keeps the results of every mode, so switching back is instant."""
         if mode not in BALANCE:
             raise ValueError(f"balance must be one of {tuple(BALANCE)}")
@@ -1034,7 +1185,7 @@ class MotionScene:
         return f"보조 힘 x{key:g} (Isaac)" if not isinstance(key, str) else BALANCE[key]
 
     def mode_label(self) -> str:
-        """'보조 힘 x1 (Isaac)', '없음 (MuJoCo)', '추적 정책 (GMT)'."""
+        """'보조 힘 (MuJoCo)', '없음 (MuJoCo)', '추적 정책 (GMT)', '보조 힘 x1 (Isaac)'."""
         return self.key_label(self.phys_key)
 
     @property
@@ -1126,7 +1277,8 @@ class MotionScene:
         if pol:
             hold = f" (+{pol['hold_falls']} 끝난 뒤)" if pol.get("hold_falls") else ""
             err = f"{m['phys_body_error_cm']:.1f}" if m.get("phys_body_error_cm") is not None else "-"
-            return (f"넘어짐 {m.get('phys_falls', '-')}{hold} · 몸 위치 오차 {err} cm · "
+            pull = f" · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중" if pol.get("controller") == "harness" else ""
+            return (f"넘어짐 {m.get('phys_falls', '-')}{hold}{pull} · 몸 위치 오차 {err} cm · "
                     f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
         return (f"넘어짐 {m.get('phys_falls', '-')} · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중 · "
                 f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
@@ -1141,9 +1293,10 @@ class MotionScene:
                 + (f" · 몸 오차 {err:.1f} cm" if err is not None else ""))
 
     def results_overview(self, item: Item) -> list[tuple[str, str]]:
-        """(mode, result) for every physics mode computed for this motion so far, Isaac first."""
+        """(mode, result) for every physics mode computed for this motion so far, in the menu's order
+        (Isaac last)."""
         phys = item.handles.get("phys", {})
-        keys = sorted(phys, key=lambda k: (isinstance(k, str), list(BALANCE).index(k) if isinstance(k, str) else -k))
+        keys = sorted(phys, key=lambda k: (not isinstance(k, str), list(BALANCE).index(k) if isinstance(k, str) else -k))
         return [(self.key_label(k), self.result_text(phys[k])) for k in keys]
 
     def physics_status(self) -> str:
@@ -1214,6 +1367,168 @@ class MotionScene:
             if t <= local <= t + 0.5:
                 return f"넘어짐 {t:.2f}s"
         return ""
+
+    @staticmethod
+    def object_rows(item: Item) -> list[tuple[str, str]]:
+        """Inspector rows of the objects captured with the motion (retlens.objects): what they are, and
+        whether the robot's hands meet them where the person's do."""
+        objs = item.human.objects if item.human is not None else []
+        if not objs:
+            return []
+        rows = [("물체", ", ".join(o.name + (" (움직임)" if o.moves else "") for o in objs))]
+        m = item.metrics
+        per = m.get("_objects")
+        if isinstance(per, dict) and per.get("error"):
+            rows.append(("손–물체", f"재지 못함: {per['error']}"))
+        elif m.get("hand_obj_contact_s"):
+            rows.append(("손–물체", f"사람 손이 물체에 닿은 {m['hand_obj_contact_s']:g}초 중 로봇 손도 닿음 "
+                                  f"{m.get('hand_obj_reach_pct', 0):g}% · 로봇 손–물체 평균 {m.get('hand_obj_err_cm', 0):g} cm"))
+            far = [p for p in per or [] if p.get("robot_distance_cm") is not None]
+            if far:
+                rows.append(("물체별 로봇 손 거리", ", ".join(f"{p['name']} {p['robot_distance_cm']:g} cm ({p['contact_s']:g}초)"
+                                                      for p in sorted(far, key=lambda p: -p["contact_s"]))))
+        elif "hand_obj_contact_s" in m:
+            rows.append(("손–물체", "사람 손이 물체에 닿는 순간이 없음"))
+        return rows
+
+    # ---------------------------------------------------------------- label segments (유형별 재생)
+    @staticmethod
+    def segment_key(s) -> str:
+        """'track: label' (or the label alone in a file without tracks): how segments are grouped."""
+        return f"{s.track}: {s.label}" if s.track else s.label
+
+    def label_catalog(self) -> list[dict]:
+        """Every label of the open motions' labels (files and 자동 라벨): its key ('track: label'), segment
+        count, seconds and motions; the most seconds first."""
+        cat: dict[str, dict] = {}
+        for it in list(self.items):
+            labels = it.labels
+            if labels is None:
+                continue
+            dur = self.shown(it).robot.duration
+            for s in labels.segments:
+                if s.start >= dur:
+                    continue
+                c = cat.setdefault(self.segment_key(s), {"key": self.segment_key(s), "segments": 0, "seconds": 0.0,
+                                                          "motions": []})
+                c["segments"] += 1
+                c["seconds"] += min(s.end, dur) - s.start
+                if it.label not in c["motions"]:
+                    c["motions"].append(it.label)
+        return sorted(cat.values(), key=lambda c: -c["seconds"])
+
+    def segment_list(self, key: str) -> list[tuple[Item, object]]:
+        """(motion, segment) of every segment with this key in the open motions, in timeline order."""
+        out = []
+        for it in list(self.items):
+            labels = it.labels
+            dur = self.shown(it).robot.duration
+            out += [(it, s) for s in (labels.segments if labels is not None else [])
+                    if self.segment_key(s) == key and s.start < dur]
+        return sorted(out, key=lambda p: p[0].offset + p[1].start)
+
+    def play_segments(self, key: str, solo: bool = False, play: bool = True) -> int:
+        """유형별 재생: play the segments with this key one after another (each from its start to its end, then
+        the next; at the last one's end back to the first when the view loops). solo: only the motion being
+        played is shown meanwhile. Returns how many segments there are (0: nothing to play)."""
+        self.stop_segments()
+        segs = self.segment_list(key)
+        if not segs:
+            return 0
+        self.playlist = {"key": key, "segments": segs, "index": 0, "solo": bool(solo),
+                         "visible": {id(it): it.visible for it in self.items}}
+        self._goto_segment(0)
+        self.set_playing(play)
+        return len(segs)
+
+    def step_segment(self, direction: int) -> tuple[Item, object] | None:
+        """The previous / next segment of the playlist (wrapping round); None when nothing is being played."""
+        pl = self.playlist
+        if pl is None:
+            return None
+        self._goto_segment((pl["index"] + direction) % len(pl["segments"]))
+        return pl["segments"][pl["index"]]
+
+    def stop_segments(self) -> None:
+        """End 유형별 재생: the motions hidden for solo are shown again as they were."""
+        pl, self.playlist = self.playlist, None
+        if pl is not None and pl["solo"]:
+            for it in list(self.items):
+                if id(it) in pl["visible"]:
+                    it.visible = pl["visible"][id(it)]
+            self.emit("items")
+        if pl is not None:
+            self.emit("time")
+
+    def _goto_segment(self, i: int) -> None:
+        pl = self.playlist
+        pl["index"] = i
+        it, s = pl["segments"][i]
+        if it not in self.items:  # removed meanwhile
+            self.stop_segments()
+            return
+        if pl["solo"]:
+            for other in self.items:
+                other.visible = other is it
+            self.emit("items")
+        lo, hi = self.time_range()
+        self.t = float(np.clip(it.offset + s.start, lo, hi))
+        self.emit("time")
+
+    def _advance_playlist(self) -> None:
+        pl = self.playlist
+        it, s = pl["segments"][pl["index"]]
+        if it not in self.items:
+            self.stop_segments()
+            return
+        if self.t < it.offset + min(s.end, self.shown(it).robot.duration):
+            return
+        nxt = pl["index"] + 1
+        if nxt >= len(pl["segments"]):
+            if not self.view.loop:
+                self.t, self.playing = it.offset + min(s.end, self.shown(it).robot.duration), False
+                self.emit("time")
+                return
+            nxt = 0
+        self._goto_segment(nxt)
+
+    def playlist_state(self) -> dict | None:
+        """What 유형별 재생 is doing (front ends show it): key, position, the segment and its motion."""
+        pl = self.playlist
+        if pl is None:
+            return None
+        it, s = pl["segments"][pl["index"]]
+        return {"key": pl["key"], "index": pl["index"], "count": len(pl["segments"]), "solo": pl["solo"],
+                "id": it.label, "start_s": s.start, "end_s": s.end}
+
+    def problems(self, item: Item) -> dict[str, list[tuple[float, float]]]:
+        """{kind: [(start_s, end_s)]} where what is shown for this motion has problems (retlens.problems:
+        foot slip, penetration, ...), in motion time; its falls as the kind "fall" (start = end)."""
+        out = dict(self.shown(item).metrics.get("_problems") or {})
+        falls = self.falls(item)
+        if falls:
+            out["fall"] = [(t, t) for t, _ in falls]
+        return out
+
+    def problem_stops(self, items: list[Item] | None = None) -> list[tuple[float, str, Item]]:
+        """(timeline time, kind, motion) of the start of every problem of these motions (default: the
+        visible ones), in time order."""
+        out = []
+        for it in [it for it in (items if items is not None else list(self.items)) if it.visible]:
+            out += [(it.offset + a, kind, it) for kind, sp in self.problems(it).items() for a, _ in sp]
+        return sorted(out, key=lambda s: s[0])
+
+    def next_problem(self, direction: int = 1, item: Item | None = None):
+        """Pause and go to the next (direction > 0) or previous problem start of this motion (default: every
+        visible one); returns (time, kind, motion), or None when there is none that way."""
+        stops = self.problem_stops([item] if item is not None else None)
+        ahead = [s for s in stops if (s[0] > self.t + 1e-3 if direction > 0 else s[0] < self.t - 1e-3)]
+        if not ahead:
+            return None
+        stop = ahead[0] if direction > 0 else ahead[-1]
+        self.set_playing(False)
+        self.seek(stop[0])
+        return stop
 
     def falls(self, item: Item) -> list[tuple[float, str]]:
         """(time, first cause) of each fall in what is shown for this motion."""
@@ -1297,6 +1612,12 @@ class MotionScene:
             q = m.get("_quality") or {}
             lost = ", ".join(f"{SCORE_LABELS.get(k, k)} -{v:g}" for k, v in q.get("score_lost", {}).items())
             rows.append(("리타게팅 점수", m["retarget_grade"] + (f" · 감점: {lost}" if lost else " · 감점 없음")))
+            prev = item.info.get("previous_retarget")
+            if prev:  # retargeted again here (retarget_again): what it replaced
+                before = prev.get("score")
+                rows.append(("다시 리타게팅", f"{retarget_text(prev['foot_flat'], prev['swing_clearance_cm'], prev['self_collision'])}"
+                             f" → {retarget_text(item.retarget['foot_flat'], item.retarget['swing_clearance_cm'], item.retarget['self_collision'])}"
+                             + (f" · 점수 {before:.0f} → {m.get('retarget_score', 0):.0f}" if before is not None else "")))
             worst = sorted(q.get("segments_deg", {}).items(), key=lambda kv: -kv[1])[:3]
             rows.append(("많이 어긋난 부위", ", ".join(f"{n} {v:g}°" for n, v in worst)))
             if q.get("pinned_joints_pct"):
@@ -1305,6 +1626,7 @@ class MotionScene:
             if q.get("collision_pairs_pct"):
                 rows.append(("자기 충돌 부위", ", ".join(f"{n.replace('_link', '')} {v:g}%"
                                                    for n, v in q["collision_pairs_pct"].items())))
+        rows += self.object_rows(item)
         ff = item.info.get("foot_flat")
         if ff:  # retargeted with 디딤발 평평 보정 (retlens.retarget.flatten_stance_feet)
             side = {"left": "왼", "right": "오"}
@@ -1345,9 +1667,10 @@ class MotionScene:
                                  + (f" 원래 로봇 동작: {rel(ref)}" if ref else "")))
         if self.is_policy_result(item):
             p = item.info["policy_replay"]
+            pull = "골반 보조 힘" if p.get("controller") == "harness" else "보조 힘 없음"
             rows.append(("참고", f"MuJoCo에서 시뮬레이션한 동작입니다"
-                                 f"({item.info.get('controller_label') or p.get('controller')}, 보조 힘 없음, 넘어짐 "
-                                 f"{p.get('falls', '-')}). 물리 모드를 켜도 Isaac으로 다시 계산하지 않습니다. 원본: "
+                                 f"({item.info.get('controller_label') or p.get('controller')}, {pull}, 넘어짐 "
+                                 f"{p.get('falls', '-')}). 물리 모드를 켜도 다시 계산하지 않습니다. 원본: "
                                  f"{rel(item.info['source']) if item.info.get('source') else '-'}"))
         return rows
 
@@ -1398,7 +1721,7 @@ class MotionScene:
                     li = [i for i, n in enumerate(joints) if any(k in n for k in analysis.LEG_KEYS)]
                     legs, whole = f(float(np.median(rmse[li])), "{:.1f}"), f(float(np.median(rmse)), "{:.1f}")
             mode = (f"물리 x{shown.info['physics'].get('harness_scale', 1):g}" if self.is_physics_result(shown)
-                    else f"MuJoCo · {'GMT' if shown.info['policy_replay'].get('controller') == 'gmt' else '없음'}"
+                    else f"MuJoCo · {MODE_SHORT.get(shown.info['policy_replay'].get('controller'), '없음')}"
                     if self.is_policy_result(shown)
                     else "기구학")
             vals = [f((it.metrics if k in RETARGET_ROWS else m).get(k), fmt) for _, k, fmt in METRIC_ROWS]

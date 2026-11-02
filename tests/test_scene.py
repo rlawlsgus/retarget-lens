@@ -3,6 +3,7 @@
 import os
 import socket
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -262,6 +263,95 @@ def test_retarget_settings_apply_to_motions_opened_next(scene, tmp_path, monkeyp
         scene.remove(flat)
 
 
+def test_retarget_one_motion_again(scene, tmp_path, monkeypatch):
+    """이 모션의 보정: one open motion retargeted again with other corrections takes its own place (name, colour,
+    offset, labels kept) and remembers the score it replaced; 추천 보정 ranks the 8 combinations by score."""
+    from retlens import compare
+    from retlens.app import api_core
+    from retlens.motion_labels import MotionLabels, Segment
+
+    monkeypatch.setattr(compare, "CACHE", str(tmp_path))
+    bvh = os.path.join(os.path.dirname(SAMPLE), "synthetic_walk.bvh")
+    first = scene.add(bvh)
+    other = scene.add(SAMPLE)
+    try:
+        scene.set_offset(first, 0.5)
+        first.labels = MotionLabels(path="x.csv", segments=[Segment(label="walk", start=0.0, end=1.0)])
+        before = first.metrics["retarget_score"]
+        new = scene.retarget_again(first, swing_clearance_cm=2.0)
+        assert first not in scene.items and scene.items.index(new) == 0 and scene.items[1] is other  # same place
+        assert (new.label, new.color, new.offset) == (first.label, first.color, 0.5) and new.labels is first.labels
+        assert new.retarget["swing_clearance_cm"] == 2.0 and not new.retarget["foot_flat"]  # the rest: its own
+        assert new.info["previous_retarget"] == {"foot_flat": False, "swing_clearance_cm": 0.0, "self_collision": False,
+                                                 "score": before}
+        assert dict(scene.item_facts(new))["다시 리타게팅"].startswith("보정 없음 → 스윙 발 2 cm")
+        with pytest.raises(ValueError):
+            scene.retarget_again(other)  # a robot motion: nothing to retarget
+        calls = []
+
+        def fake(item, ff, sw, scol):  # the ranking without 8 real retargets
+            calls.append((ff, sw, scol))
+            return SimpleNamespace(metrics={"retarget_score": 50 + 20 * ff + 10 * (sw > 0) - 5 * scol, "retarget_grade": "-"})
+
+        monkeypatch.setattr(scene, "_load_with", fake)
+        steps = []
+        ranked = scene.recommend_retarget(new, lambda done, total, text: steps.append(done))
+        assert len(calls) == 8 and len(set(calls)) == 8 and steps == list(range(9))
+        assert ranked[0]["text"] == "디딤발 평평 + 스윙 발 2 cm" and ranked[0]["score"] == 80 and ranked[-1]["score"] == 45
+        assert api_core.item_info(scene, new)["retarget"]["swing_clearance_cm"] == 2.0
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)
+
+
+def test_problems_and_label_segments(scene, tmp_path):
+    """문제 구간: the per-frame flags as spans per motion, falls among them, and stepping from one to the next;
+    유형별 재생: the open motions' labels by 'track: label', and one label's segments played one after another
+    (solo shows only the motion being played, and gives the others back at the end)."""
+    from retlens.motion_labels import MotionLabels, Segment
+
+    a, b = scene.add(SAMPLE), scene.add(SAMPLE)
+    try:
+        a.metrics["_problems"] = {"slip": [(0.5, 0.8)], "joint_limit": [(1.5, 1.6)]}
+        b.metrics["_problems"] = {"penetration": [(0.2, 0.3)]}
+        scene.set_offset(b, 1.0)
+        assert scene.problems(a) == {"slip": [(0.5, 0.8)], "joint_limit": [(1.5, 1.6)]}
+        assert [(t, k) for t, k, _ in scene.problem_stops()] == [(0.5, "slip"), (1.2, "penetration"), (1.5, "joint_limit")]
+        scene.seek(0.0)
+        assert scene.next_problem(1)[:2] == (0.5, "slip") and scene.t == 0.5 and not scene.playing
+        assert scene.next_problem(1)[:2] == (1.2, "penetration")
+        assert scene.next_problem(-1)[:2] == (0.5, "slip")
+        assert scene.next_problem(-1) is None  # nothing before
+        assert scene.next_problem(1, item=a)[:2] == (1.5, "joint_limit")  # one motion's only
+        scene.set_visible(b, False)
+        assert [k for _, k, _ in scene.problem_stops()] == ["slip", "joint_limit"]  # hidden motions are skipped
+        scene.set_visible(b, True)
+
+        a.labels = MotionLabels(path="a.csv", segments=[Segment(label="걷기", start=0.0, end=0.5, track="동작"),
+                                                         Segment(label="서기", start=0.5, end=1.0, track="동작")])
+        b.labels = MotionLabels(path="b.csv", segments=[Segment(label="걷기", start=0.2, end=0.4, track="동작")])
+        cat = {c["key"]: c for c in scene.label_catalog()}
+        assert cat["동작: 걷기"]["segments"] == 2 and cat["동작: 걷기"]["seconds"] == pytest.approx(0.7)
+        assert cat["동작: 걷기"]["motions"] == [a.label, b.label] and cat["동작: 서기"]["segments"] == 1
+        scene.view.loop = False
+        assert scene.play_segments("동작: 걷기", solo=True) == 2 and scene.playing
+        assert scene.t == pytest.approx(0.0) and a.visible and not b.visible  # solo: only the motion being played
+        scene.tick(0.6)  # past the first segment's end (0.5): on to b's at 1.0 + 0.2
+        assert scene.t == pytest.approx(1.2) and b.visible and not a.visible
+        assert scene.playlist_state()["index"] == 1 and scene.playlist_state()["id"] == b.label
+        scene.tick(0.3)  # past the last one's end without looping: stops there
+        assert not scene.playing and scene.t == pytest.approx(1.4)
+        assert scene.step_segment(1)[0] is a and scene.t == pytest.approx(0.0)  # round to the first
+        scene.stop_segments()
+        assert scene.playlist is None and a.visible and b.visible  # both back
+        assert scene.play_segments("동작: 없음") == 0 and scene.playlist is None
+    finally:
+        scene.view.loop = True
+        scene.stop_segments()
+        scene.remove(a)
+        scene.remove(b)
+
+
 def test_overlay_comparison(scene):
     """겹쳐 비교: B on A's pelvis, A a ghost, only B's parts beyond the tolerance drawn and coloured."""
     from retlens.app.robots import REGIONS
@@ -319,18 +409,20 @@ def test_balance_modes(scene, tmp_path):
             f.write("stand-in")
     calls = []
 
-    def sim(motion, controller, progress):  # the reference at 50 Hz; "pd" falls twice
+    def sim(motion, controller, progress):  # the reference at 50 Hz; "pd" falls twice, "harness" pulls 12 %
         calls.append(controller)
         progress(0, 1)
         n = int(round(motion.duration * 50)) + 1
         idx = np.clip(np.round(np.arange(n) / 50 * motion.fps).astype(int), 0, motion.num_frames - 1)
         col = [motion.joint_names.index(j) for j in pr.GMT_DOFS]
         falls = [0.5, 1.5] if controller == "pd" else []
+        pull = {"harness_force_per_body_weight": {"mean": 0.12, "p95": 0.3, "max": 0.4}, "consistent": False,
+                "issues": ["harness > 20% body weight in 30.0% of frames"]} if controller == "harness" else {}
         return pr.Result(controller, np.arange(n) / 50, motion.root_pos[idx], motion.root_quat[idx],
                          motion.dof_pos[idx][:, col],
                          {"controller": controller, "falls": len(falls), "fall_times_s": falls,
                           "fall_causes": ["tilt", "drop"][:len(falls)], "hold_falls": 0, "hold_fall_times_s": [],
-                          "body_error_cm": 9.0 if controller == "pd" else 4.0, "torque_saturated_ratio": 0.2})
+                          "body_error_cm": 9.0 if controller == "pd" else 4.0, "torque_saturated_ratio": 0.2, **pull})
 
     def wait(item, key):
         end = time.time() + 30
@@ -342,6 +434,7 @@ def test_balance_modes(scene, tmp_path):
     scene.policy = PolicyRunner(str(tmp_path / "policy"), gmt_root=str(root), simulate=sim, log=lambda *_: None)
     scene.policy.problem = lambda controller: ""  # the stand-in needs neither MuJoCo nor PyTorch
     try:
+        assert SceneOptions().balance == "harness" and scene.balance == "harness"  # MuJoCo's harness by default
         a = scene.add(SAMPLE)
         scene.set_balance("pd")
         assert scene.phys_key == "pd" and scene.mode_label() == "없음 (MuJoCo)" and scene.balance_problem("pd") == ""
@@ -363,16 +456,28 @@ def test_balance_modes(scene, tmp_path):
         gmt = wait(a, "gmt")
         scene.tick(0.0)
         assert scene.shown(a) is gmt and scene.falls(a) == [] and " · GMT · 넘어짐 0회 · 몸 오차 4.0 cm" in a.handles["label_text"]
+
+        scene.set_balance("harness")
+        harness = wait(a, "harness")
+        scene.tick(0.0)
+        assert scene.shown(a) is harness and scene.mode_label() == "보조 힘 (MuJoCo)"
+        assert scene.job_text(a) == "완료 · 넘어짐 0 · 보조 힘 12% 체중 · 몸 위치 오차 4.0 cm · 토크 한계 초과 20.0%"
+        assert " · MuJoCo 보조 힘 · 넘어짐 0회 · 몸 오차 4.0 cm" in a.handles["label_text"]
+        names, cols = scene.metric_table(None)
+        vals = dict(zip(names, cols[0][1]))
+        assert vals["재생 방식"] == "MuJoCo · 보조 힘" and vals["물리: 보조 힘 (체중 %)"] == "12.0"
+        assert vals["물리 판정"] == "보조 힘 > 체중 20%: 프레임 30.0%"
+
         scene.set_balance("pd")  # kept: no new run
-        assert scene.shown(a) is pd and calls == ["pd", "gmt"]
-        assert [m for m, _ in scene.results_overview(a)] == ["없음 (MuJoCo)", "추적 정책 (GMT)"]
+        assert scene.shown(a) is pd and calls == ["pd", "gmt", "harness"]
+        assert [m for m, _ in scene.results_overview(a)] == ["보조 힘 (MuJoCo)", "없음 (MuJoCo)", "추적 정책 (GMT)"]
         b = scene.add(SAMPLE)  # added while physics mode is on: computed in the current mode (same motion: cached)
-        assert wait(b, "pd") is not pd and calls == ["pd", "gmt"]
+        assert wait(b, "pd") is not pd and calls == ["pd", "gmt", "harness"]
         scene.set_physics(False, "test")
         assert scene.shown(a) is a and scene.physics_status() == "물리 모드: 꺼짐"
     finally:
         scene.set_physics(False, "test")
-        scene.set_balance("isaac")
+        scene.set_balance("harness")
         for it in list(scene.items):
             scene.remove(it)
         scene.policy.shutdown()

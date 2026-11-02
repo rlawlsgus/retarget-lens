@@ -12,6 +12,30 @@ import numpy as np
 
 
 @dataclass
+class ObjectTrack:
+    """A rigid object moving with a human motion (a prop, a piece of furniture, a rigid-body node):
+    its pose per frame of that motion and its shape in its own frame."""
+
+    name: str
+    positions: np.ndarray  # (T, 3) meters, Z-up: the object's origin
+    rotations: np.ndarray  # (T, 3, 3) its frame in the world
+    vertices: np.ndarray  # (V, 3) meters, in its own frame (scale applied); empty for a bare node
+    faces: np.ndarray  # (F, 3) int
+    kind: str = "mesh"  # "mesh" | "empty"
+
+    def world_vertices(self, frame: int) -> np.ndarray:
+        return self.vertices @ self.rotations[frame].T + self.positions[frame]
+
+    @property
+    def moves(self) -> bool:
+        """Whether it moves during the clip (more than 1 cm or 2 degrees)."""
+        p, R = self.positions, self.rotations
+        turn = np.einsum("ij,tij->t", R[0], R)  # trace(R0^T R_t)
+        return bool(np.nanmax(np.linalg.norm(p - p[0], axis=1)) > 0.01
+                    or np.nanmin(turn) < 1 + 2 * np.cos(np.radians(2.0)))
+
+
+@dataclass
 class SkeletonMotion:
     """Human motion as world-space joint (or marker) positions.
 
@@ -30,6 +54,8 @@ class SkeletonMotion:
     # (T, J, 3, 3) joint frames in the world (Z-up), only when the loader was
     # asked for them (BVH with_rotations=True). Joint-local axes are the file's.
     rotations: np.ndarray | None = None
+    # props and furniture captured with the person (FBX), on the same frames
+    objects: list[ObjectTrack] = field(default_factory=list)
 
     @property
     def num_frames(self) -> int:

@@ -272,6 +272,8 @@ def measure(human: SkeletonMotion, m: RobotMotion, robot: str, model) -> dict:
         "_pinned_joints_pct": pinned,
         "_collision_pairs_pct": worst_pairs,
         "_leg_length_m": {"robot": round(leg_r, 3), "human": round(leg_h, 3)},
+        # per frame, for the timeline (retlens.problems); not part of the details the inspector shows
+        "_frames": {"joint_limit": at_limit.any(1), "self_collision": np.array([bool(p) for p in hits])},
     }
 
 

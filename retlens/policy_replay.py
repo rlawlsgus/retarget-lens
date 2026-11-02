@@ -1,18 +1,23 @@
 """Balance on / off: replay a robot motion in MuJoCo with and without a closed-loop tracking policy.
 
-The Isaac physics replay (tools/isaac_replay.py --physics) follows the clip with stiff joint PD and
-nothing that keeps the balance, so with the harness off it falls even on clean data. A robot that
+Stiff joint PD that follows the clip has nothing that keeps the balance, so on its own it falls even
+on clean data. The physics check puts a virtual harness on the pelvis that holds it up and measures
+how hard it pulls (tools/isaac_replay.py --physics does the same in Isaac PhysX). A robot that
 imitates mocap for real runs a tracking policy instead: it reads the reference and its own IMU /
-joint state and bends the reference to stay up. This module runs both on the same model:
+joint state and bends the reference to stay up. This module runs all three on the same model:
 
-    controller "pd"   open loop, like --assist 0: stiff PD on the reference angles and velocities
-                      (configs/physics.yaml gains, position servos integrated implicitly), no balance
-    controller "gmt"  GMT (General Motion Tracking, Chen et al. 2025; Apache-2.0, the authors provide
-                      the model for research use only; scripts/install_gmt.ps1): a pretrained general
-                      tracker for the G1 that sees 20 reference frames up to 1.9 s ahead, at 50 Hz,
-                      with its own PD (kp 40-150) as on the robot
+    controller "pd"       open loop, like --assist 0: stiff PD on the reference angles and velocities
+                          (configs/physics.yaml gains, position servos integrated implicitly), no balance
+    controller "harness"  the same PD plus the pelvis harness of tools/isaac_replay.py --physics
+                          (configs/physics.yaml "assist": springs toward the clip's horizontal root
+                          position and its orientation, damped toward its velocities); its force per
+                          body weight says how much balance help the clip needs beyond the feet
+    controller "gmt"      GMT (General Motion Tracking, Chen et al. 2025; Apache-2.0, the authors provide
+                          the model for research use only; scripts/install_gmt.ps1): a pretrained general
+                          tracker for the G1 that sees 20 reference frames up to 1.9 s ahead, at 50 Hz,
+                          with its own PD (kp 40-150) as on the robot
 
-Both use GMT's G1 model (the 29-DoF G1 with the wrists fixed: 23 DoF; 4 contact spheres per foot) at
+All use GMT's G1 model (the 29-DoF G1 with the wrists fixed: 23 DoF; 4 contact spheres per foot) at
 1 kHz, start in the clip's first pose and count falls with configs/physics.yaml's rules (tilt, pelvis
 height, drop below the clip; not the 0.5 m root distance, which a tracker drifting along its own path
 would trip). After a fall the robot restarts in the clip's pose at that time.
@@ -67,8 +72,8 @@ SMOOTH_FRAMES = 19
 # bodies whose pelvis-relative positions measure tracking (local key-body error)
 KEY_BODIES = ["torso_link", "left_knee_link", "right_knee_link", "left_ankle_roll_link", "right_ankle_roll_link",
               "left_elbow_link", "right_elbow_link", "left_rubber_hand", "right_rubber_hand"]
-CONTROLLERS = ("pd", "gmt")
-LABELS = {"pd": "제어기 없음 (PD 재생)", "gmt": "추적 정책 (GMT)"}
+CONTROLLERS = ("pd", "harness", "gmt")
+LABELS = {"pd": "제어기 없음 (PD 재생)", "harness": "골반 보조 힘 (PD 재생 + 가상 하네스)", "gmt": "추적 정책 (GMT)"}
 
 
 def gmt_dir() -> str:
@@ -136,6 +141,22 @@ def quat_rotate_inverse(q, v):
     return v * (2.0 * w ** 2 - 1.0) - np.cross(qv, v) * w * 2.0 + qv * np.sum(qv * v, axis=-1, keepdims=True) * 2.0
 
 
+def matrix_xyzw(q):
+    x, y, z, w = np.moveaxis(q / np.linalg.norm(q, axis=-1, keepdims=True), -1, 0)
+    return np.stack([np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+                     np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+                     np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1)], -2)
+
+
+def log_rot(D):
+    """Rotation vectors (..., 3) of rotation matrices (..., 3, 3) (angles below pi), as tools/isaac_replay.py."""
+    ang = np.arccos(np.clip((np.trace(D, axis1=-2, axis2=-1) - 1) / 2, -1.0, 1.0))
+    v = np.stack([D[..., 2, 1] - D[..., 1, 2], D[..., 0, 2] - D[..., 2, 0], D[..., 1, 0] - D[..., 0, 1]], -1)
+    s = np.sin(ang)
+    small = s < 1e-6
+    return v * np.where(small, 0.5, ang / (2 * np.where(small, 1.0, s)))[..., None]
+
+
 def roll_pitch_xyzw(q):
     x, y, z, w = np.moveaxis(q, -1, 0)
     roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
@@ -192,6 +213,10 @@ class Reference:
         # the PD replay's velocity target: the derivative of its own interpolated position target
         self.dof_vel_fd = np.zeros_like(self.dof_pos)
         self.dof_vel_fd[:-1] = dvel[:-1]
+        # the harness's damping targets, unfiltered as tools/isaac_replay.py takes them: central-difference
+        # root velocity, forward-difference angular velocity (world frame)
+        self.root_vel_fd = np.gradient(self.root_pos, 1.0 / self.fps, axis=0)
+        self.root_ang_vel_fd = ang
 
     @classmethod
     def from_motion(cls, m: RobotMotion, loop: bool = False) -> "Reference":
@@ -237,6 +262,12 @@ class Reference:
         f0, _, _, past = self._index(times)
         return np.where(past[:, None], 0.0, self.dof_vel_fd[f0])
 
+    def harness_velocity(self, times):
+        """The harness's root linear and angular velocity targets (0 when held)."""
+        f0, _, _, past = self._index(times)
+        still = past[:, None]
+        return np.where(still, 0.0, self.root_vel_fd[f0]), np.where(still, 0.0, self.root_ang_vel_fd[f0])
+
     def mimic_obs(self, step: int) -> np.ndarray:
         """GMT's _get_mimic_obs: 20 future frames x (root z, roll, pitch, local lin vel, local yaw rate, 23 DoF)."""
         pos, rot, vel, ang, dof, _ = self.frame((step + TAR_STEPS) * CONTROL_DT)
@@ -247,12 +278,16 @@ class Reference:
 
 
 # -------------------------------------------------------------------------------------- sim setup
-def pd_gains(config_path: str | None = None):
-    """configs/physics.yaml's stiff drive gains (first matching pattern) for GMT's 23 joints."""
+def load_config(config_path: str | None = None) -> dict:
     import yaml
 
     with open(config_path or paths.resource("configs", "physics.yaml"), encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        return yaml.safe_load(f)
+
+
+def pd_gains(config_path: str | None = None):
+    """configs/physics.yaml's stiff drive gains (first matching pattern) for GMT's 23 joints."""
+    cfg = load_config(config_path)
     kp, kd = np.zeros(len(GMT_DOFS)), np.zeros(len(GMT_DOFS))
     for i, n in enumerate(GMT_DOFS):
         for rule in cfg["pd"]:
@@ -273,7 +308,8 @@ class Result:
 
 
 class G1Sim:
-    """GMT's G1 model in MuJoCo, driven either by GMT or by open-loop stiff PD."""
+    """GMT's G1 model in MuJoCo, driven either by GMT or by open-loop stiff PD (with or without the
+    pelvis harness)."""
 
     def __init__(self, model_path: str, controller: str, policy_path: str | None = None,
                  physics_config: str | None = None):
@@ -285,11 +321,13 @@ class G1Sim:
         self.controller = controller
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.model.opt.timestep = SIM_DT
+        if controller == "harness":  # as the Isaac replay: the robot's parts pass through each other, the floor holds
+            self.self_collision_off()
         names = [self.model.joint(self.model.jnt_qposadr.size - len(GMT_DOFS) + i).name for i in range(len(GMT_DOFS))]
         if names != GMT_DOFS:
             raise ValueError(f"unexpected joint order in {model_path}: {names}")
         self.pd_kp, self.pd_kd, self.fall_cfg = pd_gains(physics_config)
-        if controller == "pd":
+        if controller in ("pd", "harness"):
             # stiff servos as MuJoCo position actuators (kv integrated implicitly): explicit torque PD
             # with kd 20-40 on light links is unstable at 1 kHz
             m = self.model
@@ -311,11 +349,29 @@ class G1Sim:
         self.feet = [g for g in range(self.model.ngeom)
                      if self.model.body(self.model.geom_bodyid[g]).name.endswith("ankle_roll_link")
                      and self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
+        self.mass = float(self.model.body_mass.sum())
+        self.weight = self.mass * float(-self.model.opt.gravity[2])
+        self.report_cfg = {}
+        if controller == "harness":  # tools/isaac_replay.py's gains: critically damped per kg of robot
+            cfg = load_config(physics_config)
+            self.report_cfg = cfg.get("report", {})
+            a = cfg.get("assist", {})
+            wn = 2 * np.pi * float(a.get("pos_hz", 2.0))
+            self.h_kp, self.h_kd = self.mass * wn ** 2, 2 * self.mass * wn
+            self.h_kp_rot, self.h_kd_rot = float(a.get("rot_stiffness", 300.0)), float(a.get("rot_damping", 30.0))
+            self.h_axes = np.array([1.0, 1.0, 1.0 if a.get("vertical", False) else 0.0])
         self.policy = None
         if controller == "gmt":  # the TorchScript file, evaluated in numpy (no PyTorch needed)
             from .gmt_policy import GMTPolicy
 
             self.policy = GMTPolicy(policy_path)
+
+    def self_collision_off(self) -> None:
+        """Robot geoms collide with the world body's (the floor) only: contype 2 / conaffinity 1 never
+        matches another robot geom, and the floor's contype 1 still matches."""
+        m = self.model
+        robot = (m.geom_bodyid != 0) & ((m.geom_contype != 0) | (m.geom_conaffinity != 0))
+        m.geom_contype[robot], m.geom_conaffinity[robot] = 2, 1
 
     # -- state
     def set_pose(self, data, pos, rot_xyzw, dof, vel=None, ang_vel=None, dof_vel=None, lift: bool = False):
@@ -379,6 +435,18 @@ class G1Sim:
             tau = self.pd_kp * (target - q) + self.pd_kd * (ref_dof_vel - qd)
         return bool(np.any(np.abs(tau) > TORQUE_LIMIT))
 
+    def pull(self, pos, rot_xyzw, vel, ang_vel) -> tuple[float, float]:
+        """The pelvis harness for one 1 ms step, toward the clip's root pose and velocities (world
+        frame); returns the size of its force (N) and torque (N m)."""
+        d = self.data
+        rot = d.xmat[self.pelvis].reshape(3, 3)
+        force = self.h_axes * (self.h_kp * (pos - d.qpos[:3]) + self.h_kd * (vel - d.qvel[:3]))
+        torque = (self.h_kp_rot * log_rot(matrix_xyzw(rot_xyzw) @ rot.T)
+                  + self.h_kd_rot * (ang_vel - rot @ d.qvel[3:6]))  # free joint: local angular velocity
+        d.xfrc_applied[self.pelvis, :3] = force  # at the pelvis's centre of mass
+        d.xfrc_applied[self.pelvis, 3:] = torque
+        return float(np.linalg.norm(force)), float(np.linalg.norm(torque))
+
     # -- measures
     def _local_bodies(self, data):
         xpos = data.xpos[self.key_bodies] - data.xpos[self.pelvis]
@@ -421,6 +489,8 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
     falls, causes, hold_falls, drift_at_fall = [], [], [], []
     sat = {True: 0, False: 0}  # steps over a torque limit, in the clip / in the hold
     steps = {True: 0, False: 0}
+    harness = sim.controller == "harness"
+    pull_f, pull_f_max, pull_t = [], [], []  # per control tick in the clip: mean / max force, mean torque
     last_reset = 0.0
     step_t = np.arange(DECIMATION) * SIM_DT
     for k in range(n_ctrl):
@@ -462,12 +532,21 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
                 steps[in_clip] += 1
                 mj.mj_step(sim.model, sim.data)
         else:
-            dof_s = ref.frame(t + step_t)[4]
+            pos_s, rot_s, _, _, dof_s, _ = ref.frame(t + step_t)
             dvel_s = ref.pd_velocity(t + step_t)
+            if harness:
+                vel_s, ang_s = ref.harness_velocity(t + step_t)
+                forces, torques = np.zeros(DECIMATION), np.zeros(DECIMATION)
             for i in range(DECIMATION):
                 sat[in_clip] += sim.apply(dof_s[i], dvel_s[i])
                 steps[in_clip] += 1
+                if harness:
+                    forces[i], torques[i] = sim.pull(pos_s[i], rot_s[i], vel_s[i], ang_s[i])
                 mj.mj_step(sim.model, sim.data)
+            if harness and in_clip:
+                pull_f.append(forces.mean())
+                pull_f_max.append(forces.max())
+                pull_t.append(torques.mean())
         if progress and k % 25 == 0:  # every 0.5 s simulated (RetLens's runner cancels from here)
             progress(k, n_ctrl)
     je = np.degrees(np.array(joint_err)) if joint_err else np.zeros((0, len(GMT_DOFS)))
@@ -496,7 +575,42 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         "torque_saturated_ratio": round(sat[True] / max(steps[True], 1), 4),
         "hold_torque_saturated_ratio": round(sat[False] / steps[False], 4) if steps[False] else None,
     }
+    if harness:
+        metrics.update(harness_metrics(sim, np.array(pull_f), np.array(pull_f_max), np.array(pull_t),
+                                       len(falls), metrics["torque_saturated_ratio"]))
     return Result(sim.controller, np.array(times), np.array(roots), np.array(quats), np.array(dofs), metrics)
+
+
+def _stats(x: np.ndarray, digits: int = 3) -> dict:
+    if not len(x):
+        return {"mean": None, "p95": None, "max": None}
+    return {"mean": round(float(x.mean()), digits), "p95": round(float(np.percentile(x, 95)), digits),
+            "max": round(float(x.max()), digits)}
+
+
+def harness_metrics(sim: G1Sim, force: np.ndarray, force_max: np.ndarray, torque: np.ndarray, falls: int,
+                    saturated: float) -> dict:
+    """The harness's numbers and the clip's verdict, named as tools/isaac_replay.py --physics names them
+    (configs/physics.yaml "report"); here per 20 ms control tick, and torque saturation per 1 ms step."""
+    rep = sim.report_cfg
+    flag = float(rep.get("assist_flag_ratio", 0.2))
+    bw = force / sim.weight
+    flagged = float((bw > flag).mean()) if len(bw) else 0.0
+    issues = []
+    if falls:
+        issues.append(f"{falls} fall(s)")
+    if flagged > float(rep.get("max_flagged_ratio", 0.05)):
+        issues.append(f"harness > {flag:.0%} body weight in {flagged:.1%} of frames")
+    if saturated > float(rep.get("max_saturated_ratio", 0.05)):
+        issues.append(f"torque limits exceeded in {saturated:.1%} of frames")
+    return {"robot_mass_kg": round(sim.mass, 2),
+            "harness_force_per_body_weight": _stats(bw),
+            "harness_force_max_per_body_weight": _stats(force_max / sim.weight),
+            "harness_torque_nm": _stats(torque, 1),
+            "harness_flag_ratio": flag,
+            "harness_flagged_ratio": round(flagged, 4),
+            "consistent": not issues,
+            "issues": issues}
 
 
 def result_motion(res: Result, name: str, joint_names: list[str]) -> RobotMotion:

@@ -85,6 +85,20 @@ def test_folders_and_check(user):
     assert checks["video"].ok and checks["robot_usd"].ok  # empty robot USD: the asset library's G1
 
 
+def test_label_rules_check(user, monkeypatch):
+    """The 자동 라벨 rule file is checked once one is set: a file moved or deleted since shows as missing."""
+    monkeypatch.delenv("RETLENS_LABEL_RULES", raising=False)
+    assert "label_rules" not in {c.key for c in settings.check_all(settings.Settings())}
+    rules = _file(user / "rules" / "mine.rules.yaml", "name: mine\n")
+    c = next(c for c in settings.check_all(settings.Settings(label_rules=str(rules))) if c.key == "label_rules")
+    assert c.ok and c.path == str(rules)
+    os.remove(rules)
+    c = next(c for c in settings.check_all(settings.Settings(label_rules=str(rules))) if c.key == "label_rules")
+    assert not c.ok and not c.required and "규칙 파일" in c.hint and c.needed_for == "자동 라벨"
+    monkeypatch.setenv("RETLENS_LABEL_RULES", str(rules))  # the environment variable stands in for the setting
+    assert not next(c for c in settings.check_all(settings.Settings()) if c.key == "label_rules").ok
+
+
 def test_find_gmt(user, monkeypatch):
     """추적 정책 (GMT): its folder from the setting, RETLENS_GMT_DIR, the setup assistant's folder or
     ..\\GMT; found once a policy this program runs is there (no PyTorch needed: it runs in numpy)."""

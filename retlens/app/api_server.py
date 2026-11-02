@@ -7,6 +7,9 @@
     POST /api/open      {"paths": [..]}                      load (retarget when needed), shown in the window
     POST /api/retarget  {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}   리타게팅 보정 for the human motions opened
                                                              next (open ones keep theirs: reopen to compare)
+                        {"id", corrections...}  this motion retargeted again with them (the others: its own), in
+                                                its place; {"id", "recommend": true}: the 8 combinations ranked by
+                                                리타게팅 점수 (slow the first time: 8 retargets)
     POST /api/remove    {"id": ..}
     GET  /api/motion?id=..              one motion: QC, metrics, C3D QC, physics state
     POST /api/item      {"id", "visible"?, "offset_s"?, "show_human"?}
@@ -15,12 +18,20 @@
                         {"id", "auto": true, "rules"?}  label the motion by a rule file (the 자동 라벨 setting
                                          when "rules" is left out; retlens.autolabel). 422 when it cannot
                                          (robot motion, broken rules): the motion keeps its labels
-    POST /api/playback  {"play"?, "time_s"?, "speed"?, "loop"?}
+    POST /api/playback  {"play"?, "time_s"?, "speed"?, "loop"?, "problem"?: 1 | -1, "id"?}   "problem": go to the
+                                         next / previous problem start (of motion "id", else every visible one)
+    GET  /api/segments                  유형별 재생: every 'track: label' of the open motions (segments, seconds)
+    POST /api/segments  {"key", "solo"?, "play"?} | {"step": 1 | -1} | {"stop": true}   play one label's segments
+                                         one after another (solo: only that segment's motion shown)
+    GET  /api/batch                     데이터셋 일괄 처리 in the window: running?, totals, its rows so far
+    POST /api/batch     {"folders", "physics"?, "auto_labels"?} | {"stop": true}   start (with the 리타게팅 menu's
+                                         corrections) / stop after the current motion (retlens.batch)
     GET  /api/metrics?ref=..            the 분석 table (RMSE against ref)
     POST /api/align     {"ref"}         기준에 시간 자동 정렬
     POST /api/compare   {"a", "b", "heading"?, "tol_cm"?} / {"on": false}   겹쳐 비교 (+ its numbers)
-    POST /api/physics   {"on", "assist"?, "balance"?}       물리 모드; balance isaac (needs the EULA accepted in
-                                                             the window) | pd | gmt (MuJoCo: no controller / GMT)
+    POST /api/physics   {"on", "assist"?, "balance"?}       물리 모드; balance harness | pd | gmt (MuJoCo: pelvis
+                                                             harness / no controller / GMT) | isaac (Isaac's harness,
+                                                             x assist; needs the EULA accepted in the window)
     POST /api/video     {"id"}          동영상 저장 (queued; see /api/jobs)
     GET  /api/jobs                      physics (Isaac, MuJoCo) and video jobs
     POST /api/camera    {"fit": true}   카메라 맞추기
@@ -46,6 +57,7 @@ from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from .. import paths
+from ..batch import totals as batch_totals
 from . import api_core
 from .scene import BALANCE
 
@@ -101,6 +113,8 @@ class ApiBackend:
             (p, "/api/open"): self.open, (p, "/api/retarget"): self.retarget, (p, "/api/remove"): self.remove,
             (g, "/api/motion"): self.motion,
             (p, "/api/item"): self.item, (p, "/api/labels"): self.labels, (p, "/api/playback"): self.playback,
+            (g, "/api/segments"): self.segments, (p, "/api/segments"): self.segments,
+            (g, "/api/batch"): self.batch, (p, "/api/batch"): self.batch,
             (g, "/api/metrics"): self.metrics,
             (p, "/api/align"): self.align, (p, "/api/compare"): self.compare, (p, "/api/physics"): self.physics,
             (p, "/api/video"): self.video, (g, "/api/jobs"): self.jobs, (p, "/api/camera"): self.camera,
@@ -137,6 +151,20 @@ class ApiBackend:
         return {"opened": out}
 
     def retarget(self, q: dict) -> dict:
+        if q.get("id") is not None:  # this motion only: again with other corrections, or the ranking of them all
+            item = self._item(q["id"])
+            try:
+                if q.get("recommend"):
+                    return {"id": item.label, "score": item.metrics.get("retarget_score"),
+                            "ranking": self.scene.recommend_retarget(item)}
+                new = self.scene.retarget_again(
+                    item, foot_flat=None if "foot_flat" not in q else bool(q["foot_flat"]),
+                    swing_clearance_cm=None if q.get("swing_clearance_cm") is None else float(q["swing_clearance_cm"]),
+                    self_collision=None if "self_collision" not in q else bool(q["self_collision"]))
+            except (TypeError, ValueError) as e:
+                raise ApiError(str(e), 422) from None
+            return {"id": new.label, "retarget": new.retarget, "score_before": item.metrics.get("retarget_score"),
+                    "score": new.metrics.get("retarget_score")}
         try:
             swing = None if q.get("swing_clearance_cm") is None else float(q["swing_clearance_cm"])
             r = self.scene.set_retarget(foot_flat=None if "foot_flat" not in q else bool(q["foot_flat"]),
@@ -198,9 +226,56 @@ class ApiBackend:
             sc.view.loop = bool(q["loop"])
         if "time_s" in q:
             sc.seek(float(q["time_s"]))
+        out = {}
+        if "problem" in q:  # 다음 / 이전 문제로: +1 / -1, of one motion ("id") or every visible one
+            stop = sc.next_problem(int(q["problem"]), self._item(q["id"]) if q.get("id") is not None else None)
+            out["problem"] = None if stop is None else {"time_s": stop[0], "kind": stop[1], "id": stop[2].label,
+                                                        "motion_time_s": stop[0] - stop[2].offset}
         if "play" in q:
             sc.set_playing(bool(q["play"]))
-        return {"time_s": sc.t, "playing": sc.playing, "speed": sc.view.speed, "time_range_s": list(sc.time_range())}
+        return {"time_s": sc.t, "playing": sc.playing, "speed": sc.view.speed, "time_range_s": list(sc.time_range()),
+                **out}
+
+    def segments(self, q: dict) -> dict:
+        """유형별 재생: the labels of the open motions; {"key", "solo"?, "play"?} plays that label's segments one
+        after another, {"step": 1 | -1} moves through them, {"stop": true} ends it."""
+        sc = self.scene
+        if q.get("stop"):
+            sc.stop_segments()
+            sc.set_playing(False)
+        elif q.get("key") is not None:
+            if not sc.play_segments(str(q["key"]), solo=bool(q.get("solo", False)), play=bool(q.get("play", True))):
+                raise ApiError(f"no segment labelled {q['key']!r} in the open motions", 404)
+        elif "step" in q:
+            if sc.step_segment(int(q["step"])) is None:
+                raise ApiError("no label segments are being played: start with {\"key\": ...}", 409)
+        return {"labels": sc.label_catalog(), "playing": sc.playlist_state(), "time_s": sc.t}
+
+    def batch(self, q: dict) -> dict:
+        """데이터셋 일괄 처리 in the window's 데이터셋 tab: {"folders", "physics"?, "auto_labels"?} starts it (the
+        tab's folders replaced), {"stop": true} stops it after the current motion; GET: its rows so far."""
+        if self.window is None:
+            raise ApiError("일괄 처리 needs the RetLens window (retlens-cli batch runs it without one)", 409)
+        panel = self.window.dataset
+
+        def start():
+            panel.folders = []
+            panel.add_folders([str(f) for f in q["folders"]])
+            panel.physics.setChecked(bool(q.get("physics", False)))
+            panel.auto.setChecked(bool(q.get("auto_labels", False)))
+            self.window.docks["dataset"].show()
+            self.window.docks["dataset"].raise_()
+            panel.run()
+
+        if q.get("stop"):
+            self.on_gui(panel._request_stop)
+        elif q.get("folders"):
+            if panel._running:
+                raise ApiError("일괄 처리 is already running: {\"stop\": true} first", 409)
+            self.on_gui(start)
+        rows = list(panel.model.rows)
+        return {"running": panel._running, "folders": list(panel.folders), **batch_totals(rows),
+                "rows": api_core.jsonable(rows)}
 
     # ---------------------------------------------------------------- analysis
     def metrics(self, q: dict) -> dict:

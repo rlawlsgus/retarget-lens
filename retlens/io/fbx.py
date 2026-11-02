@@ -26,12 +26,12 @@ import subprocess
 import numpy as np
 
 from .. import paths
-from ..motion import SkeletonMotion
+from ..motion import ObjectTrack, SkeletonMotion
 from .bvh import cmu_capture_fps
 
 CACHE_DIR = paths.cache_dir("fbx")  # dev: data/cache/fbx
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_fbx_script.py")  # Blender runs this file
-SCRIPT_VERSION = 1  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
+SCRIPT_VERSION = 2  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
 
 # Extra factors to meters: files whose numbers are 100x off (centimetre values in a
 # meter scene, e.g. a BVH imported into Blender at scale 1) or in inches.
@@ -82,11 +82,13 @@ def read_fbx(path: str, take: str | None = None, cache: bool = True) -> dict:
     """Raw armature animation of an FBX file in Blender's frame (Z-up, file scale).
 
     Returns joint (bone) names, parents, world positions (T, J, 3) and frames
-    (T, J, 3, 3), the rest pose of the same, the frame rate and the takes.
+    (T, J, 3, 3), the rest pose of the same, the frame rate and the takes, and the objects:
+    [{"name", "kind", "mats" (T, 4, 4) world matrices, "vertices", "faces"} (mesh in its own frame)].
     """
     path = os.path.abspath(path)
-    stem = os.path.splitext(os.path.basename(path))[0]
-    tag = f"{stem}-{_file_key(path)}-v{SCRIPT_VERSION}" + (f"-{take}" if take else "")
+    stem = os.path.splitext(os.path.basename(path))[0][:48]  # the file key tells files apart; long names hit MAX_PATH
+    tag = f"{stem}-{_file_key(path)}-v{SCRIPT_VERSION}" + (f"-{hashlib.sha1(take.encode()).hexdigest()[:8]}"
+                                                            if take else "")
     out = os.path.join(CACHE_DIR, tag + ".npz")
     if not (cache and os.path.isfile(out)):
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -95,6 +97,12 @@ def read_fbx(path: str, take: str | None = None, cache: bool = True) -> dict:
         os.replace(tmp, out)
     with np.load(out, allow_pickle=False) as d:
         mats, rest = d["mats"], d["rest"]
+        objects = []
+        if "obj_names" in d:
+            vs, fs = d["obj_vert_start"], d["obj_face_start"]
+            for i, name in enumerate(d["obj_names"]):
+                objects.append({"name": str(name), "kind": str(d["obj_kinds"][i]), "mats": d["obj_mats"][:, i],
+                                "vertices": d["obj_verts"][vs[i]:vs[i + 1]], "faces": d["obj_faces"][fs[i]:fs[i + 1]]})
         return {
             "names": [str(n) for n in d["names"]],
             "parents": d["parents"].astype(int),
@@ -107,6 +115,7 @@ def read_fbx(path: str, take: str | None = None, cache: bool = True) -> dict:
             "takes": [str(t) for t in d["takes"]],
             "reader": f"Blender {d['blender']} FBX importer",
             "cache": out,
+            "objects": objects,
         }
 
 
@@ -179,6 +188,7 @@ def load_fbx(
         ground_offset = float(np.nanmin(pos[..., 2]))
         pos = pos - [0.0, 0.0, ground_offset]
         rest_pos = rest_pos - [0.0, 0.0, ground_offset]
+    objects = [_object_track(o, s, dropped, ground_offset) for o in raw.get("objects", [])]
     return SkeletonMotion(
         name=stem,
         joint_names=raw["names"],
@@ -191,7 +201,18 @@ def load_fbx(
               "dropped_frames": dropped, "file_fps": file_fps, "fps_note": fps_note, "take": raw["take"],
               "takes": raw["takes"], "reader": raw["reader"], "rest_pose": (rest_pos, raw["rest_frames"])},
         rotations=raw["frames"][dropped:] if with_rotations else None,
+        objects=objects,
     )
+
+
+def _object_track(o: dict, s: float, dropped: int, ground_offset: float) -> ObjectTrack:
+    """An object of read_fbx in the skeleton's units and frames: its world matrices split into origin and
+    rotation, its mesh scaled by its (first frame's) world scale, all times the skeleton's unit factor."""
+    M = o["mats"][dropped:]
+    scale = np.linalg.norm(M[0, :3, :3], axis=0)  # column norms: the object's own axis scales
+    return ObjectTrack(name=o["name"], kind=o["kind"], positions=M[:, :3, 3] * s - [0.0, 0.0, ground_offset],
+                       rotations=_orthonormal(M[:, :3, :3]), vertices=o["vertices"] * scale * s,
+                       faces=np.asarray(o["faces"], dtype=np.int64))
 
 
 def bvh_to_fbx(bvh: str, out: str, scale: float | str = "auto") -> str:

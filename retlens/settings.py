@@ -398,7 +398,7 @@ def check_all(s: Settings | None = None) -> list[Check]:
                      "사람 모션(BVH·FBX·SMPL-X·C3D) 열기", "" if gmr else
                      "설치가 깨졌습니다. 프로그램을 다시 설치하세요" if paths.INSTALLED else "scripts\\install_gmr.ps1을 실행하세요"))
     for key, name, found, needed_for, hint in (
-            ("isaac", "Isaac Sim", find_isaac(s), "물리 모드, 동영상 저장",
+            ("isaac", "Isaac Sim", find_isaac(s), "물리 모드 '보조 힘 (Isaac)', 동영상 저장",
              "NVIDIA Isaac Sim을 설치하고 설치 폴더(python.bat이 있는 곳)를 지정하세요. NVIDIA RTX GPU가 필요합니다"),
             ("blender", "Blender 4.5", find_blender(s), "FBX 파일 열기",
              "Blender 4.5 LTS를 설치(또는 압축 해제)하고 blender.exe를 지정하세요"),
@@ -410,7 +410,7 @@ def check_all(s: Settings | None = None) -> list[Check]:
     usd = find_robot_usd(s)
     out.append(Check("robot_usd", "로봇 USD (Isaac)", usd.path is not None, False, usd.path or "",
                      " · ".join(x for x in (usd.detail, usd.source) if x) if usd.path is not None else usd.problem,
-                     "물리 모드, 동영상 저장", "" if usd.path is not None else
+                     "물리 모드 '보조 힘 (Isaac)', 동영상 저장", "" if usd.path is not None else
                      "USD 파일을 고르거나 칸을 비워 NVIDIA 에셋 서버의 G1을 쓰세요"))
     gmt = find_gmt(s)  # the policy runs in numpy (retlens/gmt_policy.py): no PyTorch needed
     mujoco = importlib.util.find_spec("mujoco") is not None
@@ -427,4 +427,9 @@ def check_all(s: Settings | None = None) -> list[Check]:
     have = [d for d in libs if os.path.isdir(d)]
     out.append(Check("library", "모션 폴더", bool(have), False, "; ".join(libs), f"{len(have)}/{len(libs)}개 있음",
                      "프로젝트 패널 목록", "" if have else "모션 파일이 있는 폴더를 추가하세요 (열기 메뉴로 아무 파일이나 열 수도 있음)"))
+    rules = s.label_rules or os.environ.get("RETLENS_LABEL_RULES", "")  # = retlens.autolabel.ENV
+    if rules:  # only once one is set: a rule file that was moved or deleted since
+        ok = os.path.isfile(rules)
+        out.append(Check("label_rules", "자동 라벨 규칙 파일", ok, False, rules, "" if ok else "파일이 없습니다",
+                         "자동 라벨", "" if ok else "인스펙터 > 라벨 > 규칙 파일...에서 다시 고르세요"))
     return out

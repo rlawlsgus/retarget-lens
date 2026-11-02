@@ -174,6 +174,7 @@ def test_problem(tmp_path, gmt_root, monkeypatch):
     assert "알 수 없는" in policy_runner.problem("lqr", gmt_root)
     os.remove(pr.gmt_paths(gmt_root)["policy"])
     assert policy_runner.problem("pd", gmt_root) == "" and "추적 정책" in policy_runner.problem("gmt", gmt_root)
+    assert policy_runner.problem("harness", gmt_root) == ""  # the harness needs the G1 model only, as "pd"
     runner = _runner(tmp_path, gmt_root, FakeSim())
     with pytest.raises(RuntimeError, match="추적 정책"):
         runner.request(g1_motion(seconds=1.0), "gmt")

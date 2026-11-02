@@ -106,9 +106,18 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
     if item.info.get("c3d"):
         out["c3d"] = item.info["c3d"]
         out["solved_motion"] = item.info.get("solved_motion")
+    # objects captured with the person (FBX props, retlens.objects): None = none; per object its kind, whether it
+    # moves, the seconds a human hand touches it and the robot hand's mean distance meanwhile
+    objs = item.human.objects if item.human is not None else []
+    per = m.get("_objects")
+    out["objects"] = (per if isinstance(per, list) else
+                      [{"name": o.name, "kind": o.kind, "moves": o.moves, "vertices": int(len(o.vertices))} for o in objs]
+                      ) if objs else None
     # labelled time segments (retlens.motion_labels): None = no label file; "now" at the scene's time
     labels = item.labels  # read once: the window's threads may replace it meanwhile
     out["labels"] = labels.summary(scene.t - item.offset, segments=metrics) if labels is not None else None
+    # where the problems are (retlens.problems; falls under "fall"), in motion time: {kind: [[start_s, end_s], ...]}
+    out["problems"] = {k: [list(s) for s in sp] for k, sp in scene.problems(item).items()}
     if metrics:
         out["metrics"] = {k: v for k, v in m.items() if not k.startswith("_") and k not in ("qc", "qc_notes")}
     if scene.physics_on or item.handles.get("phys"):
