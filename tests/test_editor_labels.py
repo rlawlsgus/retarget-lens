@@ -261,7 +261,7 @@ def test_the_inspectors_segment_list_is_made_as_it_is_shown():
     m = editor.SegmentModel(it, it.labels.segments, multi=True)
     assert m.rowCount() == 1920 and m.columnCount() == 4 and m.heads[0] == "트랙"
     idx = m.index(961, 0)
-    assert m.data(idx) == "왼손" and m.data(m.index(961, 1)) == "b" and m.data(m.index(961, 3)) == "0.50"
+    assert m.data(idx) == "왼손" and m.data(m.index(961, 1)) == "b" and m.data(m.index(961, 3)) == "0.500"
     assert m.data(m.index(961, 1), Qt.DecorationRole) is m.data(m.index(963, 1), Qt.DecorationRole)  # one icon per color
     assert "0.25 – 0.50 s" in m.data(idx, Qt.ToolTipRole)
 
@@ -319,3 +319,57 @@ def test_number_boxes_let_the_window_shortcuts_through():
     APP.processEvents()
     assert fired == ["Space", "N"] and box.value() == 2.5
     win.close()
+
+
+def test_dragging_the_picked_segments_edge():
+    """라벨 편집 in the timeline: a press on the picked segment's end and a drag give one edit on release, on frames,
+    stopping before the next segment's end (the edge it shares moves with it); Esc gives none; the picture under
+    the playhead is not drawn again while dragging."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+
+    it = _item("m", ["이동"])  # back to back 0.25 s segments
+    seg = it.labels.segments[3]  # 0.75 - 1.0
+    edits = []
+
+    class Win(types.SimpleNamespace):
+        def label_selection(self):
+            return (it, it.labels, seg) if self.picked else None
+
+        def set_label_selection(self, item, s):
+            self.picked = s is seg
+
+        def edit_labels(self, item, base, result, what, before=None):
+            edits.append((base, result, what, before))
+            return True
+
+        def select(self, item):
+            pass
+
+    win = Win(scene=_Scene([it]), selected=it, picked=True)
+    tracks = editor.TimelineTracks(win)
+    tracks.resize(1200, 120)
+    tracks.show()
+    APP.processEvents()
+    tracks.grab()
+    layer = tracks._layer[1]
+    r = tracks._selected_rect()
+    edge = QPoint(int(round(r.right())), int(r.center().y()))
+    assert tracks.edge_at(edge) == "end"
+    QTest.mousePress(tracks, Qt.LeftButton, Qt.NoModifier, edge)
+    for dx in (2, 10, 40):
+        QTest.mouseMove(tracks, edge + QPoint(dx, 0))
+    tracks.grab()
+    assert tracks._layer[1] is layer  # the preview is drawn over the picture
+    QTest.mouseRelease(tracks, Qt.LeftButton, Qt.NoModifier, edge + QPoint(40, 0))
+    assert len(edits) == 1
+    base, (new, s), what, before = edits[0]
+    assert base is it.labels and before is seg and what == "구간 끝 옮기기"
+    assert s.start == seg.start and seg.end < s.end <= 1.25 - 1 / 30 + 1e-9  # the next keeps a frame
+    assert new.segments[4].start == s.end and it.labels.segments[4].start == 1.0  # the neighbour followed; old intact
+    QTest.mousePress(tracks, Qt.LeftButton, Qt.NoModifier, edge)
+    QTest.mouseMove(tracks, edge + QPoint(30, 0))
+    QTest.keyClick(tracks, Qt.Key_Escape)
+    QTest.mouseRelease(tracks, Qt.LeftButton, Qt.NoModifier, edge + QPoint(30, 0))
+    assert len(edits) == 1  # cancelled
+

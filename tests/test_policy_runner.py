@@ -22,8 +22,8 @@ class FakeSim:
     """policy_replay.run's stand-in: the reference resampled at 50 Hz, a fall at 0.2 s for "pd". With
     gate set, each run waits for gate.set() and keeps calling progress (so a cancel can stop it)."""
 
-    def __init__(self, gate: threading.Event | None = None, fail: bool = False):
-        self.gate, self.fail = gate, fail
+    def __init__(self, gate: threading.Event | None = None, fail: bool = False, diag_error: str = ""):
+        self.gate, self.fail, self.diag_error = gate, fail, diag_error
         self.calls: list[str] = []
         self.threads: set[str] = set()
 
@@ -39,9 +39,17 @@ class FakeSim:
         idx = np.clip(np.round(np.arange(n) / 50 * motion.fps).astype(int), 0, motion.num_frames - 1)
         col = [motion.joint_names.index(j) for j in pr.GMT_DOFS]
         falls = [0.2] if controller == "pd" else []
+        diags = [{"fall_time_s": t, "window_s": [0.1, t], "primary_cause": "toe_catch", "primary_onset_s": 0.12,
+                  "primary_evidence": {"feet": ["left_ankle_roll_link"], "clip_foot_speed_mps": [0.9]},
+                  "candidates": [], "rule": "tilt"} for t in falls]
         metrics = {"controller": controller, "falls": len(falls), "fall_times_s": falls,
                    "fall_causes": ["tilt"] * len(falls), "hold_falls": 0, "hold_fall_times_s": [],
-                   "body_error_cm": 9.0 if controller == "pd" else 4.0, "torque_saturated_ratio": 0.1}
+                   "hold_fall_causes": [],
+                   "body_error_cm": 9.0 if controller == "pd" else 4.0, "torque_saturated_ratio": 0.1,
+                   "first_fall_cause": diags[0]["primary_cause"] if diags else None, "fall_diagnosis": diags,
+                   "hold_fall_diagnosis": []}
+        if self.diag_error:
+            metrics.update(first_fall_cause=None, fall_diagnosis=[], fall_diagnosis_error=self.diag_error)
         return pr.Result(controller, np.arange(n) / 50, motion.root_pos[idx], motion.root_quat[idx],
                          motion.dof_pos[idx][:, col], metrics)
 
@@ -101,6 +109,10 @@ def test_runs_in_the_background_and_caches(tmp_path, gmt_root):
     assert info["label"] == "synthetic/walk" and info["policy_replay"]["falls"] == 1
     item = load_item(job.result, log=None)  # the same files as tools/policy_replay.py writes
     assert item.kind.startswith("MuJoCo 재생") and item.robot.fps == 50 and len(item.robot.joint_names) == 29
+    pol = item.info["policy_replay"]  # each fall's first cause, as the run gave it
+    assert pol["first_fall_cause"] == "toe_catch" and pol["hold_fall_diagnosis"] == []
+    assert pol["fall_diagnosis"][0]["rule"] == "tilt" and pol["fall_diagnosis"][0]["primary_evidence"]["feet"] == [
+        "left_ankle_roll_link"]
 
     # the cache: a new runner (next start of RetLens) finds the result without simulating
     sim2 = FakeSim()
@@ -131,6 +143,13 @@ def test_cache_key(tmp_path, gmt_root):
     assert runner.key(m, "pd") == k_cfg and runner.key(m, "gmt") != k_gmt  # the policy file: GMT only
     short = _runner(tmp_path, gmt_root, FakeSim(), hold_s=0.0)
     assert short.key(m, "pd") != k_cfg  # the hold after the clip
+    with pytest.MonkeyPatch.context() as mp:  # results whose meaning changed (3: fall diagnosis) run again
+        mp.setattr(policy_runner, "CACHE_VERSION", policy_runner.CACHE_VERSION + 1)
+        assert runner.key(m, "pd") != k_cfg
+    with pytest.MonkeyPatch.context() as mp:  # and so do those whose run() metrics changed
+        mp.setattr(pr, "RESULT_VERSION", pr.RESULT_VERSION + 1)
+        assert runner.key(m, "pd") != k_cfg
+    assert runner.key(m, "pd") == k_cfg and policy_runner.CACHE_VERSION >= 3
     for r in (runner, short):
         r.shutdown()
 
@@ -164,6 +183,19 @@ def test_failure_keeps_the_worker(tmp_path, gmt_root):
     assert job.state == "failed" and "broken policy" in job.message and not os.path.exists(job.out_npz)
     runner._simulate = FakeSim()
     assert _wait(runner.request(g1_motion(seconds=1.0), "pd")).state == "done"  # a failed run is retried
+    runner.shutdown()
+
+
+def test_failed_fall_diagnosis_is_logged(tmp_path, gmt_root):
+    """A run whose fall diagnosis failed is still a result (the falls keep their rules); the log says why."""
+    lines = []
+    runner = _runner(tmp_path, gmt_root, FakeSim(diag_error="ValueError: broken"), log=lines.append)
+    job = _wait(runner.request(g1_motion(seconds=1.0), "pd"))
+    assert job.state == "done"
+    with open(job.result[:-4] + ".json", encoding="utf-8") as f:
+        pol = json.load(f)["policy_replay"]
+    assert pol["fall_diagnosis_error"] == "ValueError: broken" and pol["fall_causes"] == ["tilt"]
+    assert any("fall diagnosis failed" in line and "ValueError: broken" in line for line in lines)
     runner.shutdown()
 
 
@@ -233,3 +265,14 @@ def test_runner_matches_policy_replay():
                           hold_s=0.5).metrics
             assert got == json.loads(json.dumps(want)), c
         runner.shutdown()
+
+
+def test_a_result_whose_diagnosis_failed_is_made_again(tmp_path):
+    """Shown meanwhile, but not taken from the cache the next time (the causes come once the diagnosis works)."""
+    npz = tmp_path / "x.npz"
+    npz.write_bytes(b"x")
+    (tmp_path / "x.json").write_text(json.dumps({"policy_replay": {"falls": 1, "fall_diagnosis_error": "ValueError"}}))
+    assert not policy_runner._complete(str(npz))
+    (tmp_path / "x.json").write_text(json.dumps({"policy_replay": {"falls": 1}}))
+    assert policy_runner._complete(str(npz))
+

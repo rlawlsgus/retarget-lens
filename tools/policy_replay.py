@@ -10,9 +10,9 @@ the way a deployed tracker does (retlens/policy_replay.py; scripts/install_gmt.p
     python tools/policy_replay.py --summary reports/policy                         # rebuild summary.md only
 
 Per clip and controller it writes <out-dir>/<folder>/<clip>_<controller>_sim.npz (the simulated motion,
-50 Hz; RetLens opens it next to the original) and .json (falls, tracking errors, policy correction,
-torque saturation), --video one MP4 per clip with the controllers side by side and the reference as a
-blue ghost. summary.md collects every result under --out-dir.
+50 Hz; RetLens opens it next to the original) and .json (falls with their first cause, tracking errors,
+policy correction, torque saturation), --video one MP4 per clip with the controllers side by side and the
+reference as a blue ghost. summary.md collects every result under --out-dir.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 sys.path.insert(0, ROOT)
 
 from retlens import policy_replay as pr  # noqa: E402
+from retlens.diagnosis import causes_text  # noqa: E402
 from retlens.motion import RobotMotion  # noqa: E402
 
 MOTION_EXT = (".bvh", ".fbx", ".npz", ".csv", ".pkl")
@@ -178,18 +179,23 @@ def write_summary(out_dir: str) -> str:
              "**추적 정책 (GMT)**: 공개된 G1 범용 추적 정책이 기준 동작과 자기 상태를 보고 관절 목표를 냄(실제 로봇의 방식). "
              "넘어지면(기울기 60°, 골반 0.3 m 아래, 원본보다 0.25 m 낮음) 그 시각의 원본 자세로 다시 시작해 셉니다. "
              "넘어짐 괄호 안은 클립이 끝난 뒤 마지막 자세로 1초 서 있는 동안의 넘어짐입니다. "
+             "넘어짐 원인: 클립 안의 넘어짐마다 직전 0.75 s에서 처음 시작된 조건(발끝 걸림, 발 미끄러짐, 자기충돌 근접, "
+             "토크 포화, 지지면 이탈, 보조 힘 급증)과 그 시각(retlens/diagnosis.py, Isaac 물리 재생과 같은 기준; "
+             "근거 수치는 json의 fall_diagnosis). "
              "보조 힘: 하네스 힘 / 체중(평균 / 95%, 보조 힘 모드만). "
              "관절 RMSE: 23관절(다리 12관절). 몸 위치 오차: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치 차의 평균. "
              "정책 보정: 정책이 낸 관절 목표와 원본 관절각의 평균 차이. 토크 한계: 요구 토크가 한계를 넘은 스텝 비율. "
              f"`tools/policy_replay.py`가 만듭니다.", "",
-             "| 클립 | 종류 | 제어 | 길이 s | 넘어짐 | 첫 넘어짐 s | 보조 힘 % | 관절 RMSE° (다리) | 몸 위치 오차 cm | 골반 높이 오차 cm | 정책 보정 ° | 토크 한계 % |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| 클립 | 종류 | 제어 | 길이 s | 넘어짐 | 첫 넘어짐 s | 넘어짐 원인 | 보조 힘 % | 관절 RMSE° (다리) | 몸 위치 오차 cm | "
+             "골반 높이 오차 cm | 정책 보정 ° | 토크 한계 % |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for info, m in rows:
         pull = m.get("harness_force_per_body_weight") or {}
-        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} |".format(
+        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} |".format(
             info.get("label", "?"), info.get("kind", ""), pr.LABELS.get(m["controller"], m["controller"]),
             fmt(m.get("clip_s")), f"{m['falls']}" + (f" (+{m['hold_falls']})" if m.get("hold_falls") else ""),
-            fmt(m.get("first_fall_s"), "{:.2f}"),
+            fmt(m.get("first_fall_s"), "{:.2f}"), causes_text(m["fall_diagnosis"]) if m.get("fall_diagnosis") else
+            "?" if m.get("falls") else "-",  # ?: falls without a diagnosis (an older result, or it failed)
             f"{100 * pull['mean']:.0f} / {100 * pull['p95']:.0f}" if pull.get("mean") is not None else "-",
             fmt(m.get("joint_rmse_deg")), fmt(m.get("leg_joint_rmse_deg")), fmt(m.get("body_error_cm")),
             fmt(m.get("pelvis_height_error_cm")), fmt(m.get("policy_correction_deg")),
@@ -268,8 +274,11 @@ def main() -> int:
                     "model": "GMT G1 (23 DoF, wrists fixed), MuJoCo 1 kHz"
                              + (", robot self-collision off" if c == "harness" else ""), "gmt_files": files,
                     "swing_clearance_cm": args.swing_clearance, "smooth_hz": args.smooth})
-                log(f"{label} [{c}] {ref.length:.1f}s in {time.time() - t0:.1f}s: falls {m['falls']}"
-                    f"{' (first ' + str(m['first_fall_s']) + ' s)' if m['falls'] else ''}"
+                if m.get("fall_diagnosis_error"):
+                    log(f"{label} [{c}]: fall diagnosis failed: {m['fall_diagnosis_error']}")
+                cause = f", {m['first_fall_cause']}" if m.get("first_fall_cause") else ""
+                first = f" (first {m['first_fall_s']} s{cause})" if m["falls"] else ""
+                log(f"{label} [{c}] {ref.length:.1f}s in {time.time() - t0:.1f}s: falls {m['falls']}{first}"
                     f"{', +' + str(m['hold_falls']) + ' in the hold' if m['hold_falls'] else ''}, "
                     f"{'harness ' + format(m['harness_force_per_body_weight']['mean'], '.0%') + ' body weight, ' if c == 'harness' else ''}"
                     f"joint RMSE {m['joint_rmse_deg']} deg, body error {m['body_error_cm']} cm, "

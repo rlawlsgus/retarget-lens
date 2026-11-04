@@ -13,8 +13,10 @@ the Isaac runs nothing starts a process: one worker thread runs one clip at a ti
 stops it within 0.5 s of simulated time.
 
 Results are keyed by the motion's arrays, the controller, configs/physics.yaml (PD gains, fall
-rules), the GMT files, the hold after the clip and CACHE_VERSION, and saved as tools/policy_replay.py
-saves them, so compare.load_item opens both (kind "MuJoCo 재생 · ...", info["policy_replay"]).
+rules, diagnosis thresholds), the GMT files, the hold after the clip, CACHE_VERSION and
+policy_replay.RESULT_VERSION, and saved as tools/policy_replay.py saves them, so compare.load_item
+opens both (kind "MuJoCo 재생 · ...", info["policy_replay"], with each fall's first cause in
+fall_diagnosis / first_fall_cause; a diagnosis that failed is logged and leaves fall_diagnosis_error).
 The policy runs in numpy (retlens/gmt_policy.py), so the installed program runs it too once GMT's
 files are there (설치 도우미, retlens/prereqs.py).
 """
@@ -38,7 +40,9 @@ from . import policy_replay as pr
 from .motion import RobotMotion
 from .physics_runner import PHYSICS_CONFIG, _file_id, _safe
 
-CACHE_VERSION = 2  # bump when policy_replay's results change meaning (2: the policy in numpy, not torch)
+# bump when the saved results change meaning (2: the policy in numpy, not torch; 3: fall diagnosis); the key
+# also holds policy_replay.RESULT_VERSION, which run()'s metrics bump
+CACHE_VERSION = 3
 HOLD_S = 1.0  # stand on the last pose this long after the clip, as tools/policy_replay.py does
 MODEL_TEXT = "GMT G1 (23 DoF, wrists fixed), MuJoCo 1 kHz"
 
@@ -48,8 +52,15 @@ class Cancelled(Exception):
 
 
 def _complete(npz: str) -> bool:
-    """A finished result: the json is written after the npz."""
-    return os.path.isfile(npz) and os.path.isfile(npz[:-4] + ".json")
+    """A finished result: the json is written after the npz. One whose fall diagnosis failed is made again next time
+    (it is shown meanwhile, with its fall rules and why)."""
+    if not (os.path.isfile(npz) and os.path.isfile(npz[:-4] + ".json")):
+        return False
+    try:
+        with open(npz[:-4] + ".json", encoding="utf-8") as f:
+            return not json.load(f).get("policy_replay", {}).get("fall_diagnosis_error")
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def problem(controller: str, gmt_root: str | None = None) -> str:
@@ -137,8 +148,8 @@ class PolicyRunner:
         h = hashlib.sha1()
         ids = [_file_id(files["model"]) if os.path.isfile(files["model"]) else None,
                _file_id(files["policy"]) if controller == "gmt" and os.path.isfile(files["policy"]) else None]
-        h.update(json.dumps([CACHE_VERSION, controller, list(motion.joint_names), float(motion.fps), self.hold_s,
-                             ids]).encode())
+        h.update(json.dumps([CACHE_VERSION, pr.RESULT_VERSION, controller, list(motion.joint_names), float(motion.fps),
+                             self.hold_s, ids]).encode())
         for a in (motion.root_pos, motion.root_quat, motion.dof_pos):
             h.update(np.ascontiguousarray(a, dtype=np.float32).tobytes())
         h.update(config.encode())
@@ -253,6 +264,9 @@ class PolicyRunner:
         res = self._simulate(motion, job.controller, progress)
         if job.cancel_requested:
             raise Cancelled()
+        why = res.metrics.get("fall_diagnosis_error")
+        if why:  # the run itself is fine: its falls keep their rules
+            self.log(f"MuJoCo fall diagnosis failed: {job.name} ({job.controller}): {why}")
         job.stage, job.progress = "결과 저장", 0.96
         files = self.files()
         pr.save_result(res, job.out_npz, motion.joint_names, {

@@ -266,3 +266,114 @@ def test_at_matches_a_plain_scan(monkeypatch):
         assert lab.at(t) == scan(t), t
     lab.segments = segs[:10]  # a new list: looked up again
     assert lab.tracks == [segs[0].track]
+
+
+def _lab(*rows, path="x.labels.csv"):
+    """Labels from (track, label, start, end) rows, back to back like a labeller's table."""
+    return ml.MotionLabels(path=path, segments=[ml.Segment(label=lb, start=a, end=b, track=t) for t, lb, a, b in rows])
+
+
+def test_edits_give_new_labels_and_never_change_the_old():
+    """An edit returns new labels (edited) sharing the segments it did not touch; the old labels and segments stay
+    as they were, so undo is just putting the old object back."""
+    lab = _lab(("이동", "걷기", 0.0, 1.0), ("이동", "서기", 1.0, 2.0), ("손", "뻗기", 0.5, 1.5))
+    before = [(s.label, s.start, s.end) for s in lab.segments]
+    walk, stand, reach = lab.segments
+    new, seg = ml.with_bounds(lab, walk, 0.0, 1.4, FPS, DUR)  # the end both share: the neighbour's start moves too
+    assert new is not lab and new.edited and not lab.edited
+    assert (seg.start, seg.end) == (0.0, pytest.approx(1.4)) and new.segments[1].start == pytest.approx(1.4)
+    assert new.segments[2] is reach and [(s.label, s.start, s.end) for s in lab.segments] == before
+    detached, seg = ml.with_bounds(lab, walk, 0.0, 0.8, FPS, DUR, together=False)  # shrinking alone leaves a gap
+    assert seg.end == pytest.approx(0.8) and detached.segments[1] is stand
+    grown, seg = ml.with_bounds(lab, walk, 0.0, 9.0, FPS, DUR, together=False)  # stops at the neighbour
+    assert seg.end == pytest.approx(1.0)
+    _same, seg = ml.with_bounds(lab, walk, 0.0, 1.0, FPS, DUR)
+    assert _same is lab and seg is walk  # nothing changed
+    snapped, seg = ml.with_bounds(lab, stand, 1.0, 1.511, FPS, DUR, together=False)
+    assert seg.end == pytest.approx(round(1.511 * FPS) / FPS)  # on a frame
+    tiny, seg = ml.with_bounds(lab, walk, 0.99, 1.0, FPS, DUR)
+    assert seg.end - seg.start == pytest.approx(1 / FPS)  # at least a frame
+
+
+def test_rename_split_merge_remove_add():
+    lab = _lab(("이동", "걷기", 0.0, 1.0), ("이동", "서기", 1.0, 2.0))
+    walk, stand = lab.segments
+    lab.segments[1].color = (1, 2, 3)
+    renamed, seg = ml.relabeled(lab, walk, " 서기 ")
+    assert seg.label == "서기" and seg.color == (1, 2, 3)  # looks like the label it took
+    with pytest.raises(ValueError):
+        ml.relabeled(lab, walk, "  ")
+    halves, first = ml.split(lab, walk, 0.51, FPS)
+    assert [(s.start, s.end) for s in halves.segments[:2]] == [(0.0, pytest.approx(0.5)), (pytest.approx(0.5), 1.0)]
+    assert first is halves.segments[0]
+    with pytest.raises(ValueError):
+        ml.split(lab, walk, 1.0, FPS)  # on the edge: nothing to cut
+    one, seg = ml.merged(lab, walk, 1)
+    assert len(one.segments) == 1 and (seg.label, seg.start, seg.end) == ("걷기", 0.0, 2.0)
+    with pytest.raises(ValueError):
+        ml.merged(lab, walk, -1)  # nothing before
+    gone, seg = ml.removed(lab, stand)
+    assert seg is None and gone.segments == [walk]
+    filled, seg = ml.added(gone, "이동", 1.5, FPS, DUR, "뛰기")  # the gap stand left, up to the motion's end
+    assert (seg.track, seg.label, seg.start, seg.end) == ("이동", "뛰기", 1.0, DUR) and filled.segments[-1] is seg
+    with pytest.raises(ValueError):
+        ml.added(lab, "이동", 0.5, FPS, DUR)  # a segment is there already
+    fresh, seg = ml.added(None, "", 1.0, FPS, DUR, "대기")  # a motion without labels: its first one, the whole motion
+    assert fresh.edited and fresh.path == "" and (seg.start, seg.end) == (0.0, DUR)
+    broken = ml.MotionLabels(path="b.labels.csv", error="label 열이 없습니다")
+    again, _seg = ml.added(broken, "", 1.0, FPS, DUR, "대기")
+    assert again.path == "b.labels.csv" and not again.error  # starts again where the broken file was
+    other_track, seg = ml.added(lab, "손", 0.5, FPS, DUR, "뻗기")
+    assert other_track.tracks == ["이동", "손"] and (seg.start, seg.end) == (0.0, DUR)
+    assert ml.index_of(lab, stand) == 1
+    twin = ml.Segment(label="걷기", start=0.0, end=1.0, track="이동")
+    with pytest.raises(ValueError):
+        ml.index_of(lab, twin)  # alike is not the same segment
+
+
+def test_saving_edits_is_safe(tmp_path, monkeypatch):
+    """A header-only CSV reads back as labels without segments; files of other kinds or other motions are never
+    overwritten; a write that fails leaves the old file."""
+    src = _motion(tmp_path)
+    empty = ml.save_csv(ml.MotionLabels(path=""), str(tmp_path / "motions" / "02_01.labels.csv"))
+    back = ml.load(empty, src, FPS, DUR)
+    assert back.error == "" and back.segments == []
+    table = _write(tmp_path / "motions" / "labels.csv", "seq,label,start_s,end_s\n02_01,a,0,1\n02_03,b,0,1\n")
+    assert "여러 모션" in ml.overwrite_problem(table)
+    assert "여러 모션" in ml.overwrite_problem(_write(tmp_path / "t.csv", "seq,label,start_s,end_s\na,x,0,1\nb,y,0,1\n"))
+    assert "라벨 파일이 아닙니다" in ml.overwrite_problem(_write(tmp_path / "walk.csv", "time,q0,q1\n0,0,0\n"))
+    assert "JSON" in ml.overwrite_problem(_write(tmp_path / "a.labels.json", "[]"))
+    assert ml.overwrite_problem(empty) == "" and ml.overwrite_problem(str(tmp_path / "new.labels.csv")) == ""
+    framed = _write(tmp_path / "f.labels.csv", "label,start_frame,end_frame,who\na,0,9,me\n")
+    losses = ml.overwrite_losses(framed)
+    assert any("who" in x for x in losses) and any("프레임" in x for x in losses)
+    old = open(empty, encoding="utf-8-sig").read()
+
+    class Broken:
+        def writerow(self, row):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(ml.csv, "writer", lambda f: Broken())
+    with pytest.raises(OSError):
+        ml.save_csv(_lab(("", "a", 0.0, 1.0)), empty)
+    assert open(empty, encoding="utf-8-sig").read() == old  # untouched
+    assert not [p for p in os.listdir(os.path.dirname(empty)) if p.endswith(".tmp")]  # no temporary file left
+
+
+def test_saving_never_takes_another_motions_table(tmp_path):
+    """A file of another motion's rows (one seq), or a folder table's name even when new, is never written; a file of
+    this motion's rows is (its seq column is said to go); both edges of a segment moved at once land where asked."""
+    src = _motion(tmp_path)
+    other = _write(tmp_path / "motions" / "02_01.labels.csv", "seq,label,start_s,end_s\n02_02,a,0,1\n")
+    assert "다른 모션" in ml.overwrite_problem(other, src) and ml.overwrite_problem(other)  # no motion given: refused
+    mine = _write(tmp_path / "motions" / "x.labels.csv", "seq,label,start_s,end_s\n02_01,a,0,1\n")
+    assert ml.overwrite_problem(mine, src) == "" and any("seq" in x for x in ml.overwrite_losses(mine))
+    assert ml.overwrite_problem(str(tmp_path / "new" / "labels.csv"), src)  # would be read for the whole folder
+    assert ml.overwrite_problem(str(tmp_path / "new.labels.json"), src)
+    lab = _lab(("", "a", 1.0, 2.0))
+    seg = lab.segments[0]
+    _new, s = ml.with_bounds(lab, seg, 3.0, 4.0, FPS, DUR)
+    assert (s.start, s.end) == (3.0, 4.0)
+    same, s = ml.with_bounds(lab, seg, 1.0002, 2.0, FPS, DUR)  # given back rounded: not an edit
+    assert same is lab and s is seg
+

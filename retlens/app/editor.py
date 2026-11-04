@@ -37,14 +37,16 @@ from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
-                               QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+                               QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMainWindow,
                                QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
                                QSpinBox,
                                QSplitter,
-                               QStyle, QTableView, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
+                               QStyle, QStyledItemDelegate, QTableView, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import autolabel, batch, cmu_labels, motion_labels, problems
+from . import session as work
 from .. import paths as app_paths  # "paths" is a common local name here
 from .. import settings
 from ..compare import MOTION_EXT, Item, library_files
@@ -155,11 +157,29 @@ def dark_palette() -> QPalette:
 
 
 class _PassShortcuts(QObject):
-    """Lets the window's one-key shortcuts (Space, N, P, O, F, ...) through a focused number box, which would
-    otherwise take them; digits, arrows and Home / End stay the box's."""
+    """Lets the window's one-key shortcuts (Space, N, P, O, F, S, ...) through a focused number box, which would
+    otherwise take them; digits, arrows, Home / End and Ctrl+ keys (its own undo, copy) stay the box's."""
 
     def eventFilter(self, obj, e):
-        if e.type() == QEvent.ShortcutOverride and (e.key() == Qt.Key_Space or Qt.Key_A <= e.key() <= Qt.Key_Z):
+        if e.type() == QEvent.ShortcutOverride and (e.key() == Qt.Key_Space or Qt.Key_A <= e.key() <= Qt.Key_Z) \
+                and not e.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+            e.ignore()
+            return True
+        return False
+
+
+class _SceneUndoKeys(QObject):
+    """The 3D view (Chromium) takes Ctrl+Z / Ctrl+Y as its own editing keys; it has no text to edit, so they go
+    to the window's 되돌리기 / 다시 실행 (label edits) instead."""
+
+    def __init__(self, view: QWidget):
+        super().__init__(view)
+        self.view = view
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.ShortcutOverride and isinstance(obj, QWidget) and \
+                (obj is self.view or self.view.isAncestorOf(obj)) and \
+                (e.matches(QKeySequence.Undo) or e.matches(QKeySequence.Redo)):
             e.ignore()
             return True
         return False
@@ -444,6 +464,7 @@ class InspectorPanel(QScrollArea):
         self.setWidgetResizable(True)
         self.item: Item | None = None
         self._labels_shown = None
+        self._selecting = False
         self._open = set(win.settings.value("inspector/open", [], type=list) or [])  # the folds left open
         self._build_empty()
 
@@ -451,7 +472,8 @@ class InspectorPanel(QScrollArea):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setAlignment(Qt.AlignTop)
-        self.setWidget(w)
+        self.setWidget(w)  # the old widgets go: nothing may point at them
+        self._seg_model = self._seg_table = self._save_labels = None
         return lay
 
     def _build_empty(self) -> None:
@@ -591,6 +613,16 @@ class InspectorPanel(QScrollArea):
         pl.addWidget(section_label("물리"))
         self.phys = self._value("")
         pl.addWidget(self.phys)
+        self.falls = QTableWidget(0, 3)  # the shown result's falls: a click goes to where its first cause started
+        self.falls.setHorizontalHeaderLabels(["넘어짐 (s)", "1차 원인", "시작 (s)"])
+        self.falls.verticalHeader().setVisible(False)
+        self.falls.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.falls.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.falls.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.falls.setToolTip("누르면 그 넘어짐의 1차 원인이 시작된 곳으로 갑니다 (행에 마우스를 올리면 근거)")
+        self.falls.cellClicked.connect(self._fall_clicked)
+        self._falls_key = None
+        pl.addWidget(self.falls)
         lay.addWidget(self.phys_box)
 
         self.video_box = QWidget()  # shown once a video was asked for (파일 menu, Ctrl+E, right-click)
@@ -626,14 +658,12 @@ class InspectorPanel(QScrollArea):
         segment's start)."""
         # read once (other threads replace them); refresh() rebuilds when they change (menu, API, drop)
         self._labels_shown = lab = item.labels
-        if lab is None:
-            info = self._value("라벨 없음", labels_text(item, None))
-            info.setStyleSheet("color: gray")
-        else:
-            info = self._value(labels_text(item, lab))
-            if lab.error:
-                info.setStyleSheet("color: rgb(230,150,60)")
+        self._labels_info = info = self._value("")
+        self._labels_edited = edited = self._value("편집됨 (저장 안 함) · 라벨 CSV로 저장...으로 남깁니다")
+        edited.setStyleSheet("color: rgb(230,150,60)")
+        self._show_labels_info(item, lab)
         lay.addWidget(info)
+        lay.addWidget(edited)
         segs = lab.segments if lab is not None else []
         rules = autolabel.rules_file()
         row = QHBoxLayout()
@@ -662,30 +692,165 @@ class InspectorPanel(QScrollArea):
         row.addWidget(more)
         row.addStretch(1)
         lay.addLayout(row)
+        edit = QHBoxLayout()  # editing: the picked segment (timeline or the list below)
+        for text, tip, fn in (
+                ("＋ 구간", "재생 위치의 빈칸에 구간을 더합니다 (고른 구간의 트랙, 트랙이 없으면 새 트랙)",
+                 lambda: self.win.label_add_here(item)),
+                ("나누기", "고른 구간을 재생 위치에서 둘로 나눕니다 (S)", self.win.label_split),
+                ("삭제", "고른 구간을 지웁니다 (타임라인이나 이 표에서 Delete)", self.win.label_delete),
+                ("↶", "되돌리기 (Ctrl+Z)", lambda: self.win.label_undo()),
+                ("↷", "다시 실행 (Ctrl+Y)", lambda: self.win.label_undo(redo=True))):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            edit.addWidget(b)
+        edit.addStretch(1)
+        self._save_labels = save = QPushButton("라벨 CSV로 저장...")
+        save.setToolTip("지금 라벨을 CSV로 저장합니다. 모션 옆에 <이름>.labels.csv로 두면 열 때 붙습니다")
+        save.clicked.connect(lambda: self.win.save_labels_dialog(item))
+        edit.addWidget(save)
+        lay.addLayout(edit)
+        self._show_labels_info(item, lab)
+        self._seg_model = None
         if not segs:
             return
         multi = len(lab.tracks) > 1 or bool(lab.tracks[0])
         table = QTableView()
-        model = SegmentModel(item, segs, multi, table)  # rows are made as they scroll into view: a long take has thousands
+        # rows are made as they scroll into view: a long take has thousands
+        model = SegmentModel(item, segs, multi, table,
+                             on_edit=lambda seg, field, value: self.win.edit_segment(item, item.labels, seg, field, value))
         table.setModel(model)
+        table.setItemDelegate(SegmentDelegate(model, self.win.scene.label_names, table))
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(22)
         table.horizontalHeader().setSectionResizeMode(len(model.heads) - 3, QHeaderView.Stretch)
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setEditTriggers(QAbstractItemView.DoubleClicked)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setMinimumHeight(min(220, 26 + 22 * len(segs)))
-        table.clicked.connect(lambda i: (self.win.scene.set_playing(False),
-                                         self.win.scene.seek(item.offset + segs[i.row()].start)))
+        table.setToolTip("누르면 그 구간을 고르고 처음으로 갑니다. 두 번 누르면 라벨·시간을 고칩니다. 우클릭: 편집")
+        table.clicked.connect(lambda i: self._segment_clicked(model.segs[i.row()]))
+        table.selectionModel().currentRowChanged.connect(  # Up / Down: the picked segment follows (no seek)
+            lambda cur, _prev: cur.isValid() and not self._selecting and self.win.set_label_selection(
+                self.item, model.segs[cur.row()]))
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.customContextMenuRequested.connect(lambda pos: self._segment_menu(table, model, pos))
+        self._seg_table, self._seg_model = table, model
         lay.addWidget(table)
+        self.select_segment(self.win.label_selection()[2] if self.win.label_selection() is not None else None)
+
+    def _show_labels_info(self, item: Item, lab) -> None:
+        if lab is None:
+            self._labels_info.setText("라벨 없음")
+            self._labels_info.setToolTip(labels_text(item, None))
+            self._labels_info.setStyleSheet("color: gray")
+        else:
+            self._labels_info.setText(labels_text(item, lab))
+            self._labels_info.setToolTip("")
+            self._labels_info.setStyleSheet("color: rgb(230,150,60)" if lab.error else "")
+        dirty = lab is not None and lab.edited
+        self._labels_edited.setVisible(dirty)
+        save = getattr(self, "_save_labels", None)
+        if save is not None:
+            save.setEnabled(lab is not None and (bool(lab.segments) or dirty))
+            f = save.font()
+            f.setBold(dirty)
+            save.setFont(f)
+
+    def _segment_clicked(self, seg) -> None:
+        it = self.item
+        self.win.set_label_selection(it, seg)
+        self.win.scene.set_playing(False)
+        self.win.scene.seek(it.offset + seg.start)
+
+    def _segment_menu(self, table, model, pos) -> None:
+        index = table.indexAt(pos)
+        if not index.isValid():
+            return
+        seg = model.segs[index.row()]
+        self.win.set_label_selection(self.item, seg)
+        m = QMenu(self)
+        self.win.label_menu(m, self.item, seg)
+        m.exec(table.viewport().mapToGlobal(pos))
+
+    def select_segment(self, seg) -> None:
+        """The picked segment selected (and scrolled to) in the list."""
+        model = getattr(self, "_seg_model", None)
+        if model is None:
+            return
+        row = next((k for k, s in enumerate(model.segs) if s is seg), None) if seg is not None else None
+        sm = self._seg_table.selectionModel()
+        if row is None:
+            sm.clearSelection()
+            return
+        index = model.index(row, 0)
+        if not sm.isRowSelected(row, QModelIndex()):
+            self._selecting = True  # not a pick by the user (currentRowChanged)
+            try:
+                self._seg_table.selectRow(row)
+            finally:
+                self._selecting = False
+        self._seg_table.scrollTo(index)
+
+    def _labels_changed_in_place(self, it: Item) -> bool:
+        """New labels on the shown motion (an edit, undo): the list and the lines updated where they are, so the
+        list keeps its scroll; False when the panel has to be built again (labels came or went, tracks changed)."""
+        lab, old, model = it.labels, self._labels_shown, getattr(self, "_seg_model", None)
+        if model is None or lab is None or old is None or not lab.segments:
+            return False
+        if (len(lab.tracks) > 1 or bool(lab.tracks[0])) != model.multi:
+            return False
+        self._labels_shown = lab
+        scroll = self._seg_table.verticalScrollBar().value()
+        model.set_segments(lab.segments)
+        self._seg_table.verticalScrollBar().setValue(scroll)
+        self._show_labels_info(it, lab)
+        sel = self.win.label_selection()
+        self.select_segment(sel[2] if sel is not None else None)
+        return True
+
+    def _fill_falls(self, it: Item) -> None:
+        """The falls of what is shown (physics mode, or a result file): time, first cause, where it started."""
+        sc = self.win.scene
+        shown = sc.shown(it)
+        details = sc.fall_details(shown) if shown is not it or sc.is_sim_result(it) else []
+        key = (id(shown), id(shown.info), len(details))
+        if key == self._falls_key:
+            return
+        self._falls_key = key
+        self.falls.setRowCount(len(details))
+        for r, d in enumerate(details):
+            cause = d["cause_ko"] or ("분석 실패" if d["why_none"].startswith("원인 분석 실패") else d["why_none"] or
+                                      (f"판정: {d['rule_ko']}" if d["rule_ko"] else "-"))
+            onset = d["onset_s"]
+            for c, text in enumerate((f"{d['time_s']:.2f}" + (" (끝난 뒤)" if d["after_clip"] else ""), cause,
+                                      f"{onset:.2f}" if onset is not None else "-")):
+                cell = QTableWidgetItem(text)
+                cell.setToolTip(sc.fall_tip(shown, d))
+                cell.setData(Qt.UserRole, onset if onset is not None else d["time_s"])
+                if c != 1:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.falls.setItem(r, c, cell)
+        self.falls.setVisible(bool(details))
+        self.falls.setFixedHeight(self.falls.horizontalHeader().height() + 2
+                                  + sum(self.falls.rowHeight(r) for r in range(min(len(details), 8))))
+
+    def _fall_clicked(self, row: int, _col: int) -> None:
+        cell, it = self.falls.item(row, 0), self.item
+        if cell is not None and it is not None:
+            self.win.scene.set_playing(False)
+            self.win.scene.seek(it.offset + float(cell.data(Qt.UserRole)))
 
     def refresh(self, metrics: bool = True) -> None:
         """metrics=False: only the status lines (job progress), not the problems and the metric table."""
         it, sc = self.item, self.win.scene
         if it is None or it not in sc.items:
             return
-        if it.labels is not self._labels_shown:  # loaded, reloaded or removed (menu, API, a dropped file)
-            self.show_item(it)
-            return
+        if it.labels is not self._labels_shown:  # edited, loaded, reloaded or removed (menu, API, a dropped file)
+            if not self._labels_changed_in_place(it):
+                self.show_item(it)
+                return
         overview = sc.results_overview(it)
         sim = sc.is_sim_result(it)
         self.phys_box.setVisible(sim or sc.physics_on or bool(overview))
@@ -700,6 +865,7 @@ class InspectorPanel(QScrollArea):
             text = "\n".join(lines)
         if self.phys.text() != text:
             self.phys.setText(text)
+        self._fill_falls(it)
         video, file = sc.video_text(it), sc.video_file(it)
         self.video_box.setVisible(bool(video))
         html = (f"동영상 저장됨: <a href='file'>{escape(os.path.basename(file))}</a> · <a href='folder'>폴더</a>"
@@ -892,7 +1058,10 @@ class TimelineTracks(QWidget):
         self.win = win
         self.setMinimumHeight(self.RULER_H + self.ROW_H)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.ClickFocus)  # Esc stops dragging a segment's edge; Delete deletes the picked segment
         self._drag = False
+        self._edge: dict | None = None  # dragging the picked segment's start or end (label editing)
+        self._no_menu = 0.0  # when a right press cancelled a drag: its menu (right after) does not open
         self._layer: tuple | None = None  # (_layer_key(), QPixmap)
 
     def sizeHint(self):
@@ -946,6 +1115,11 @@ class TimelineTracks(QWidget):
     def segment_at(self, pos):
         """(motion, segment) under the mouse (within a pixel of a thin one), or None. Looked up by
         time, not by going through the segments: it runs on every mouse move."""
+        hit = self.hit_at(pos)
+        return (hit[0], hit[2]) if hit is not None else None
+
+    def hit_at(self, pos):
+        """(motion, its labels as drawn, segment) under the mouse, or None."""
         row = self._row_at(pos.y())
         if row is None or not row[3] or pos.x() < self.NAME_W:
             return None
@@ -961,8 +1135,42 @@ class TimelineTracks(QWidget):
             if 0.0 <= local < dur:
                 hit = next((s for s in labels.at(local) if s.track == tracks[k]), None)
                 if hit is not None:
-                    return it, hit
+                    return it, labels, hit
         return None
+
+    def lane_at(self, pos):
+        """(motion, track) of the label lane under the mouse, or None (the motion's bar, the ruler)."""
+        row = self._row_at(pos.y())
+        if row is None or not row[3]:
+            return None
+        k = int((pos.y() - (row[1] + self.ROW_H - 1)) // self.LANE_H)
+        return (row[0], row[3][k]) if 0 <= k < len(row[3]) else None
+
+    def _selection(self):
+        """The window's picked segment (motion, labels, segment), or None (a test's stand-in window has none)."""
+        fn = getattr(self.win, "label_selection", None)
+        return fn() if fn is not None else None
+
+    def _selected_rect(self, rows=None, seg=None) -> QRectF | None:
+        sel = self._selection()
+        if sel is None:
+            return None
+        it = sel[0]
+        row = next((r for r in (rows if rows is not None else self._rows()) if r[0] is it), None)
+        if row is None or not row[3]:
+            return None
+        return self._seg_rect(it, row[1], {t: k for k, t in enumerate(row[3])}, seg or sel[2], self._span(),
+                              self.win.scene.shown(it).robot.duration)
+
+    def edge_at(self, pos) -> str | None:
+        """'start' / 'end' when the mouse is on an edge of the picked segment (4 px), else None."""
+        r = self._selected_rect()
+        if r is None or not r.top() - 2 <= pos.y() <= r.bottom() + 2:
+            return None
+        x = pos.x()
+        if abs(x - r.left()) <= 4 and abs(x - r.left()) <= abs(x - r.right()):
+            return "start"
+        return "end" if abs(x - r.right()) <= 4 else None
 
     def _span(self) -> tuple[float, float]:
         lo, hi = self.win.scene.time_range()
@@ -991,7 +1199,9 @@ class TimelineTracks(QWidget):
 
     def view_key(self) -> tuple:
         """What is drawn: TimelinePanel.refresh repaints only when this changes."""
-        return self._layer_key(), self.win.scene.t
+        sel, ed = self._selection(), self._edge
+        return (self._layer_key(), self.win.scene.t, _Same(sel[2]) if sel is not None else None,
+                (ed["preview"].start, ed["preview"].end) if ed is not None and ed.get("preview") is not None else None)
 
     def paintEvent(self, _):
         rows = self._rows()
@@ -1019,10 +1229,29 @@ class TimelineTracks(QWidget):
                     r = self._seg_rect(it, y, lane, s, span, dur)
                     if r is not None:
                         p.drawRect(r.adjusted(1, 1, -1, -1))
+        self._paint_selection(p, rows)
         self._paint_ruler(p, span)
         x = self._x(sc.t, span)
         p.setPen(QPen(QColor(255, 150, 40), 2))
         p.drawLine(int(x), 0, int(x), self.height())
+
+    def _paint_selection(self, p: QPainter, rows) -> None:
+        """The picked segment outlined with handles on its edges; while an edge is dragged, where it would go."""
+        ed = self._edge
+        preview = ed.get("preview") if ed is not None else None
+        r = self._selected_rect(rows, preview)
+        if r is None:
+            return
+        hl = self.palette().color(QPalette.Highlight).lighter(140)
+        if preview is not None:
+            fill = QColor(hl)
+            fill.setAlpha(70)
+            p.fillRect(r, fill)
+        p.setPen(QPen(hl, 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(r)
+        for x in (r.left(), r.right()):
+            p.fillRect(QRectF(x - 2, r.top() - 1, 4, r.height() + 2), hl)
 
     def _ruler_ticks(self, span):
         lo, hi = span
@@ -1064,7 +1293,7 @@ class TimelineTracks(QWidget):
             broken = labels is not None and bool(labels.error)  # its label file could not be used: say so
             p.setPen(QColor(230, 150, 60) if broken else text)
             p.drawText(QRectF(6, y, self.NAME_W - 10, self.ROW_H), Qt.AlignVCenter | Qt.AlignLeft,
-                       f"⚠ {it.label}" if broken else it.label)
+                       f"⚠ {it.label}" if broken else f"{it.label} *" if getattr(labels, "edited", False) else it.label)
             dur = sc.shown(it).robot.duration
             c = QColor(*it.color)
             c.setAlpha(200 if it.visible else 70)
@@ -1114,6 +1343,10 @@ class TimelineTracks(QWidget):
                            fm.elidedText(s.label, Qt.ElideRight, int(r.width()) - 6))
 
     def mousePressEvent(self, e):
+        if e.button() == Qt.RightButton and self._edge is not None:  # cancels dragging an edge
+            self._edge, self._no_menu = None, time.monotonic()
+            self.update()
+            return
         if e.button() != Qt.LeftButton:  # the right button opens the menu (contextMenuEvent)
             return
         if e.position().x() < self.NAME_W:  # click a name: select that motion
@@ -1121,9 +1354,40 @@ class TimelineTracks(QWidget):
             if row is not None:
                 self.win.select(row[0])
             return
+        which = self.edge_at(e.position())
+        if which is not None:  # on the picked segment's edge: drag it (a click without moving still seeks)
+            it, lab, seg = self._selection()
+            self._edge = {"item": it, "labels": lab, "seg": seg, "which": which, "x": e.position().x(), "moved": False}
+            self.win.scene.set_playing(False)
+            return
+        self._pick(e.position())
         self._drag = True
         self.win.scene.set_playing(False)
         self.win.scene.seek(self._t(e.position().x()))
+
+    def _pick(self, pos) -> None:
+        pick = getattr(self.win, "set_label_selection", None)
+        if pick is not None:
+            hit = self.hit_at(pos)
+            pick(hit[0] if hit is not None else None, hit[2] if hit is not None else None)
+
+    def _drag_edge(self, e) -> None:
+        """The edge follows the mouse on frames, stopping at the neighbours (a neighbour sharing the edge moves
+        with it; Alt: not) and snapping to the playhead within 5 px."""
+        ed, x = self._edge, e.position().x()
+        if not ed["moved"] and abs(x - ed["x"]) < 3:
+            return
+        ed["moved"] = True
+        it, seg, sc = ed["item"], ed["seg"], self.win.scene
+        t = (sc.t if abs(self._x(sc.t) - x) <= 5 else self._t(x)) - it.offset
+        start, end = (t, seg.end) if ed["which"] == "start" else (seg.start, t)
+        new, s = motion_labels.with_bounds(ed["labels"], seg, start, end, it.robot.fps, it.robot.duration,
+                                           together=not e.modifiers() & Qt.AltModifier)
+        ed["new"], ed["preview"] = new, s
+        v = s.start if ed["which"] == "start" else s.end
+        QToolTip.showText(e.globalPosition().toPoint(), f"{'시작' if ed['which'] == 'start' else '끝'} {v:.3f} s · 프레임 "
+                          f"{int(round(v * it.robot.fps))} · 길이 {s.duration:.2f} s", self)
+        self.update()
 
     def mouseDoubleClickEvent(self, e):
         hit = self.segment_at(e.position())
@@ -1132,20 +1396,56 @@ class TimelineTracks(QWidget):
             self.win.scene.seek(hit[0].offset + hit[1].start)
 
     def mouseMoveEvent(self, e):
-        if self._drag:
+        if self._edge is not None:
+            self._drag_edge(e)
+        elif self._drag:
             self.win.scene.seek(self._t(e.position().x()))
         else:
+            edge = self.edge_at(e.position()) is not None
+            if edge != (self.cursor().shape() == Qt.SizeHorCursor):
+                self.setCursor(Qt.SizeHorCursor) if edge else self.unsetCursor()
             self.setToolTip(self._fall_at(e.position()) or self._label_tip(e.position()))
 
-    def mouseReleaseEvent(self, _):
+    def mouseReleaseEvent(self, e):
         self._drag = False
+        ed, self._edge = self._edge, None
+        if ed is None:
+            return
+        if not ed["moved"]:  # a click on the edge: seek there, like a click anywhere
+            self.win.scene.seek(self._t(e.position().x()))
+        elif ed.get("new") is not None and ed["new"] is not ed["labels"]:
+            self.win.edit_labels(ed["item"], ed["labels"], (ed["new"], ed["preview"]),
+                                 "구간 시작 옮기기" if ed["which"] == "start" else "구간 끝 옮기기", before=ed["seg"])
+        self.update()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape and self._edge is not None:
+            self._edge = None
+            self.update()
+            return
+        super().keyPressEvent(e)
 
     def contextMenuEvent(self, e):
+        if time.monotonic() - self._no_menu < 1.0:
+            self._no_menu = 0.0
+            return
         row = self._row_at(e.pos().y())
         m = QMenu(self)
         if row is not None:
-            self.win.select(row[0])
-            self.win.motion_menu(m, row[0])
+            it, win = row[0], self.win
+            hit = self.hit_at(e.pos()) if e.pos().x() >= self.NAME_W else None
+            lane = self.lane_at(e.pos())
+            if hit is not None and hasattr(win, "label_menu"):  # a segment: its edits first
+                win.set_label_selection(hit[0], hit[2])
+                win.label_menu(m, hit[0], hit[2])
+                m.addSeparator()
+            else:
+                win.select(it)
+                if lane is not None and e.pos().x() >= self.NAME_W and hasattr(win, "label_add"):  # a gap in a lane
+                    t = self._t(e.pos().x()) - it.offset
+                    m.addAction(f"여기에 구간 추가... ({lane[1] or '라벨'} {t:.2f} s)", lambda: win.label_add(it, lane[1], t))
+                    m.addSeparator()
+            win.motion_menu(m, it)
         elif getattr(self.win, "a_show_problems", None) is not None:  # the ruler or below the rows
             m.addAction(self.win.a_show_problems)
         if not m.isEmpty():
@@ -1166,10 +1466,10 @@ class TimelineTracks(QWidget):
         if row is None or pos.y() > row[1] + self.ROW_H:  # falls are marked on the motion's bar
             return ""
         it, sc = row[0], self.win.scene
-        why = "판정" if sc.is_policy_result(sc.shown(it)) else "1차 원인"  # MuJoCo: the fall rule, not a diagnosis
         for ft, cause in sc.falls(it):
-            if abs(self._x(it.offset + ft) - pos.x()) < 6:
-                return f"{it.label}: 넘어짐 {ft:.2f}s" + (f" · {why} {cause}" if cause else "")
+            if abs(self._x(it.offset + ft) - pos.x()) < 6:  # its first cause with the numbers (MuJoCo: and the rule)
+                tip = getattr(sc, "fall_tip_at", None)
+                return f"{it.label}: " + (tip(it, ft) if tip is not None else f"넘어짐 {ft:.2f}s · {cause}")
         if sc.view.show_problems:  # the problem strips under the mouse
             lo, hi = self._span()
             px = (hi - lo) / max(1, self.width() - self.NAME_W - 10)
@@ -1325,8 +1625,7 @@ class TimelinePanel(QWidget):
 
     def _seg_refresh(self) -> None:
         sc = self.win.scene
-        key = tuple((id(it), id(it.labels), len(it.labels.segments) if it.labels is not None else -1)
-                    for it in list(sc.items))
+        key = tuple((_Same(it), _Same(it.labels)) for it in list(sc.items))  # objects: labels are replaced, not changed
         if key != self._cat_key:  # the motions or their labels changed: the list again (not every frame)
             self._cat_key = key
             cur = self._seg_key()
@@ -2077,8 +2376,8 @@ LABEL_SOURCES = {"file": "파일", "auto": "자동"}  # where a row's labels cam
 # the 데이터셋 table's columns (retlens.batch.COLUMNS): shown at first, shown once a row has a value, the rest from
 # the header's right-click menu (the user's picks are kept)
 BATCH_SHOWN = ("name", "folder", "duration_s", "retarget_score", "qc", "main_loss", "problems_s", "worst_problem")
-BATCH_WHEN_FILLED = ("objects", "hand_obj_reach_pct", "labels", "label_segments", "phys_falls", "phys_harness_pct",
-                     "phys_ok", "error")
+BATCH_WHEN_FILLED = ("objects", "hand_obj_reach_pct", "labels", "label_segments", "phys_falls", "phys_first_cause",
+                     "phys_harness_pct", "phys_ok", "error")
 
 
 class BatchModel(QAbstractTableModel):
@@ -2109,7 +2408,8 @@ class BatchModel(QAbstractTableModel):
             return (1, 0.0, "") if v is None or v == "" else (0, float(v), "") if isinstance(v, (int, float)) else (0, 0.0, str(v))
         if role == Qt.ToolTipRole:
             return "\n".join(x for x in (r.get("file"), r.get("error"), r.get("qc_notes"), r.get("phys_ok"),
-                                         r.get("phys_error")) if x)
+                                         r.get("phys_error"),
+                                         f"넘어짐 원인: {r['phys_fall_causes']}" if r.get("phys_fall_causes") else "") if x)
         if role == Qt.ForegroundRole:
             if r.get("error"):
                 return QBrush(QC_COLORS["FAIL"])
@@ -2152,7 +2452,8 @@ class BatchFilter(QSortFilterProxyModel):
             return False
         if self.text:
             hay = " ".join(str(r.get(k) or "") for k in ("name", "folder", "qc", "worst_problem", "main_loss", "error",
-                                                         "labels", "kind")).lower() + " " + LABEL_SOURCES.get(r.get("labels"), "")
+                                                         "labels", "kind", "phys_first_cause")).lower() + " " + \
+                LABEL_SOURCES.get(r.get("labels"), "")
             return all(w in hay for w in self.text.split())
         return True
 
@@ -2454,13 +2755,31 @@ class DatasetPanel(QWidget):
 
 
 class SegmentModel(QAbstractTableModel):
-    """The inspector's list of a motion's segments: track (with several), label, start, end."""
+    """The inspector's list of a motion's segments: track (with several), label, start, end. With on_edit, the
+    label, start and end can be edited: on_edit(segment, field, value) is called once the editor has closed
+    (the edit replaces the labels, which resets this list)."""
 
-    def __init__(self, it: Item, segs: list, multi: bool, parent=None):
+    def __init__(self, it: Item, segs: list, multi: bool, parent=None, on_edit=None):
         super().__init__(parent)
-        self.it, self.segs, self.multi = it, segs, multi
+        self.it, self.segs, self.multi, self.on_edit = it, segs, multi, on_edit
         self.heads = (["트랙"] if multi else []) + ["라벨", "시작 (s)", "끝 (s)"]
         self._icons: dict[tuple, QIcon] = {}
+
+    def set_segments(self, segs: list) -> None:
+        self.beginResetModel()
+        self.segs = segs
+        self.endResetModel()
+
+    def flags(self, index):
+        f = super().flags(index)
+        return f | Qt.ItemIsEditable if self.on_edit is not None and index.column() >= self.multi else f
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if role != Qt.EditRole or self.on_edit is None:
+            return False
+        seg, field = self.segs[index.row()], ("label", "start", "end")[index.column() - self.multi]
+        QTimer.singleShot(0, lambda: self.on_edit(seg, field, value))  # not inside the editor's commit
+        return True
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.segs)
@@ -2475,7 +2794,9 @@ class SegmentModel(QAbstractTableModel):
         s = self.segs[index.row()]
         c = index.column() - self.multi  # -1 track, 0 label, 1 start, 2 end
         if role == Qt.DisplayRole:
-            return (s.track, s.label, f"{s.start:.2f}", f"{s.end:.2f}")[c + 1]
+            return (s.track, s.label, f"{s.start:.3f}", f"{s.end:.3f}")[c + 1]
+        if role == Qt.EditRole:
+            return (s.track, s.label, s.start, s.end)[c + 1]
         if role == Qt.ToolTipRole:
             return segment_text(self.it, s)
         if role == Qt.DecorationRole and c == 0:
@@ -2486,6 +2807,36 @@ class SegmentModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole and c >= 1:
             return int(Qt.AlignRight | Qt.AlignVCenter)
         return None
+
+
+class SegmentDelegate(QStyledItemDelegate):
+    """Editors of the segment list: a label from the ones in use (or a new one), a time on the motion's frames."""
+
+    def __init__(self, model: SegmentModel, names, parent=None):
+        super().__init__(parent)
+        self.model, self.names = model, names
+
+    def createEditor(self, parent, option, index):
+        if index.column() - self.model.multi == 0:
+            box = QComboBox(parent)
+            box.setEditable(True)
+            box.addItems(self.names(self.model.segs[index.row()].track))
+            return box
+        spin = QDoubleSpinBox(parent)
+        spin.setDecimals(3)
+        spin.setRange(0.0, 1e6)
+        spin.setSingleStep(1.0 / max(self.model.it.robot.fps, 1.0))
+        return spin
+
+    def setEditorData(self, editor, index):
+        value = index.data(Qt.EditRole)
+        if isinstance(editor, QComboBox):
+            editor.setEditText(str(value))
+        else:
+            editor.setValue(float(value))
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText() if isinstance(editor, QComboBox) else editor.value(), Qt.EditRole)
 
 
 def segment_text(it: Item, s: motion_labels.Segment) -> str:
@@ -2526,17 +2877,18 @@ def labels_text(it: Item, lab=None) -> str:
     if lab is None:
         stem = os.path.splitext(os.path.basename(it.source))[0]
         return (f"라벨 파일이 없습니다. 모션 옆에 {stem}.labels.csv 같은 파일을 두면 열 때 붙고, 아래 '불러오기'나 "
-                "타임라인 우클릭으로 아무 라벨 파일이나 붙일 수 있습니다. '자동 라벨'은 규칙 파일대로 사람 동작을 보고 붙입니다.")
-    head = rel(lab.path).replace("\\", "/") if lab.path else "라벨"
+                "타임라인 우클릭으로 아무 라벨 파일이나 붙일 수 있습니다. '자동 라벨'은 규칙 파일대로 사람 동작을 보고 붙이고, "
+                "'＋ 구간'으로 직접 만들 수도 있습니다.")
+    head = rel(lab.path).replace("\\", "/") if lab.path else ("새로 만든 라벨" if lab.edited else "라벨")
     if lab.auto:
-        head = f"자동 라벨 · {lab.auto}" + (f"\n규칙 파일 {head}" if lab.path else "")
+        head = f"자동 라벨 · {lab.auto}" + (" · 편집함" if lab.edited else "") + (f"\n규칙 파일 {head}" if lab.path else "")
         if lab.error:
             return f"{head}\n자동 라벨을 붙이지 못함: {lab.error}"
     if lab.error:
         return f"{head}\n라벨 파일을 쓰지 못함: {lab.error}"
     tracks = [t for t in lab.tracks if t]
     text = f"{head}\n구간 {len(lab.segments)}개" + (f" · 트랙 {len(tracks)}개 ({', '.join(tracks)})" if tracks else "")
-    return text + "".join(f"\n· {n}" for n in lab.notes)
+    return text + "".join(f"\n· {'불러올 때: ' if lab.edited else ''}{n}" for n in lab.notes)
 
 
 def short_text(v: str, limit: int = 18) -> str:
@@ -3072,6 +3424,7 @@ class EditorWindow(QMainWindow):
 
         self.view = SceneView(url)
         self.setCentralWidget(self.view)
+        QApplication.instance().installEventFilter(_SceneUndoKeys(self.view))
         self.hierarchy = HierarchyPanel(self)
         self.inspector = InspectorPanel(self)
         self.scene_settings = SceneSettingsPanel(self)
@@ -3197,7 +3550,24 @@ class EditorWindow(QMainWindow):
                                                     self.dataset._add_folder()),
                            tip="촬영 세션 폴더의 모션을 모두 리타게팅·측정해 데이터셋 탭의 표에 모읍니다")
         self.a_quit = act("종료", self.close, "Ctrl+Q")
-        self.a_remove = act("선택한 모션 제거", lambda: self.remove(self.selected), "Delete")
+        self.a_remove = act("선택한 모션 제거", self.delete_selected, "Delete",
+                            tip="고른 모션을 닫습니다 (타임라인이나 구간 표에서 라벨 구간을 골랐으면 그 구간을 지움)")
+        # label editing: the picked segment of the selected motion (MotionScene.edit_labels)
+        self.a_undo = act("되돌리기", lambda: self.label_undo(), "Ctrl+Z", tip="고른 모션의 마지막 라벨 편집을 되돌립니다")
+        self.a_redo = act("다시 실행", lambda: self.label_undo(redo=True), "Ctrl+Y")
+        self.a_redo.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        self.a_rename = act("라벨 바꾸기...", self.label_rename, "F2")
+        self.a_split = act("재생 위치에서 나누기", self.label_split, "S")
+        self.a_add_seg = act("재생 위치에 구간 추가...", lambda: self.label_add_here(self.selected),
+                             tip="재생 위치의 라벨 없는 빈칸을 채우는 구간을 더합니다")
+        self.a_merge_prev = act("이전 구간과 합치기", lambda: self.label_merge(-1))
+        self.a_merge_next = act("다음 구간과 합치기", lambda: self.label_merge(1))
+        self.a_start_here = act("구간 시작을 재생 위치로", lambda: self.label_edge_here("start"), "[",
+                                tip="←/→(1/30초씩)로 재생 위치를 옮긴 뒤 누릅니다. 더 세밀하게는 구간 표에서 숫자로 고칩니다")
+        self.a_end_here = act("구간 끝을 재생 위치로", lambda: self.label_edge_here("end"), "]")
+        self.a_delete_seg = act("라벨 구간 삭제", self.label_delete, tip="Delete (타임라인이나 구간 표에서)")
+        self.a_save_labels = act("라벨 CSV로 저장...", lambda: self.selected is not None and
+                                 self.save_labels_dialog(self.selected))
         self.a_remove_all = act("모두 제거...", self.remove_all)
         for a in (self.a_video, self.a_remove, self.a_remove_all):  # select() / the items event turn them on
             a.setEnabled(False)
@@ -3214,8 +3584,14 @@ class EditorWindow(QMainWindow):
         self.a_show_problems.setChecked(sc.view.show_problems)
         self.a_physics = act("물리 모드", self.set_physics, "P", checkable=True,
                              tip="로봇을 물리 시뮬레이션 결과로 그립니다 (P). ▾에서 균형 제어를 고릅니다")
-        self.a_cancel = act("작업 취소", sc.cancel_jobs, icon=QStyle.SP_BrowserStop,
-                            tip="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화를 멈춥니다")
+        self.a_cancel = act("작업 취소", lambda: self.cancel_all(), icon=QStyle.SP_BrowserStop,
+                            tip="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화, 여는 중인 작업 세션을 멈춥니다")
+        self.a_session_open = act("작업 세션 열기...", self.open_session_dialog, "Ctrl+Shift+O")
+        self.a_session_save = act("작업 세션 저장", lambda: self.save_session(), "Ctrl+S",
+                                  tip="열린 모션(보정·시간 오프셋·보이기·라벨과 고친 라벨), 겹쳐 비교, 씬 설정, 물리 모드, "
+                                      "재생 위치를 파일 하나(.retlens)에 저장합니다. 모션 파일은 복사하지 않고 위치만 적습니다")
+        self.a_session_save_as = act("작업 세션 다른 이름으로 저장...", lambda: self.save_session_as(), "Ctrl+Shift+S")
+        self.a_session_new = act("새 작업 세션", self.new_session, "Ctrl+N", tip="열린 모션을 모두 닫고 새로 시작합니다")
         self.a_cancel.setEnabled(False)  # while jobs run (_refresh_status)
         self.a_compare = act("겹쳐 비교", lambda on: self.start_compare(on=on), "O", checkable=True,
                              tip="대상(B)을 기준(A)의 골반에 겹쳐, 벗어난 부위만 색칠합니다 (O). A·B는 비교 탭이나 "
@@ -3250,12 +3626,19 @@ class EditorWindow(QMainWindow):
         mb = self.menuBar()
         m = mb.addMenu("파일(&F)")
         m.setToolTipsVisible(True)
-        for a in (self.a_open, self.a_batch, None, self.a_video, self.a_video_dir, self.a_folders, None, self.a_settings,
-                  self.a_setup, None, self.a_quit):
-            m.addSeparator() if a is None else m.addAction(a)
+        self.m_recent = QMenu("최근 작업 세션", self)
+        self.m_recent.aboutToShow.connect(lambda: self._fill_recent_menu(self.m_recent))
+        for a in (self.a_open, self.a_batch, None, self.a_session_new, self.a_session_open, self.m_recent,
+                  self.a_session_save, self.a_session_save_as, None, self.a_video, self.a_video_dir, self.a_folders, None,
+                  self.a_settings, self.a_setup, None, self.a_quit):
+            m.addSeparator() if a is None else m.addMenu(a) if isinstance(a, QMenu) else m.addAction(a)
         m = mb.addMenu("편집(&E)")
-        m.addAction(self.a_remove)
-        m.addAction(self.a_remove_all)
+        m.setToolTipsVisible(True)
+        for a in (self.a_undo, self.a_redo, None, self.a_rename, self.a_split, self.a_add_seg, self.a_merge_prev,
+                  self.a_merge_next, self.a_start_here, self.a_end_here, self.a_delete_seg, self.a_save_labels, None,
+                  self.a_remove, self.a_remove_all):
+            m.addSeparator() if a is None else m.addAction(a)
+        self._refresh_label_actions()
         m = mb.addMenu("보기(&V)")
         for d in self.docks.values():
             m.addAction(d.toggleViewAction())
@@ -3490,6 +3873,8 @@ class EditorWindow(QMainWindow):
         return next((it for it in self.scene.items if id(it) == key), None)
 
     def select(self, item: Item | None) -> None:
+        if self.label_sel is not None and self.label_sel[0] is not item:
+            self.label_sel = None
         self.selected = item
         self.hierarchy.select(item)
         self.inspector.show_item(item)
@@ -3497,9 +3882,10 @@ class EditorWindow(QMainWindow):
         self.timeline.tracks.update()
         self.a_video.setEnabled(item is not None)
         self.a_remove.setEnabled(item is not None)
+        self._refresh_label_actions()
 
     def remove(self, item: Item | None) -> None:
-        if item is not None:
+        if item is not None and self._confirm_discard_labels([item], "제거하면"):
             self.scene.remove(item)
 
     def start_compare(self, on: bool = True, ref: Item | None = None, item: Item | None = None) -> None:
@@ -3523,10 +3909,250 @@ class EditorWindow(QMainWindow):
 
     def remove_all(self) -> None:
         items = list(self.scene.items)
-        if items and QMessageBox.question(self, "모두 제거", f"열린 모션 {len(items)}개를 모두 제거할까요?\n"
-                                                            "(파일은 그대로입니다)") == QMessageBox.Yes:
-            for it in items:
-                self.scene.remove(it)
+        if not items:
+            return
+        if any(self.scene.labels_dirty(it) for it in items):  # its question says it all
+            if not self._confirm_discard_labels(items, "모두 제거하면"):
+                return
+        elif QMessageBox.question(self, "모두 제거", f"열린 모션 {len(items)}개를 모두 제거할까요?\n"
+                                                    "(파일은 그대로입니다)") != QMessageBox.Yes:
+            return
+        for it in items:
+            self.scene.remove(it)
+
+    # ---------------------------------------------------------------- label editing (retlens.motion_labels)
+    # A segment is picked in the timeline or the inspector's list; the edits act on it, each one undo step of its
+    # motion (MotionScene.edit_labels). Edited labels stay in the window until 라벨 CSV로 저장.
+    label_sel = None  # (motion, segment) picked
+    _sel_cache = None  # (labels, segment, segment is in them): label_selection runs on every paint
+    confirm_unsaved = True  # ask before unsaved label edits go (off for smoke tests)
+
+    def label_selection(self):
+        """(motion, its labels, segment) picked, while that segment is still one of the selected motion's."""
+        sel = self.label_sel
+        if sel is None or sel[0] is not self.selected or sel[0] not in self.scene.items:
+            return None
+        it, seg = sel
+        lab = it.labels
+        if lab is None:
+            return None
+        cache = self._sel_cache
+        if cache is None or cache[0] is not lab or cache[1] is not seg:
+            self._sel_cache = cache = (lab, seg, any(s is seg for s in lab.segments))
+        return (it, lab, seg) if cache[2] else None
+
+    def set_label_selection(self, item: Item | None, seg) -> None:
+        if item is not None and item is not self.selected:
+            self.select(item)
+        self.label_sel = (item, seg) if item is not None and seg is not None else None
+        self.timeline.tracks.update()
+        self.inspector.select_segment(seg if self.label_sel is not None else None)
+        self._refresh_label_actions()
+
+    def edit_labels(self, item: Item, base, result, what: str, before=None) -> bool:
+        """Put an edit's result (new labels, segment to pick) on the motion as one undo step."""
+        new, seg = result
+        if not self.scene.edit_labels(item, base, new, what, before=before, after=seg):
+            self.status("라벨이 그사이 다른 곳(API·자동 라벨·다시 리타게팅)에서 바뀌어 이 편집은 하지 않았습니다", 8000)
+            return False
+        if new is not base:
+            self._pick_after_edit(item, seg)
+            self.status(f"{item.label}: {what} (Ctrl+Z 되돌리기)", 5000)
+        return True
+
+    def _pick_after_edit(self, item: Item, seg) -> None:
+        """The segment an edit (or undo) leaves picked; the labels event that came first saw the old one."""
+        self.label_sel = (item, seg) if seg is not None else None
+        self.timeline.tracks.update()
+        self.inspector.select_segment(seg)
+        self._refresh_label_actions()
+
+    def _edit_picked(self, what: str, make) -> None:
+        """make(motion, labels, segment) -> (new labels, segment) on the picked segment; what is wrong goes to the
+        status bar."""
+        sel = self.label_selection()
+        if sel is None:
+            self.status("고른 라벨 구간이 없습니다 (타임라인이나 인스펙터의 구간 표에서 구간을 누릅니다)", 6000)
+            return
+        it, lab, seg = sel
+        try:
+            result = make(it, lab, seg)
+        except ValueError as e:
+            self.status(str(e), 6000)
+            return
+        if result is not None:
+            self.edit_labels(it, lab, result, what, before=seg)
+
+    def _ask_label(self, title: str, text: str, track: str, current: str = "") -> str | None:
+        names = self.scene.label_names(track)
+        if current and current not in names:
+            names.insert(0, current)
+        label, ok = QInputDialog.getItem(self, title, text, names or [motion_labels.NEW_LABEL],
+                                         names.index(current) if current in names else 0, True)
+        return label.strip() if ok and label.strip() else None
+
+    def label_rename(self) -> None:
+        sel = self.label_selection()
+        if sel is None:
+            self._edit_picked("라벨 바꾸기", None)
+            return
+        label = self._ask_label("라벨 바꾸기", f"{sel[2].label} ({sel[2].start:.2f}–{sel[2].end:.2f} s)의 새 라벨:",
+                                sel[2].track, sel[2].label)
+        if label is not None:
+            self._edit_picked("라벨 바꾸기", lambda it, lab, seg: motion_labels.relabeled(lab, seg, label))
+
+    def label_split(self) -> None:
+        self._edit_picked("구간 나누기", lambda it, lab, seg: motion_labels.split(lab, seg, self.scene.t - it.offset,
+                                                                             it.robot.fps))
+
+    def label_merge(self, direction: int) -> None:
+        self._edit_picked("구간 합치기", lambda it, lab, seg: motion_labels.merged(lab, seg, direction))
+
+    def label_delete(self) -> None:
+        self._edit_picked("구간 삭제", lambda it, lab, seg: motion_labels.removed(lab, seg))
+
+    def label_edge_here(self, which: str) -> None:
+        """The picked segment's start or end to the playhead (with Left / Right: frame by frame)."""
+        def make(it, lab, seg):
+            t = self.scene.t - it.offset
+            if (which == "start" and t >= seg.end) or (which == "end" and t <= seg.start):
+                raise ValueError(f"재생 위치가 구간의 {'끝' if which == 'start' else '시작'}보다 "
+                                 f"{'뒤' if which == 'start' else '앞'}에 있습니다")
+            return motion_labels.with_bounds(lab, seg, t if which == "start" else seg.start,
+                                             t if which == "end" else seg.end, it.robot.fps, it.robot.duration)
+        self._edit_picked("구간 시작을 재생 위치로" if which == "start" else "구간 끝을 재생 위치로", make)
+
+    def edit_segment(self, item: Item, base, seg, field: str, value) -> None:
+        """An edit typed in the inspector's segment list (a cell left as it was: nothing)."""
+        if field != "label" and abs(float(value) - (seg.start if field == "start" else seg.end)) < 1e-3:
+            return
+        try:
+            if field == "label":
+                result = motion_labels.relabeled(base, seg, str(value))
+            else:
+                start, end = (float(value), seg.end) if field == "start" else (seg.start, float(value))
+                result = motion_labels.with_bounds(base, seg, start, end, item.robot.fps, item.robot.duration)
+        except ValueError as e:
+            self.status(str(e), 6000)
+            return
+        self.edit_labels(item, base, result, "라벨 바꾸기" if field == "label" else "구간 시간 고치기", before=seg)
+
+    def label_add(self, item: Item, track: str, t: float) -> None:
+        """A segment in the unlabelled gap under motion time t on a track; its label is asked first."""
+        base = item.labels
+        label = self._ask_label("구간 추가", f"{track or '라벨'} 트랙, {t:.2f} s의 빈칸에 붙일 라벨:", track)
+        if label is None:
+            return
+        try:
+            result = motion_labels.added(base, track, t, item.robot.fps, item.robot.duration, label)
+        except ValueError as e:
+            self.status(str(e), 6000)
+            return
+        self.edit_labels(item, base, result, "구간 추가")
+
+    def label_add_here(self, item: Item | None) -> None:
+        """구간 추가 at the playhead: on the picked segment's track, the only track, else a track to name."""
+        if item is None:
+            return
+        sel, lab = self.label_selection(), item.labels
+        tracks = lab.tracks if lab is not None and not lab.error else []
+        if sel is not None and sel[0] is item:
+            self.label_add(item, sel[2].track, self.scene.t - item.offset)
+        elif len(tracks) == 1:
+            self.label_add(item, tracks[0], self.scene.t - item.offset)
+        else:
+            self.label_new_track(item)
+
+    def label_new_track(self, item: Item) -> None:
+        """A label track (or the motion's first labels): its name and the first segment's label, filling the gap
+        under the playhead."""
+        lab = item.labels
+        d = QDialog(self)
+        d.setWindowTitle(f"새 라벨 트랙 - {item.label}")
+        form = QFormLayout(d)
+        track = QComboBox()
+        track.setEditable(True)
+        track.addItems(dict.fromkeys(["", *[t for it in self.scene.items if it.labels is not None for t in it.labels.tracks]]))
+        track.setToolTip("비워 두면 이름 없는 트랙 (트랙이 하나일 때 흔함)")
+        form.addRow("트랙", track)
+        label = QComboBox()
+        label.setEditable(True)
+        label.addItems(self.scene.label_names() or [motion_labels.NEW_LABEL])
+        form.addRow("첫 구간 라벨", label)
+        t = self.scene.t - item.offset
+        form.addRow(QLabel(f"재생 위치({t:.2f} s)의 빈칸을 채웁니다. 그 뒤 끝을 끌거나 나눠서 다듬습니다."))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(d.accept)
+        buttons.rejected.connect(d.reject)
+        form.addRow(buttons)
+        if d.exec() != QDialog.Accepted:
+            return
+        try:
+            result = motion_labels.added(lab, track.currentText().strip(), t, item.robot.fps, item.robot.duration,
+                                         label.currentText())
+        except ValueError as e:
+            self.status(str(e), 6000)
+            return
+        self.edit_labels(item, lab, result, "라벨 트랙 추가")
+
+    def label_undo(self, redo: bool = False) -> None:
+        item = self.selected
+        done = self.scene.undo_labels(item, redo=redo) if item is not None else None
+        if done is None:
+            self.status(f"{'다시 실행할' if redo else '되돌릴'} 라벨 편집이 없습니다"
+                        + ("" if item is not None else " (모션을 고르세요)"), 4000)
+            return
+        what, seg = done
+        self._pick_after_edit(item, seg)
+        self.status(f"{item.label}: {'다시 실행' if redo else '되돌림'} · {what}", 5000)
+
+    def delete_selected(self) -> None:
+        """Delete: the picked label segment while the timeline or the segment list has the focus, else the
+        selected motion."""
+        fw = QApplication.focusWidget()
+        here = fw is not None and (fw is self.timeline.tracks or self.inspector.isAncestorOf(fw))
+        if here and self.label_selection() is not None:
+            self.label_delete()
+        else:
+            self.remove(self.selected)
+
+    def label_menu(self, m: QMenu, it: Item, seg) -> None:
+        """A picked segment's entries (timeline and segment list right-click)."""
+        for a in (self.a_rename, self.a_split, self.a_merge_prev, self.a_merge_next, self.a_start_here, self.a_end_here,
+                  self.a_delete_seg):
+            m.addAction(a)
+
+    def _refresh_label_actions(self) -> None:
+        undo, redo = self.scene.label_undo_text(self.selected)
+        self.a_undo.setText(f"되돌리기: {undo}" if undo else "되돌리기")
+        self.a_redo.setText(f"다시 실행: {redo}" if redo else "다시 실행")
+        self.a_undo.setEnabled(undo is not None)
+        self.a_redo.setEnabled(redo is not None)
+        picked = self.label_selection() is not None
+        for a in (self.a_rename, self.a_split, self.a_merge_prev, self.a_merge_next, self.a_start_here, self.a_end_here,
+                  self.a_delete_seg):
+            a.setEnabled(picked)
+        self.a_add_seg.setEnabled(self.selected is not None)
+        lab = self.selected.labels if self.selected is not None else None
+        self.a_save_labels.setEnabled(lab is not None and (bool(lab.segments) or lab.edited))
+
+    def _confirm_discard_labels(self, items: list[Item], action: str) -> bool:
+        """Unsaved label edits on these motions: save them (each to a CSV), let them go, or not do it at all."""
+        dirty = [it for it in items if self.scene.labels_dirty(it)]
+        if not dirty or not self.confirm_unsaved:
+            return True
+        names = ", ".join(it.label for it in dirty[:5]) + (f" 외 {len(dirty) - 5}개" if len(dirty) > 5 else "")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("저장하지 않은 라벨 편집")
+        box.setText(f"{names}의 라벨을 고친 내용이 아직 저장되지 않았습니다. {action} 고친 내용이 사라집니다.")
+        save = box.addButton("저장...", QMessageBox.AcceptRole)
+        drop = box.addButton("저장하지 않음", QMessageBox.DestructiveRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is save:
+            return all(self.save_labels_dialog(it) for it in dirty)
+        return box.clickedButton() is drop
 
     def motion_menu(self, m: QMenu, it: Item) -> None:
         """A motion's right-click menu (계층, 타임라인)."""
@@ -3559,8 +4185,10 @@ class EditorWindow(QMainWindow):
         if len(sc.items) > 1:
             m.addAction("열린 모션 모두 자동 라벨", self.auto_label_all)
         m.addAction("자동 라벨 규칙 파일 고르기...", lambda: self.pick_label_rules(it if sc.has_skeleton(it) else None))
-        if lab is not None and lab.segments:
-            m.addAction("라벨을 CSV로 저장...", lambda: self.save_labels_dialog(it))
+        m.addSeparator()
+        m.addAction("새 라벨 트랙...", lambda: self.label_new_track(it))
+        if lab is not None and (lab.segments or lab.edited):
+            m.addAction("라벨 CSV로 저장...", lambda: self.save_labels_dialog(it))
 
     def reload_labels(self, it: Item) -> None:
         """다시 읽기: the label file, or the automatic labels made again (a failure is said, labels kept)."""
@@ -3618,7 +4246,7 @@ class EditorWindow(QMainWindow):
         second or more to load) and put each on its motion on the GUI thread (_on_labelled), unless it
         was removed or labelled again meanwhile. skipped: 모두 자동 라벨, said at the end with the
         robot motions it left as they were; None: one motion, said as any labels are."""
-        job = {"items": items, "done": [], "skipped": skipped}
+        job = {"items": items, "done": [], "skipped": skipped, "base": {it: it.labels for it in items}}
         for it in items:
             self._label_jobs[it] = job  # a later request for the motion wins over this one
         self.status(f"자동 라벨 계산 중: {items[0].label}" + (f" 외 {len(items) - 1}개" if len(items) > 1 else ""))
@@ -3634,7 +4262,9 @@ class EditorWindow(QMainWindow):
         job["done"].append((it, lab))
         if self._label_jobs.get(it) is job:
             del self._label_jobs[it]
-            if any(x is it for x in self.scene.items):
+            if self.scene.labels_dirty(it) and it.labels is not job["base"].get(it):  # edited meanwhile: kept
+                self.status(f"{it.label}: 자동 라벨을 계산하는 동안 라벨을 고쳐, 계산 결과는 붙이지 않았습니다", 8000)
+            elif any(x is it for x in self.scene.items):
                 self.scene.put_auto_labels(it, lab)
                 if job["skipped"] is None:
                     self._show_labels_result(it, lab)
@@ -3648,17 +4278,53 @@ class EditorWindow(QMainWindow):
             QMessageBox.warning(self, "자동 라벨", "자동 라벨을 붙이지 못한 모션은 라벨이 그대로입니다.\n\n" + "\n".join(bad[:10])
                                 + (f"\n… 외 {len(bad) - 10}개" if len(bad) > 10 else ""))
 
-    def save_labels_dialog(self, it: Item) -> None:
+    def save_labels_dialog(self, it: Item) -> bool:
+        """Save the motion's labels to a CSV (next to it as <name>.labels.csv: opened with it next time). Never
+        over a table of several motions or another kind of file; over the file they came from only when the user
+        says so. True when saved."""
+        base = it.labels
+        if base is None:
+            self.status(f"{it.label}: 저장할 라벨이 없습니다", 4000)
+            return False
         stem = os.path.splitext(os.path.basename(it.source))[0]
         start = os.path.join(os.path.dirname(it.source), f"{stem}.labels.csv")
-        path, _ = QFileDialog.getSaveFileName(self, f"라벨 저장 - {it.label}", start, "라벨 CSV (*.csv)")
-        if path:
-            try:
-                motion_labels.save_csv(it.labels, path)
-            except OSError as e:
-                QMessageBox.warning(self, "라벨 저장", f"저장하지 못했습니다:\n{e}")
-                return
-            self.status(f"라벨 저장: {path}", 8000)
+        path, _ = QFileDialog.getSaveFileName(self, f"라벨 저장 - {it.label}", start, "라벨 CSV (*.csv)",
+                                              options=QFileDialog.DontConfirmOverwrite)
+        if not path:
+            return False
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        solved = it.info.get("solved_motion")
+        why = motion_labels.overwrite_problem(path, it.source, [solved] if solved else ())
+        if why:
+            QMessageBox.warning(self, "라벨 저장", f"이 파일에는 저장하지 않습니다:\n{path}\n\n{why}\n\n다른 이름을 고르세요.")
+            return False
+        if os.path.exists(path):
+            loaded = bool(base.path) and not base.auto and not base.error and _path_key(path) == _path_key(base.path)
+            losses = motion_labels.overwrite_losses(path, base)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("라벨 덮어쓰기")
+            box.setText(("이 모션이 불러온 라벨 파일입니다" if loaded else "이미 있는 파일입니다") + f":\n{path}\n\n"
+                        "지금 라벨로 덮어쓸까요? 원래 내용은 되돌릴 수 없습니다 (Ctrl+Z는 창 안의 라벨만 되돌립니다)."
+                        + ("\n\n덮어쓰면 잃는 것:\n" + "\n".join(f"· {x}" for x in losses) if losses else ""))
+            yes = box.addButton("덮어쓰기", QMessageBox.AcceptRole)
+            box.addButton("취소", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is not yes:
+                return False
+        try:
+            motion_labels.save_csv(base, path)
+        except OSError as e:
+            QMessageBox.warning(self, "라벨 저장", f"저장하지 못했습니다 (엑셀 등에서 열려 있으면 닫고 다시 하세요):\n{e}")
+            return False
+        self.scene.labels_saved(it, base, path)
+        first = next((p for p in motion_labels.candidates(it.source, [solved] if solved else ())
+                      if os.path.isfile(p) and os.path.basename(p).lower() not in motion_labels.FOLDER_TABLES), None)
+        note = (f" · 다음에 열 때는 {os.path.basename(first)}이(가) 먼저 붙습니다"
+                if first is not None and _path_key(first) != _path_key(path) else "")
+        self.status(f"라벨 저장: {path}{note}", 12000)
+        return True
 
     def load_labels_dialog(self, it: Item) -> None:
         lab = it.labels
@@ -3837,6 +4503,12 @@ class EditorWindow(QMainWindow):
     def dropEvent(self, e):
         if e.mimeData().hasUrls():
             files = [u.toLocalFile() for u in e.mimeData().urls() if u.toLocalFile()]
+            sessions = [f for f in files if work.is_session_file(f)]
+            if sessions:  # a work session: that, alone; after the drop (its questions would hold up Explorer)
+                if len(files) > 1:
+                    self.status("작업 세션 파일과 함께 놓은 다른 파일은 열지 않았습니다", 8000)
+                QTimer.singleShot(0, lambda p=sessions[0]: self.open_session(p))
+                return
             labels = [f for f in files if motion_labels.is_label_file(f)]  # before motions: a label table is a .csv
             paths = [f for f in files if f not in labels and f.lower().endswith(MOTION_EXT)]
             alone, opened = [], [x.source for x in self.scene.items]
@@ -3975,6 +4647,7 @@ class EditorWindow(QMainWindow):
             if self.selected is not None and self.selected not in self.scene.items:
                 self.select(None)
             self.a_remove_all.setEnabled(bool(self.scene.items))
+            self._refresh_label_actions()
             self.hierarchy.rebuild()
             self.analysis.refresh_lists()
             self.scene_settings.refresh()
@@ -3986,6 +4659,10 @@ class EditorWindow(QMainWindow):
             self.hierarchy.refresh()
             self.refresh_analysis()  # the inspector too
             self._refresh_status()
+        elif event == "labels":  # edited, loaded or taken off: only what shows labels
+            self.timeline.relayout()
+            self.inspector.refresh(metrics=False)
+            self._refresh_label_actions()
         elif event == "log":
             self._append_log(str(payload))
         if event in ("items", "item", "status", "compare"):
@@ -4009,10 +4686,15 @@ class EditorWindow(QMainWindow):
         self.st_physics.setToolTip("\n".join(f"{it.label}: {sc.job_text(it)}" for it in list(sc.items)
                                              if not sc.is_sim_result(it)) if sc.physics_on else "")
         jobs = sc.jobs_summary()
+        r = self._restore
+        if r is not None:  # a work session opening
+            jobs = " · ".join(x for x in (f"작업 세션 {r.done}/{r.total}", jobs) if x)
         self.st_jobs.setText(f"작업: {jobs}")
         for w in (self.st_jobs, self.st_cancel):
             w.setVisible(bool(jobs))
         self.a_cancel.setEnabled(bool(jobs))
+        for a in (self.a_session_save, self.a_session_save_as):
+            a.setEnabled(r is None)
         if self.a_physics.isChecked() != sc.physics_on:
             self.a_physics.blockSignals(True)
             self.a_physics.setChecked(sc.physics_on)
@@ -4050,8 +4732,418 @@ class EditorWindow(QMainWindow):
             self.hierarchy.refresh()
             self.inspector.refresh(metrics=False)
             self._refresh_status()
+        if int(now) != int(prev):  # once a second: the title's *, 자동 저장 every AUTOSAVE_S
+            self._update_title()
+            if time.time() - self._autosave_at > self.AUTOSAVE_S:
+                self._autosave_at = time.time()
+                self.autosave()
 
     _play_icon = None
+
+    # ---------------------------------------------------------------- 작업 세션 (retlens/app/session.py)
+    # The window's work in one file: the open motions (corrections, time offset, visibility, labels with unsaved
+    # edits), the comparison, scene settings, physics mode, the playhead. Opening one runs in a worker (motions
+    # retarget); 자동 저장 keeps the last work (on close, and every 2 minutes) for 최근 작업 세션 > 마지막 작업.
+    session_path: str | None = None  # the session file open (None: untitled)
+    _session_clean = None  # session.fingerprint when it was last saved / opened (None: changed)
+    _restore = None  # the session.Restore running
+    _restore_cancel = False
+    _autosave_fp = None
+    _autosave_at = 0.0
+    AUTOSAVE_S = 120.0
+    RECENT_MAX = 8
+
+    def _carry_list(self) -> list:
+        return getattr(self, "_carry", [])
+
+    def _session_dirty(self) -> bool:
+        if self._restore is not None:
+            return False
+        return work.fingerprint(self.scene, self._carry_list()) != self._session_clean
+
+    def _update_title(self) -> None:
+        name = os.path.basename(self.session_path) if self.session_path else ""
+        title = f"{name}[*] - {APP_NAME}" if name else APP_NAME
+        if self.windowTitle() != title:
+            self.setWindowTitle(title)
+        self.setWindowModified(bool(name) and self._session_dirty())
+
+    def _session_base(self, path: str | None) -> str | None:
+        return os.path.dirname(os.path.abspath(path)) if path else None
+
+    def capture_session(self, base_dir: str | None) -> dict:
+        """The session to write: the scene's (session.capture) and the window's own fields."""
+        data = work.capture(self.scene, base_dir, self._carry_list())
+        items = list(self.scene.items)
+        data["selected"] = items.index(self.selected) if self.selected in items else None
+        ref = self.analysis.ref_item()
+        data["analysis"] = {"ref": items.index(ref) if ref in items else None, "graph": self.analysis.key.currentText(),
+                            "follow_s": self.analysis.follow.currentData()}
+        return data
+
+    def save_session(self, path: str | None = None) -> bool:
+        """작업 세션 저장 (untitled: 다른 이름으로). Unsaved label edits go into the session file (not to CSVs)."""
+        if self._restore is not None:
+            self.status("작업 세션을 여는 중에는 저장할 수 없습니다", 5000)
+            return False
+        path = path or self.session_path
+        if path is None:
+            return self.save_session_as()
+        try:
+            path = work.write(path, self.capture_session(self._session_base(path)))
+        except OSError as e:
+            QMessageBox.warning(self, "작업 세션 저장", f"저장하지 못했습니다:\n{path}\n\n{e}")
+            return False
+        self.session_path = path
+        self._session_clean = work.fingerprint(self.scene, self._carry_list())
+        self._recent_add(path)
+        self._update_title()
+        self.status(f"작업 세션 저장: {path}", 8000)
+        return True
+
+    def save_session_as(self) -> bool:
+        start = self.session_path or os.path.join(
+            self.settings.value(layout_key("session/dir"), "") or os.path.join(app_paths.documents_dir(), "sessions"),
+            f"세션_{time.strftime('%Y%m%d_%H%M')}{work.EXT}")
+        os.makedirs(os.path.dirname(start), exist_ok=True)
+        path, _ = QFileDialog.getSaveFileName(self, "작업 세션 저장", start, f"RetLens 작업 세션 (*{work.EXT})")
+        if not path:
+            return False
+        if not path.lower().endswith(work.EXTS):
+            path += work.EXT
+        self.settings.setValue(layout_key("session/dir"), os.path.dirname(path))
+        return self.save_session(path)
+
+    def _confirm_session(self, action: str) -> bool:
+        """A session file open with changes: save them, let them go, or not do it."""
+        if not self.session_path or not self._session_dirty() or not self.confirm_unsaved:
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("작업 세션")
+        box.setText(f"'{os.path.basename(self.session_path)}'에 저장하지 않은 변경이 있습니다. {action} 전에 저장할까요?")
+        save = box.addButton("저장", QMessageBox.AcceptRole)
+        drop = box.addButton("저장 안 함", QMessageBox.DestructiveRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is save:
+            return self.save_session()
+        return box.clickedButton() is drop
+
+    def autosave(self, force: bool = False) -> None:
+        """자동 저장 (user folder sessions\autosave.retlens): the work as it is, kept until other work replaces it
+        (the one before stays as autosave.1). Skipped while a session opens, for an empty window, for smoke runs."""
+        if self._restore is not None or not self.confirm_unsaved or not (self.scene.items or self._carry_list()):
+            return
+        fp = work.fingerprint(self.scene, self._carry_list())
+        if not force and fp == self._autosave_fp:
+            return
+        base = self._session_base(self.session_path)
+        try:
+            work.write_autosave(self.capture_session(base), self._session_dirty(), self.session_path, self._work)
+            self._autosave_fp, self._autosave_at = fp, time.time()
+        except OSError as e:  # never in the way of closing
+            self.scene.log(f"자동 저장 못 함: {type(e).__name__}: {e}")
+
+    _work = None  # this work's token (session.write_autosave keeps another work's autosave as autosave.1)
+
+    def _new_work(self) -> None:
+        self._work = os.urandom(6).hex()
+
+    def open_session_dialog(self) -> None:
+        start = self.settings.value(layout_key("session/dir"), "") or os.path.join(app_paths.documents_dir(), "sessions")
+        path, _ = QFileDialog.getOpenFileName(self, "작업 세션 열기", start,
+                                              f"RetLens 작업 세션 (*{work.EXT} *.retlens.json);;모든 파일 (*)")
+        if path:
+            self.settings.setValue(layout_key("session/dir"), os.path.dirname(path))
+            self.open_session(path)
+
+    def open_session(self, path: str, mode: str | None = None, interactive: bool = True, discard: bool = False,
+                     autosave_of: dict | None = None) -> tuple[int, str]:
+        """Open a session: (0, '') when it started, else (HTTP-like code, why). mode replace (닫고 열기) / add
+        (함께 열기); asked when motions are open (interactive), else needed. autosave_of: reopening 자동 저장
+        (its session file becomes the title, its unsaved state comes back)."""
+        try:
+            data = work.read(path)
+        except work.SessionError as e:
+            if interactive:
+                QMessageBox.warning(self, "작업 세션 열기", str(e))
+            return 400, str(e)
+        if self._restore is not None:
+            if interactive:
+                self.status("작업 세션을 여는 중입니다. 끝나거나 취소한 뒤 다시 하세요", 6000)
+            return 409, "a work session is being opened"
+        if self.scene.items and mode is None:
+            if not interactive:
+                return 409, "motions are open: give mode replace or add"
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle("작업 세션 열기")
+            jobs = self.scene.jobs_summary()
+            box.setText(f"열린 모션 {len(self.scene.items)}개를 어떻게 할까요?")
+            box.setInformativeText("함께 열기는 세션의 모션만 더하고, 씬 설정·물리 모드·겹쳐 비교는 지금 것을 둡니다."
+                                   + (f"\n닫고 열면 실행 중인 작업({jobs})은 취소됩니다." if jobs else ""))
+            replace = box.addButton("닫고 열기", QMessageBox.AcceptRole)
+            add = box.addButton("함께 열기", QMessageBox.AcceptRole)
+            box.addButton("취소", QMessageBox.RejectRole)
+            box.exec()
+            mode = "replace" if box.clickedButton() is replace else "add" if box.clickedButton() is add else None
+            if mode is None:
+                return 499, "cancelled"
+        mode = mode or "replace"
+        if mode == "replace":
+            if interactive and not self._confirm_session("다른 작업 세션을 열기"):
+                return 499, "cancelled"
+            if interactive and not self.session_path and \
+                    not self._confirm_discard_labels(list(self.scene.items), "다른 작업 세션을 열면"):
+                return 499, "cancelled"
+            if not interactive and not discard and (self.session_path and self._session_dirty()):
+                return 409, "the open work session has unsaved changes: save it first or give discard_changes"
+            if not interactive and not discard and not self.session_path and \
+                    any(self.scene.labels_dirty(it) for it in self.scene.items):
+                return 409, "labels have unsaved edits: save them first or give discard_changes"
+            self.autosave(force=True)  # the work it replaces stays as 마지막 작업
+        # relative paths start at the session file's folder; an autosave's at the folder of the session it was of
+        base = self._session_base(autosave_of.get("session_path")) if autosave_of is not None else self._session_base(path)
+        r = work.Restore(data, base, mode)
+        self._restore, self._restore_cancel = r, False
+        if mode == "replace":
+            self.label_sel, self._carry = None, []
+            self.session_path = (autosave_of or {}).get("session_path") if autosave_of is not None else path
+            if self.session_path and not os.path.isfile(self.session_path):
+                self.session_path = None
+            self._new_work()
+        self._restore_title = os.path.basename(path)
+        self._restore_interactive = interactive
+        self._restore_autosave = autosave_of
+        ready = (self._physics_ready_gui if interactive else work.mujoco_ready(self.scene))
+
+        def progress(done, total, label):
+            self.bridge.gui.emit(lambda: self._restore_progress(r, done, total, label))
+
+        def run():
+            try:
+                r.run(self.scene, cancelled=lambda: self._restore_cancel or r is not self._restore,
+                      progress=progress, physics_ready=ready)
+            except Exception as e:  # noqa: BLE001  said at the end; what opened stays
+                r.notes.append(f"작업 세션을 다 열지 못했습니다: {type(e).__name__}: {e}")
+            finally:
+                self.bridge.gui.emit(lambda: self._finish_restore(r))
+
+        threading.Thread(target=run, daemon=True, name="session-open").start()
+        self.status(f"작업 세션 여는 중: {os.path.basename(path)}")
+        self._refresh_status()
+        return 0, ""
+
+    def _physics_ready_gui(self, balance: str) -> str:
+        """session.Restore's physics_ready for a session the user opens: what that 균형 제어 needs, asked on the
+        GUI thread (the Isaac EULA, the setup assistant); '' when it may be turned on."""
+        return "" if self._gui_call(lambda: self._balance_ready(balance)) else "필요한 것이 없거나 동의하지 않음"
+
+    _restore_seen = None
+
+    def _restore_progress(self, r, done: int, total: int, label: str) -> None:
+        if r is not self._restore:
+            return
+        if self._restore_seen is not r:  # the first call: the session's scene settings are in the scene now
+            self._restore_seen = r
+            self._settings_from_scene()
+        self.status(f"작업 세션 여는 중 {done}/{total}" + (f": {label} (처음 리타게팅하는 사람 모션이면 수십 초)" if label else ""))
+        self._refresh_status()
+
+    def _settings_from_scene(self) -> None:
+        """The panels that keep their own copy of the scene's settings, from the scene again (a session put them)."""
+        old = self.scene_settings
+        self.scene_settings = SceneSettingsPanel(self)
+        self.docks["scene"].setWidget(self.scene_settings)
+        old.deleteLater()
+        self.a_show_problems.setChecked(self.scene.view.show_problems)
+        self._refresh_status()
+        self.compare_panel.refresh()
+
+    def _finish_restore(self, r) -> None:
+        if r is not self._restore:
+            return
+        self._restore = None
+        self._settings_from_scene()
+        if r.mode == "replace":
+            sel = r.item_at(r.selected) or (self.scene.items[-1] if self.scene.items else None)
+            self.select(sel)
+            a = r.analysis or {}
+            ref = r.item_at(a.get("ref"))
+            if ref is not None:
+                self.analysis.ref.setCurrentIndex(self.analysis.ref.findData(id(ref)))
+            if a.get("graph") and self.analysis.key.findText(a["graph"]) >= 0:
+                self.analysis.key.setCurrentText(a["graph"])
+            i = self.analysis.follow.findData(a.get("follow_s"))
+            if i >= 0:
+                self.analysis.follow.setCurrentIndex(i)
+            if not r.data.get("camera"):
+                self.scene.fit_camera()
+        self._carry = self._carry_list() + r.carry()
+        auto = self._restore_autosave
+        if r.mode == "replace":
+            dirty = (bool(auto.get("dirty")) if auto is not None else False) or not self._restored_as_saved(r)
+            self._session_clean = None if dirty else work.fingerprint(self.scene, self._carry_list())
+            self._autosave_fp = work.fingerprint(self.scene, self._carry_list())
+            if r.cancelled:  # part of it: saving must not write that part over the session file
+                self.session_path, self._session_clean = None, None
+        if auto is None and r.mode == "replace" and self.session_path:
+            self._recent_add(self.session_path)
+        self._remember_restore(r)
+        self._update_title()
+        self._refresh_status()
+        n = len(r.items)
+        more = len(r.failed) + (len(r.pending()) if r.cancelled else 0)
+        self.status(f"작업 세션을 {'열었습니다' if not r.cancelled else '여는 중에 멈췄습니다'}: {self._restore_title} · "
+                    f"모션 {n}개" + (f" · 열지 못함 {more}개" if more else "")
+                    + (f" · 알림 {len(r.notes)}개 (콘솔)" if r.notes and not self._restore_interactive else ""), 15000)
+        if self._restore_interactive and (r.failed or r.notes or (r.cancelled and r.pending())):
+            self._restore_report(r)
+
+    def _restored_as_saved(self, r) -> bool:
+        """Nothing changed while the session opened (it takes minutes; the motions show as they load): the motions
+        are the ones it opened, each as its entry says and not edited since, the scene settings as saved."""
+        sc = self.scene
+        if r.mode != "replace" or {id(it) for it in sc.items} != {id(it) for it in r.items.values()}:
+            return False
+        for i, it in r.items.items():
+            e = r.entries[i]
+            if it in sc.label_history or abs(it.offset - e.get("offset_s", 0.0)) > 1e-9 or \
+                    it.visible != e.get("visible", True) or it.show_human != e.get("show_human", True):
+                return False
+        view = r.data.get("view") or {}
+        return all(getattr(sc.view, k) == v for k, v in view.items() if k != "speed" and hasattr(sc.view, k))
+
+    _last_restore: dict | None = None  # what the last opening said (GET /api/session)
+
+    def _remember_restore(self, r) -> None:
+        self._last_restore = {"file": self._restore_title, "mode": r.mode, "cancelled": r.cancelled,
+                              "opened": [it.label for it in r.items.values()],
+                              "failed": [{"label": work.entry_label(e), "error": why} for e, why in r.failed],
+                              "not_opened": [work.entry_label(e) for e in r.pending()] if r.cancelled else [],
+                              "notes": list(r.notes)}
+        for n in r.notes:
+            self.scene.log(f"작업 세션: {n}")
+        for e, why in r.failed:
+            self.scene.log(f"작업 세션: 열지 못함 {work.entry_label(e)}: {why}")
+
+    def _abandon_restore(self) -> None:
+        """Stop the session being opened and keep the motions it has not opened in the work (written back on save);
+        a replace stopped half way is untitled (a save cannot write a part over its file)."""
+        r = self._restore
+        if r is None:
+            return
+        self._restore_cancel, self._restore = True, None  # the worker stops after the motion it is on
+        self._carry = self._carry_list() + r.carry()
+        if r.mode == "replace":
+            self.session_path, self._session_clean = None, None
+        self._update_title()
+        self._refresh_status()
+
+    def _restore_report(self, r) -> None:
+        """What did not open (kept in the session file) and what to know."""
+        lines = [f"· {work.entry_label(e)}: {why}" for e, why in r.failed[:15]]
+        if len(r.failed) > 15:
+            lines.append(f"… 외 {len(r.failed) - 15}개")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information if not r.failed else QMessageBox.Warning)
+        box.setWindowTitle("작업 세션 열기")
+        text = ""
+        if r.failed:
+            text += f"열지 못한 모션 {len(r.failed)}개 (세션 파일에는 그대로 남겨 둡니다):\n" + "\n".join(lines)
+        if r.cancelled and r.pending():
+            text += ("\n\n" if text else "") + (f"멈춰서 열지 않은 모션 {len(r.pending())}개는 작업에 남겨 두었습니다"
+                                                "(저장하면 함께 저장됨). 세션 파일 자체는 그대로이니, 처음부터 다시 열 수도 "
+                                                "있습니다.")
+        if r.notes:
+            text += ("\n\n" if text else "") + "\n".join(f"· {n}" for n in r.notes[:12])
+        box.setText(text)
+        drop = box.addButton("열지 못한 모션을 세션에서 빼기", QMessageBox.DestructiveRole) if r.failed else None
+        box.addButton("닫기", QMessageBox.RejectRole)
+        box.exec()
+        if drop is not None and box.clickedButton() is drop:  # as r.carry() wrote them (absolute)
+            gone = [work.rebase_entry(x, r.base_dir, None).get("file") for x, _ in r.failed]
+            self._carry = [e for e in self._carry_list() if e.get("file") not in gone]
+            self._update_title()
+
+    def new_session(self) -> None:
+        """새 작업 세션: the open motions closed (asked when the session or labels have unsaved changes)."""
+        if self._restore is not None:
+            if self.confirm_unsaved and QMessageBox.question(self, "새 작업 세션", "작업 세션을 여는 중입니다. 멈추고 새로 "
+                                                             "시작할까요? (지금까지의 작업은 자동 저장에 남습니다)") != QMessageBox.Yes:
+                return
+            self._abandon_restore()
+        if not self._confirm_session("새 작업 세션을 시작하기"):
+            return
+        if not self.session_path and not self._confirm_discard_labels(list(self.scene.items), "새 작업 세션을 시작하면"):
+            return
+        self.autosave(force=True)
+        work.clear(self.scene)
+        self.session_path, self._carry, self.label_sel = None, [], None
+        self._session_clean = work.fingerprint(self.scene, [])
+        self._new_work()
+        self._update_title()
+
+    def cancel_all(self) -> None:
+        """작업 취소: physics and video jobs, and a session being opened (after the motion it is on)."""
+        self.scene.cancel_jobs()
+        if self._restore is not None:
+            self._restore_cancel = True
+            self.status("작업 세션 열기를 멈추는 중 (지금 모션이 끝나면)", 6000)
+
+    def _recent(self) -> list[str]:
+        v = self.settings.value(layout_key("session/recent"), [])
+        return [p for p in ([v] if isinstance(v, str) else v or []) if isinstance(p, str) and p]
+
+    def _recent_add(self, path: str) -> None:
+        path = os.path.abspath(path)
+        keep = [p for p in self._recent() if _path_key(p) != _path_key(path)]
+        self.settings.setValue(layout_key("session/recent"), [path, *keep][:self.RECENT_MAX])
+
+    def _fill_recent_menu(self, m: QMenu) -> None:
+        m.clear()
+        for p in self._recent():
+            a = m.addAction(f"{os.path.basename(p)} — {os.path.dirname(p)}", lambda p=p: self.open_session(p))
+            if not os.path.isfile(p):
+                a.setEnabled(False)
+                a.setText(a.text() + " (없음)")
+        if self._recent():
+            m.addSeparator()
+        for n, what in ((0, "마지막 작업"), (1, "그 전 작업")):
+            info = work.autosave_info(n)
+            if info is not None:
+                when = str(info["saved_at"]).replace("T", " ")[5:16]
+                m.addAction(f"{what} (자동 저장 · {when} · 모션 {info['motions']}개)",
+                            lambda info=info: self.open_session(info["path"], autosave_of=info))
+        m.addSeparator()
+        a = m.addAction("시작할 때 마지막 작업 열기")
+        a.setCheckable(True)
+        a.setChecked(self.settings.value(layout_key("session/restore_on_start"), False, type=bool))
+        a.toggled.connect(lambda on: self.settings.setValue(layout_key("session/restore_on_start"), on))
+        m.addAction("목록 지우기", lambda: self.settings.setValue(layout_key("session/recent"), []))
+
+    def open_startup(self, inputs: list[str], options: bool = False) -> None:
+        """The command line's files: a session among them opens as it was saved, without questions (only that: other
+        files are left out); none and 시작할 때 마지막 작업 열기 on: the last work (자동 저장), unless options
+        (--physics, the corrections) were given, which it would replace."""
+        sessions = [p for p in inputs if work.is_session_file(p)]
+        motions = [p for p in inputs if not work.is_session_file(p)]
+        if sessions:
+            self.open_session(sessions[0], mode="replace", interactive=False, discard=True)
+            if len(inputs) > 1:
+                self.scene.log(f"작업 세션 {os.path.basename(sessions[0])}만 엽니다 (함께 준 다른 파일은 열지 않음)")
+            return
+        if not motions and not options and self.confirm_unsaved and \
+                self.settings.value(layout_key("session/restore_on_start"), False, type=bool):
+            info = work.autosave_info(0)
+            if info is not None:
+                self.open_session(info["path"], mode="replace", interactive=False, autosave_of=info)
+        elif not motions:
+            if work.autosave_info(0) is not None:
+                self.status("지난 작업은 파일 > 최근 작업 세션 > 마지막 작업으로 엽니다", 10000)
+        if motions:
+            self.add_paths(motions)
 
     def _about(self) -> None:
         from . import runtime
@@ -4068,6 +5160,19 @@ class EditorWindow(QMainWindow):
                                           f"<b>파일 위치</b><table>{where}</table>")
 
     def closeEvent(self, e):
+        if self._restore is not None and self.confirm_unsaved and QMessageBox.question(
+                self, "작업 세션", "작업 세션을 여는 중입니다. 지금 끄면 아직 열지 않은 모션은 열지 않고, 지금까지의 "
+                                 "작업은 자동 저장에 남깁니다. 끌까요?") != QMessageBox.Yes:
+            e.ignore()
+            return
+        if self._restore is None and not self._confirm_session("종료하기"):  # a session file with changes
+            e.ignore()
+            return
+        # untitled work: unsaved label edits asked about (a session file holds its edits; 저장 안 함 let them go)
+        if not self.session_path and self._restore is None and \
+                not self._confirm_discard_labels(list(self.scene.items), "종료하면"):
+            e.ignore()
+            return
         setup = self._setup
         if setup is not None and setup.running:  # an install in the (maybe hidden) 설치 도우미
             name = setup.prereqs.NAMES[setup.running]
@@ -4077,6 +5182,8 @@ class EditorWindow(QMainWindow):
                 return
             setup.cancel.set()
             setup.worker.join(timeout=15)  # downloads and unpacks stop at the next chunk / file and clean up
+        self._abandon_restore()  # closing is certain now: what has not opened stays in the work, which is kept
+        self.autosave(force=True)
         self.settings.setValue(layout_key("window/geometry"), self.saveGeometry())
         self.settings.setValue(layout_key("window/state"), self.saveState())
         self.timer.stop()
@@ -4151,10 +5258,14 @@ def run(argv=None) -> int:
     url = f"http://127.0.0.1:{port}/?hideViserLogo"
     win = EditorWindow(scene, url, args.library, accept_eula=args.isaac_accept_eula)
     win.auto_setup = args.quit_after <= 0  # smoke tests must not stop at the first-start 환경 설정
+    win.confirm_unsaved = args.quit_after <= 0  # nor at a question about unsaved label edits
     win.show()
     if args.physics:
         win.a_physics.setChecked(True)
-    win.add_paths(args.inputs)
+    win._session_clean = work.fingerprint(scene, [])  # an empty untitled window is not "changed"
+    win._new_work()
+    win.open_startup(args.inputs, options=bool(args.physics or args.foot_flat or args.swing_clearance
+                                               or args.self_collision or args.body_mesh))
     win.view.loadFinished.connect(lambda ok: scene.log(
         f"scene view {'loaded' if ok else 'FAILED to load'}: {win.view.url().toString()}"))
     if args.quit_after > 0:

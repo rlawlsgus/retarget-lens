@@ -287,6 +287,8 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         ok = np.isfinite(P).all(axis=2)
         flags["marker_gap"] = (~ok[:, ok.any(axis=0)].all(axis=1), item.human.fps)  # markers never seen do not count
     out["_problems"] = problems.problem_spans(flags, m.fps)  # where on the timeline (retlens.problems)
+    from .diagnosis import cause_counts_text  # 물리: 넘어짐 원인 (falls per first cause, in the clip)
+
     phys = item.info.get("physics")
     if phys:  # from the Isaac run's json
         harness = (phys.get("harness_force_per_body_weight") or {}).get("mean")
@@ -295,6 +297,11 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         out["phys_falls"] = phys.get("falls")
         out["phys_saturated_pct"] = float("nan") if saturated is None else 100 * saturated
         out["phys_ok"] = "통과" if phys.get("consistent") else "; ".join(map(_issue_ko, phys.get("issues", []))) or "?"
+        diags = phys.get("fall_diagnosis") or []  # the run keeps the first 20
+        causes = cause_counts_text(diags)
+        if causes and (phys.get("falls") or 0) > len(diags):
+            causes += f" (앞 {len(diags)}회)"
+        out["phys_fall_causes"] = causes or None
     pol = item.info.get("policy_replay")
     if pol:  # MuJoCo (tools/policy_replay.py, RetLens's 균형 제어): the harness, or none
         out["phys_harness_pct"] = 0.0
@@ -302,6 +309,7 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         out["phys_saturated_pct"] = 100 * pol.get("torque_saturated_ratio", float("nan"))
         out["phys_body_error_cm"] = pol.get("body_error_cm")
         out["phys_ok"] = "통과" if not pol.get("falls") else f"넘어짐 {pol['falls']}회"
+        out["phys_fall_causes"] = cause_counts_text(pol.get("fall_diagnosis") or []) or None  # falls in the clip
         if pol.get("controller") == "harness":
             harness = (pol.get("harness_force_per_body_weight") or {}).get("mean")
             out["phys_harness_pct"] = float("nan") if harness is None else 100 * harness

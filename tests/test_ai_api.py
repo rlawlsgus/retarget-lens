@@ -192,6 +192,26 @@ def test_http_api(tmp_path, monkeypatch):
         assert _call(f"{u}/api/labels", t, {"id": a, "auto": "false"})[0] == 400
         assert _call(f"{u}/api/labels", t, {"id": a, "auto": True, "path": str(typed)})[0] == 400
         assert _call(f"{u}/api/labels", t, {"id": a, "rules": str(rules)})[0] == 400
+        # label editing: one undo step each, unsaved until saved; nothing replaces unsaved edits without saying so
+        lab_url = f"{u}/api/labels"
+        code, out = _call(lab_url, t, {"id": a, "edit": "split", "index": 1, "time_s": 0.8,
+                                       "expect": {"label": "walk", "start_s": 0.5}})
+        assert code == 200 and out["segment"] == 1 and out["labels"]["unsaved_edits"] and out["labels"]["undo"] == "구간 나누기"
+        assert [s["end_s"] for s in out["labels"]["segments"]] == [0.5, 0.8, 1.0]
+        assert _call(lab_url, t, {"id": a, "edit": "rename", "index": 0, "label": "x", "expect": {"label": "no"}})[0] == 409
+        assert _call(lab_url, t, {"id": a, "edit": "split", "index": 0, "time_s": 5})[0] == 422  # not inside it
+        assert _call(lab_url, t, {"id": a, "edit": "delete", "index": 9})[0] == 404
+        assert _call(lab_url, t, {"id": a, "edit": "fold", "index": 0})[0] == 400
+        assert _call(lab_url, t, {"id": a, "path": str(typed)})[0] == 409  # would replace the edits
+        assert _call(f"{u}/api/remove", t, {"id": a})[0] == 409
+        dest = tmp_path / "edited.labels.csv"
+        code, out = _call(lab_url, t, {"id": a, "save": str(dest)})
+        assert code == 200 and dest.is_file() and not out["labels"]["unsaved_edits"]
+        assert _call(lab_url, t, {"id": a, "save": str(dest)})[0] == 409  # there now: only with overwrite
+        assert _call(lab_url, t, {"id": a, "save": str(dest), "overwrite": True})[0] == 200
+        assert _call(lab_url, t, {"id": a, "save": "relative.csv"})[0] == 400
+        code, out = _call(lab_url, t, {"id": a, "edit": "undo"})  # back to the file's labels (saved, not unsaved)
+        assert code == 200 and out["done"] == "구간 나누기" and len(out["labels"]["segments"]) == 2
         assert _call(f"{u}/api/labels", t, {"id": a, "path": None})[1]["labels"] is None
         code, out = _call(f"{u}/api/item", t, {"id": b, "offset_s": 0.25, "visible": False})
         assert code == 200 and out["offset_s"] == 0.25 and out["visible"] is False
@@ -209,6 +229,17 @@ def test_http_api(tmp_path, monkeypatch):
         assert _call(f"{u}/api/screenshot", t, {})[0] == 409  # headless: no window
         code, out = _call(f"{u}/api/help", t)
         assert code == 200 and "POST /api/compare" in out["endpoints"]
+        # 작업 세션: saved, the motions closed, opened again with their offsets (headless: synchronously)
+        sess = str(tmp_path / "work.retlens")
+        _call(f"{u}/api/item", t, {"id": b, "offset_s": 0.4})
+        code, out = _call(f"{u}/api/session", t, {"save": sess})
+        assert code == 200 and os.path.isfile(sess) and out["motions"] == 2
+        assert _call(f"{u}/api/session", t, {"save": sess})[0] == 409  # there now: only with overwrite
+        assert _call(f"{u}/api/session", t, {"open": sess})[0] == 409  # motions are open: replace or add?
+        code, out = _call(f"{u}/api/session", t, {"open": sess, "mode": "replace"})
+        assert code == 200 and len(out["opened"]) == 2 and not out["failed"]
+        assert [m["offset_s"] for m in _call(f"{u}/api/status", t)[1]["motions"]] == [0.0, 0.4]
+        assert _call(f"{u}/api/session", t, {"open": str(typed), "mode": "add"})[0] == 400  # not a session
         assert _call(f"{u}/api/remove", t, {"id": b})[1]["removed"] == b
     finally:
         srv.stop()

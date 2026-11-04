@@ -4,7 +4,7 @@ jobs, analysis data and their 3D drawing in a viser scene. No widgets here; a fr
 its controls to the attributes and methods below and listens for changes:
 
     scene = MotionScene(server, load_robot_urdf(urdf), SceneOptions(...))
-    scene.listen(lambda event, payload: ...)   # "items", "item", "status", "time", "log"
+    scene.listen(lambda event, payload: ...)   # "items", "item", "labels", "status", "time", "log"
     scene.add("data/raw/cmu_bvh/02_01.bvh")
     scene.tick(dt)                              # advance playback and pose everything
 
@@ -26,7 +26,7 @@ import numpy as np
 
 from .. import analysis, motion_labels, objects, paths, policy_runner, problems, settings
 from ..compare import Item, compute_metrics, load_item, load_skeleton
-from ..diagnosis import CAUSE_KO
+from ..diagnosis import CAUSE_KO, cause_counts_text, evidence_text
 from ..io import urdf_joint_limits
 from ..physics_runner import PHYSICS_CONFIG, PhysicsJob, PhysicsRunner
 from ..rotations import matrix_to_quat, quat_mul, quat_to_matrix
@@ -70,7 +70,7 @@ METRIC_ROWS = [  # (label, metrics key, format)
     ("CoM 지지 밖 (%)", "com_out_pct", "{:.1f}"), ("ZMP 지지 밖 (%)", "zmp_out_pct", "{:.1f}"),
     ("정적 불균형 (%)", "static_unbalanced_pct", "{:.1f}"), ("QC", "qc", "{}"),
     ("물리: 보조 힘 (체중 %)", "phys_harness_pct", "{:.1f}"), ("물리: 넘어짐", "phys_falls", "{}"),
-    ("물리: 몸 위치 오차 (cm)", "phys_body_error_cm", "{:.1f}"),
+    ("물리: 넘어짐 원인", "phys_fall_causes", "{}"), ("물리: 몸 위치 오차 (cm)", "phys_body_error_cm", "{:.1f}"),
     ("물리: 토크 한계 초과 (%)", "phys_saturated_pct", "{:.1f}"), ("물리 판정", "phys_ok", "{}"),
 ]
 # properties of the retarget itself: the table keeps them in physics mode (from the kinematic motion)
@@ -138,6 +138,8 @@ METRIC_HELP = [
         ("물리: 보조 힘 (체중 %)", "골반을 받쳐 준 보조 힘의 평균, 체중 대비(보조 힘 모드: MuJoCo, Isaac). MuJoCo 균형 제어 "
                                 "없음·GMT는 보조 힘이 없어 0입니다."),
         ("물리: 넘어짐", "시뮬레이션에서 넘어진 횟수(클립 안). 넘어지면 그 시각의 원본 자세로 다시 시작해 셉니다."),
+        ("물리: 넘어짐 원인", "넘어짐(클립 안)마다 직전 0.75초에서 먼저 시작된 조건(1차 원인)의 횟수: 발끝 걸림, 발 "
+                          "미끄러짐, 자기충돌 근접, 토크 포화, 지지면 이탈, 보조 힘 급증. 많은 순(Isaac은 앞 20회만)."),
         ("물리: 몸 위치 오차 (cm)", "MuJoCo 결과만: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치가 원본과 다른 정도의 평균. "
                               "추적 정책은 관절을 바꿔서라도 몸을 원본 자리에 두려 하므로, 관절 RMSE보다 이 값이 따라간 정도를 잘 보여 줍니다."),
         ("물리: 토크 한계 초과 (%)", "관절 토크가 모터 한계를 넘은 비율(Isaac은 프레임, MuJoCo는 1 ms 스텝)."),
@@ -364,6 +366,8 @@ class MotionScene:
         self._phys_errors: dict = {}  # per phys_key: why its runs cannot start
         self._solved_skeletons: dict = {}  # C3D solved takes' skeletons for 자동 라벨 (_skeleton), the last few
         self.playlist: dict | None = None  # 라벨 구간 이어 재생 (play_segments)
+        # label edits per motion: {"undo": [(labels, segment before, segment after, what)], "redo": [...]}
+        self.label_history: dict[Item, dict] = {}
         self._version = 0  # bumped by every event; with the time and settings it decides redraws
         self._drawn_key, self._drawn_at = None, 0.0
         self._listeners: list[Callable[[str, object], None]] = []
@@ -402,17 +406,32 @@ class MotionScene:
                 print(f"[scene] listener failed on {event}: {type(e).__name__}: {e}", flush=True)
 
     # ---------------------------------------------------------------- items
-    def add(self, path: str) -> Item:
-        """Load (retarget when needed) and show a motion file; raises on failure."""
-        o = self.opts
-        item = load_item(path, robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps,
-                         smpl_model_dir=o.smpl_model_dir, swing_clearance=o.swing_clearance_cm / 100.0,
-                         foot_flat=o.foot_flat, self_collision=o.self_collision, log=self.log)
+    def add(self, path: str, retarget: dict | None = None, color: tuple | None = None,
+            prepare: Callable[[Item], None] | None = None) -> Item:
+        """Load (retarget when needed) and show a motion file; raises on failure.
+        retarget: this motion's corrections instead of the 리타게팅 menu's ({smooth_hz, foot_flat,
+        swing_clearance_cm, self_collision}, any of them; a saved work session). color: its colour when no other
+        open motion has it. prepare(item): runs before the motion is shown (offset, visibility, labels, which it then
+        sets itself: _find_labels looks next to the motion), so the first frame and the one "items" event already
+        have them; an exception from it is raised and the motion is not shown."""
+        o, r = self.opts, retarget or {}
+        swing = float(r.get("swing_clearance_cm", o.swing_clearance_cm) or 0.0)
+        if not 0.0 <= swing <= 10.0:
+            raise ValueError(f"swing_clearance_cm must be 0-10, not {swing}")
+        item = load_item(path, robot=o.robot, smooth=float(r.get("smooth_hz", o.smooth)), fps=o.fps, csv_fps=o.csv_fps,
+                         smpl_model_dir=o.smpl_model_dir, swing_clearance=swing / 100.0,
+                         foot_flat=bool(r.get("foot_flat", o.foot_flat)),
+                         self_collision=bool(r.get("self_collision", o.self_collision)), log=self.log)
         compute_metrics(item, self.fk, self.limits)
-        self._find_labels(item)
+        if prepare is None:
+            self._find_labels(item)
+        else:  # its labels too (a work session: the ones it had, or looked for again)
+            prepare(item)
         with self.lock:
             used = {it.color for it in self.items}
-            item.color = next((c for c in PALETTE if c not in used), PALETTE[len(self.items) % len(PALETTE)])
+            color = tuple(int(c) for c in color) if color is not None else None
+            item.color = (color if color in PALETTE and color not in used
+                          else next((c for c in PALETTE if c not in used), PALETTE[len(self.items) % len(PALETTE)]))
             base, n = item.label, 2
             while any(it.label == item.label for it in self.items):
                 item.label = f"{base} ({n})"
@@ -445,6 +464,7 @@ class MotionScene:
                 except Exception:
                     pass
             self.items.remove(item)
+            self.label_history.pop(item, None)
             for i, it in enumerate(self.items):
                 it.handles["index"] = i
             if item in (self.compare.ref, self.compare.item):
@@ -460,12 +480,16 @@ class MotionScene:
     def _find_labels(self, item: Item) -> None:
         """The label file next to the motion, if there is one. A broken one is kept with its error
         (shown in the inspector); it never stops the motion from opening."""
-        try:
-            item.labels = motion_labels.load_for(item.source, item.robot.fps, item.robot.duration,
-                                                 also=[item.info.get("solved_motion")])
-        except Exception as e:
-            item.labels = motion_labels.MotionLabels(path="", error=f"{type(e).__name__}: {e}")
+        item.labels = self._found_labels(item)
         self._log_labels(item)
+
+    @staticmethod
+    def _found_labels(item: Item):
+        try:
+            return motion_labels.load_for(item.source, item.robot.fps, item.robot.duration,
+                                          also=[item.info.get("solved_motion")])
+        except Exception as e:
+            return motion_labels.MotionLabels(path="", error=f"{type(e).__name__}: {e}")
 
     def _log_labels(self, item: Item) -> None:
         lab = item.labels
@@ -477,11 +501,10 @@ class MotionScene:
     def set_labels(self, item: Item, path: str | None):
         """Show this label file's segments on the motion (None: no labels; files are never changed)."""
         solved = item.info.get("solved_motion")  # a C3D goes by its solved motion's name in seq too
-        item.labels = None if not path else motion_labels.load(path, item.source, item.robot.fps, item.robot.duration,
-                                                               also=[solved] if solved else ())
-        self._log_labels(item)
-        self.emit("item", item)
-        return item.labels
+        lab = None if not path else motion_labels.load(path, item.source, item.robot.fps, item.robot.duration,
+                                                       also=[solved] if solved else ())
+        self._replace_labels(item, lab, "라벨 불러오기" if path else "라벨 빼기")
+        return lab
 
     def reload_labels(self, item: Item):
         """Read the motion's label file again (after editing it), or look for one next to it;
@@ -494,9 +517,9 @@ class MotionScene:
             return self.auto_label(item, lab.path or None)
         if lab is not None and lab.path and not lab.found:
             return self.set_labels(item, lab.path)
-        self._find_labels(item)
-        self.emit("item", item)
-        return item.labels
+        found = self._found_labels(item)
+        self._replace_labels(item, found, "라벨 다시 읽기")
+        return found
 
     def auto_label(self, item: Item, rules: str | None = None):
         """Label the motion by a rule file (retlens.autolabel): rules, else the 자동 라벨 규칙 setting.
@@ -523,10 +546,119 @@ class MotionScene:
         if lab.error:
             self.log(f"  {item.label}: no auto labels ({lab.error}); its labels stay as they were")
             return lab
-        item.labels = lab
-        self._log_labels(item)
-        self.emit("item", item)
+        self._replace_labels(item, lab, "자동 라벨")
         return lab
+
+    # ---------------------------------------------------------------- label editing (retlens.motion_labels)
+    # Every change puts new labels on the motion (motion_labels' edits never change labels in place) and is one
+    # step of the motion's undo history; labels from a file or the rules replacing them are a step too, so a
+    # mistaken 다시 읽기 or 빼기 is undone like an edit. Unsaved edits: the labels' edited flag.
+    UNDO_LIMIT = 200
+
+    def _push_undo(self, item: Item, old, before, after, what: str) -> None:
+        h = self.label_history.setdefault(item, {"undo": [], "redo": []})
+        if old is not None:  # a snapshot keeps only its segments: the index is made again when it comes back
+            old.__dict__.pop("_idx_cache", None)
+        h["undo"].append((old, before, after, what))
+        del h["undo"][:-self.UNDO_LIMIT]
+        h["redo"].clear()
+
+    def _replace_labels(self, item: Item, lab, what: str) -> None:
+        with self.lock:
+            old = item.labels
+            if item in self.items and old is not lab and (old is not None or lab is not None):
+                self._push_undo(item, old, None, None, what)
+            item.labels = lab
+        self._log_labels(item)
+        self._labels_changed(item)
+
+    def edit_labels(self, item: Item, base, new, what: str, before=None, after=None) -> bool:
+        """Put edited labels (made from `base`) on the motion as one undo step; False (nothing done) when its
+        labels are no longer `base` (changed meanwhile: the API, 자동 라벨, another edit) or it was removed.
+        before / after: the segment selected before and after, given back by undo / redo."""
+        with self.lock:
+            if item not in self.items or item.labels is not base:
+                return False
+            if new is base:  # nothing changed: no step, not unsaved
+                return True
+            self._push_undo(item, base, before, after, what)
+            item.labels = new
+        self._labels_changed(item)
+        return True
+
+    def undo_labels(self, item: Item, redo: bool = False):
+        """Undo (or redo) the motion's last label change; (what, segment to select) or None when there is none."""
+        with self.lock:
+            h = self.label_history.get(item)
+            if not h or not h["redo" if redo else "undo"]:
+                return None
+            labels, before, after, what = h["redo" if redo else "undo"].pop()
+            h["undo" if redo else "redo"].append((item.labels, before, after, what))
+            item.labels = labels
+        self._labels_changed(item)
+        return what, (after if redo else before)
+
+    def label_undo_text(self, item: Item | None) -> tuple[str | None, str | None]:
+        """What undo and redo would do for the motion (None: nothing)."""
+        h = self.label_history.get(item) if item is not None else None
+        return (h["undo"][-1][3] if h and h["undo"] else None), (h["redo"][-1][3] if h and h["redo"] else None)
+
+    @staticmethod
+    def labels_dirty(item: Item) -> bool:
+        """The motion's labels have edits that are not in a file yet."""
+        lab = item.labels
+        return lab is not None and lab.edited
+
+    def labels_saved(self, item: Item, base, path: str):
+        """`base` was written to path (motion_labels.save_csv): edited labels become that file's labels (not
+        unsaved; 다시 읽기 reads that file). Labels saved as they were stay as they are. None when the motion's
+        labels are no longer `base`."""
+        with self.lock:
+            if item.labels is not base:
+                return None
+            if base.edited:
+                item.labels = motion_labels.MotionLabels(path=os.path.abspath(path), segments=base.segments)
+            # labels in the undo history read from that file are not what it holds now: unsaved if they come back
+            key = os.path.normcase(os.path.abspath(path))
+            h = self.label_history.get(item, {})
+            for stack in (h.get("undo", []), h.get("redo", [])):
+                for k, (lab, before, after, what) in enumerate(stack):
+                    if lab is not None and not lab.edited and lab.path and lab.segments is not base.segments \
+                            and os.path.normcase(os.path.abspath(lab.path)) == key:
+                        stack[k] = (replace(lab, edited=True), before, after, what)
+        self._log_labels(item)
+        self._labels_changed(item)
+        return item.labels
+
+    def label_names(self, track: str | None = None) -> list[str]:
+        """Labels on the open motions, for picking one: the track's own first, the most used first."""
+        from collections import Counter
+
+        on_track, others = Counter(), Counter()
+        for it in list(self.items):
+            lab = it.labels
+            for s in (lab.segments if lab is not None else []):
+                (on_track if track is not None and s.track == track else others)[s.label] += 1
+        names = [n for n, _ in on_track.most_common()]
+        return names + [n for n, _ in others.most_common() if n not in on_track]
+
+    def _labels_changed(self, item: Item) -> None:
+        self._refresh_playlist(item)
+        self.emit("labels", item)
+
+    def _refresh_playlist(self, item: Item) -> None:
+        """Segments being played (유형별 재생) after this motion's labels changed: the list again, at the segment
+        under the playhead (one new dict: the tick thread reads it)."""
+        pl = self.playlist
+        if pl is None or not any(it is item for it, _s in pl["segments"]):
+            return
+        segs = self.segment_list(pl["key"])
+        if not segs:
+            self.stop_segments()
+            return
+        index = next((k for k, (it, s) in enumerate(segs) if it.offset + s.start <= self.t < it.offset + s.end),
+                     min(pl["index"], len(segs) - 1))
+        self.playlist = {**pl, "segments": segs, "index": index}
 
     def has_skeleton(self, item: Item) -> bool:
         """A human skeleton to label: its own, or for C3D markers the solved take's (not a robot motion)."""
@@ -860,14 +992,18 @@ class MotionScene:
         new = self._load_with(item, ff, sw, scol)
         new.info["previous_retarget"] = {**{k: r.get(k) for k in ("foot_flat", "swing_clearance_cm", "self_collision")},
                                          "score": item.metrics.get("retarget_score")}
-        new.labels, new.label, new.color, new.offset = item.labels, item.label, item.color, item.offset
+        new.label, new.color, new.offset = item.label, item.color, item.offset
         new.visible, new.show_human = item.visible, item.show_human
         with self.lock:
             if item not in self.items:
                 raise ValueError(f"{item.label}: 이미 제거된 모션입니다")
+            new.labels = item.labels  # under the lock: an edit made while it retargeted stays
+            history = self.label_history.pop(item, None)
             i = self.items.index(item)
             self.remove(item)
             self.items.insert(i, new)
+            if history is not None:
+                self.label_history[new] = history
             for k, it in enumerate(self.items):
                 it.handles["index"] = k
             self._build_item(new, i)
@@ -1271,16 +1407,23 @@ class MotionScene:
         return item
 
     def result_text(self, phys: Item) -> str:
-        """'넘어짐 0 · 몸 위치 오차 4.5 cm · ...' of a simulated motion."""
+        """'넘어짐 2 (발끝 걸림 1 · 지지면 이탈 1) · 몸 위치 오차 4.5 cm · ...' of a simulated motion (the first causes
+        when the result has them)."""
         m = phys.metrics
         pol = phys.info.get("policy_replay")
+        diags = (pol or phys.info.get("physics", {})).get("fall_diagnosis") or []
+        causes = cause_counts_text(diags, top=2)
+        falls = m.get("phys_falls") or 0
+        if causes and not pol and isinstance(falls, int) and falls > len(diags):  # Isaac diagnoses its first 20
+            causes += f", 앞 {len(diags)}회"
+        causes = f" ({causes})" if causes else ""
         if pol:
             hold = f" (+{pol['hold_falls']} 끝난 뒤)" if pol.get("hold_falls") else ""
             err = f"{m['phys_body_error_cm']:.1f}" if m.get("phys_body_error_cm") is not None else "-"
             pull = f" · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중" if pol.get("controller") == "harness" else ""
-            return (f"넘어짐 {m.get('phys_falls', '-')}{hold}{pull} · 몸 위치 오차 {err} cm · "
+            return (f"넘어짐 {m.get('phys_falls', '-')}{causes}{hold}{pull} · 몸 위치 오차 {err} cm · "
                     f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
-        return (f"넘어짐 {m.get('phys_falls', '-')} · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중 · "
+        return (f"넘어짐 {m.get('phys_falls', '-')}{causes} · 보조 힘 {m.get('phys_harness_pct', 0):.0f}% 체중 · "
                 f"토크 한계 초과 {m.get('phys_saturated_pct', 0):.1f}%")
 
     def _result_tag(self, phys: Item) -> str:
@@ -1349,24 +1492,86 @@ class MotionScene:
             + ([f"동영상 {vids}개"] if vids else [])
         return " · ".join(parts)
 
+    FALL_NOTE_LEAD_S = 0.75  # the name tag shows a fall at most this long before it (a cause may start long before)
+
     def fall_note(self, phys: Item, local: float) -> str:
-        """'넘어짐 2.07s · 발끝 걸림 1.47s부터' from the first cause's onset until shortly after the fall
-        (MuJoCo results: '넘어짐 2.07s · 기울어짐', the rule that called it a fall)."""
-        if "policy_replay" in phys.info:
-            for t, rule in self.falls_of(phys):
-                if t <= local <= t + 0.5:
-                    return f"넘어짐 {t:.2f}s · {rule}"
-            return ""
-        for d in (phys.info.get("physics", {}).get("fall_diagnosis") or []):
-            t, onset = d.get("fall_time_s", 0.0), d.get("primary_onset_s")
-            start = onset if onset is not None else t
+        """'넘어짐 2.07s · 발끝 걸림 1.47s부터' from the first cause's onset (at most FALL_NOTE_LEAD_S before) until
+        shortly after the fall; a result without causes (MuJoCo before them): '넘어짐 2.07s · 기울어짐', the rule."""
+        for d in self.fall_details(phys):
+            t, onset = d["time_s"], d["onset_s"]
+            start = max(onset, t - self.FALL_NOTE_LEAD_S) if onset is not None else t
             if start <= local <= t + 0.5:
-                cause = CAUSE_KO.get(d.get("primary_cause"), d.get("primary_cause") or "미상")
-                return f"넘어짐 {t:.2f}s · {cause} {start:.2f}s부터"
-        for t in phys.info.get("physics", {}).get("fall_times_s") or []:
-            if t <= local <= t + 0.5:
-                return f"넘어짐 {t:.2f}s"
+                after = " (클립이 끝난 뒤)" if d["after_clip"] else ""
+                why = (f" · {d['cause_ko']} {onset:.2f}s부터" if d["cause"] and onset is not None else
+                       f" · {d['cause_ko']}" if d["cause"] else f" · {d['rule_ko']}" if d["rule_ko"] else "")
+                return f"넘어짐 {t:.2f}s{after}{why}"
         return ""
+
+    @staticmethod
+    def fall_details(src: Item) -> list[dict]:
+        """Every fall of a simulated motion, in time order: {"time_s", "cause" (retlens.diagnosis id, or None when
+        the result has no diagnosis), "cause_ko", "onset_s", "rule" (MuJoCo's fall rule) and "rule_ko",
+        "after_clip" (MuJoCo: while holding the last pose), "evidence" (the cause's numbers), "others" (the
+        other conditions found: [(cause, onset_s, already on when the window opened, on since)]), "why_none" (no
+        cause: the diagnosis failed, or Isaac diagnosed only its first 20)}."""
+        def one(t, d, rule, after, why_none=""):
+            d = d or {}
+            cause = d.get("primary_cause")
+            return {"time_s": float(t), "cause": cause, "cause_ko": CAUSE_KO.get(cause, cause or ""),
+                    "onset_s": d.get("primary_onset_s"), "rule": rule, "rule_ko": FALL_RULE_KO.get(rule, rule or ""),
+                    "after_clip": after, "evidence": d.get("primary_evidence") or {},
+                    "others": [(c["cause"], c.get("onset_s"), c.get("active_at_window_start", False),
+                                c.get("active_since_s"))
+                               for c in d.get("candidates") or [] if c.get("cause") != cause],
+                    "why_none": "" if cause else why_none}
+
+        pol = src.info.get("policy_replay")
+        if pol:  # MuJoCo: in the clip, then while holding its last pose (older results: the rules only)
+            failed = f"원인 분석 실패: {pol['fall_diagnosis_error']}" if pol.get("fall_diagnosis_error") else ""
+            diag = {round(d.get("fall_time_s", 0.0), 3): d for d in pol.get("fall_diagnosis") or []}
+            hold = {round(d.get("fall_time_s", 0.0), 3): d for d in pol.get("hold_fall_diagnosis") or []}
+            rules, hold_rules = pol.get("fall_causes") or [], pol.get("hold_fall_causes") or []
+            out = [one(t, diag.get(round(t, 3)), rules[k] if k < len(rules) else None, False, failed)
+                   for k, t in enumerate(pol.get("fall_times_s") or [])]
+            return out + [one(t, hold.get(round(t, 3)), hold_rules[k] if k < len(hold_rules) else None, True, failed)
+                          for k, t in enumerate(pol.get("hold_fall_times_s") or [])]
+        p = src.info.get("physics", {})
+        diag = {round(d.get("fall_time_s", 0.0), 3): d for d in p.get("fall_diagnosis") or []}
+        later = f"원인 분석은 앞 {len(diag)}회만" if diag else ""
+        return [one(t, diag.get(round(t, 3)), None, False, later) for t in p.get("fall_times_s") or []]
+
+    def fall_tip(self, src: Item, d: dict) -> str:
+        """A fall explained in a few lines (the timeline's hover, the inspector): its first cause with the numbers,
+        the other conditions, the rule that called it a fall."""
+        t = d["time_s"]
+        head = f"넘어짐 {t:.2f}s" + (" (클립이 끝난 뒤)" if d["after_clip"] else "")
+        lines = []
+        if d["cause"]:
+            onset = d["onset_s"]
+            head += f" · 1차 원인 {d['cause_ko']}" + (f" ({onset:.2f}s부터, {t - onset:.2f}초 전)" if onset is not None else "")
+            pol = src.info.get("policy_replay")
+            assist = (1.0 if pol.get("controller") == "harness" else 0.0) if pol else \
+                src.info.get("physics", {}).get("harness_scale", 1.0)
+            ev = evidence_text(d["cause"], d["evidence"], assist)
+            if ev:
+                lines.append(f"근거: {ev}")
+            others = [f"{CAUSE_KO.get(c, c)} ({(since if before and since is not None else o):.2f}s부터"
+                      f"{' 계속' if before else ''})" for c, o, before, since in d["others"] if o is not None][:3]
+            if others:
+                lines.append("함께: " + ", ".join(others))
+            if d["rule_ko"]:
+                lines.append(f"넘어짐 판정: {d['rule_ko']}")
+        elif d["why_none"]:
+            head += f" · {d['why_none']}" + (f" · 판정 {d['rule_ko']}" if d["rule_ko"] else "")
+        elif d["rule_ko"]:
+            head += f" · 판정 {d['rule_ko']} (원인 분석이 없는 이전 결과)"
+        return "\n".join([head, *lines])
+
+    def fall_tip_at(self, item: Item, t: float) -> str:
+        """fall_tip of the shown result's fall at motion time t."""
+        src = self.shown(item)
+        d = next((d for d in self.fall_details(src) if abs(d["time_s"] - t) < 1e-6), None)
+        return self.fall_tip(src, d) if d is not None else f"넘어짐 {t:.2f}s"
 
     @staticmethod
     def object_rows(item: Item) -> list[tuple[str, str]]:
@@ -1446,7 +1651,7 @@ class MotionScene:
         pl = self.playlist
         if pl is None:
             return None
-        self._goto_segment((pl["index"] + direction) % len(pl["segments"]))
+        self._goto_segment((pl["index"] + direction) % len(pl["segments"]), pl)
         return pl["segments"][pl["index"]]
 
     def stop_segments(self) -> None:
@@ -1460,8 +1665,11 @@ class MotionScene:
         if pl is not None:
             self.emit("time")
 
-    def _goto_segment(self, i: int) -> None:
-        pl = self.playlist
+    def _goto_segment(self, i: int, pl: dict | None = None) -> None:
+        """To segment i of this playlist (the one read by the caller: a label edit may have replaced it since)."""
+        pl = pl if pl is not None else self.playlist
+        if pl is None or pl is not self.playlist or not 0 <= i < len(pl["segments"]):
+            return
         pl["index"] = i
         it, s = pl["segments"][i]
         if it not in self.items:  # removed meanwhile
@@ -1490,12 +1698,12 @@ class MotionScene:
                 self.emit("time")
                 return
             nxt = 0
-        self._goto_segment(nxt)
+        self._goto_segment(nxt, pl)
 
     def playlist_state(self) -> dict | None:
         """What 유형별 재생 is doing (front ends show it): key, position, the segment and its motion."""
         pl = self.playlist
-        if pl is None:
+        if pl is None or not 0 <= pl["index"] < len(pl["segments"]):
             return None
         it, s = pl["segments"][pl["index"]]
         return {"key": pl["key"], "index": pl["index"], "count": len(pl["segments"]), "solo": pl["solo"],
@@ -1536,11 +1744,18 @@ class MotionScene:
 
     @staticmethod
     def falls_of(src: Item) -> list[tuple[float, str]]:
+        """(time, first cause) of each fall; a MuJoCo result without causes: the fall rule; after the clip (MuJoCo
+        holds its last pose): '클립이 끝난 뒤'. Light: the timeline asks on every paint."""
         pol = src.info.get("policy_replay")
-        if pol:  # MuJoCo: the fall rule, and the falls while holding the last pose after the clip
+        if pol:
+            diag = {round(d.get("fall_time_s", 0.0), 3): d.get("primary_cause") for d in pol.get("fall_diagnosis") or []}
+            hold = {round(d.get("fall_time_s", 0.0), 3): d.get("primary_cause")
+                    for d in pol.get("hold_fall_diagnosis") or []}
             rules = pol.get("fall_causes") or []
-            return [(t, FALL_RULE_KO.get(r, r)) for t, r in zip(pol.get("fall_times_s") or [], rules)] \
-                + [(t, "클립이 끝난 뒤") for t in pol.get("hold_fall_times_s") or []]
+            clip = [(t, CAUSE_KO.get(diag.get(round(t, 3)), "") or FALL_RULE_KO.get(r, r))
+                    for t, r in zip(pol.get("fall_times_s") or [], rules)]
+            return clip + [(t, "클립이 끝난 뒤" + (f" · {CAUSE_KO.get(hold[round(t, 3)], '')}" if hold.get(round(t, 3)) else ""))
+                           for t in pol.get("hold_fall_times_s") or []]
         p = src.info.get("physics", {})
         diag = {round(d.get("fall_time_s", 0.0), 3): d.get("primary_cause") for d in p.get("fall_diagnosis") or []}
         return [(t, CAUSE_KO.get(diag.get(round(t, 3)), "")) for t in p.get("fall_times_s") or []]

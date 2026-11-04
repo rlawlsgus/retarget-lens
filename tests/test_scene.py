@@ -497,3 +497,123 @@ def test_batched_kinematics_match_the_urdf(scene):
         for li, link in enumerate(rb.links):
             ref = T_base[k] @ urdf.get_transform(link, urdf.base_link)
             assert np.allclose(T[li, k], ref, atol=1e-9), link
+
+
+def test_label_edits_undo_and_save(scene, tmp_path, monkeypatch):
+    """라벨 편집: each edit (and a file's labels replacing them) is one undo step of its motion; an edit made from
+    labels that changed meanwhile is refused; saved edits become the file's labels; the history follows the motion
+    when it is retargeted again and goes when it is removed."""
+    from retlens import motion_labels as ml
+
+    a = scene.add(SAMPLE)
+    events = []
+    scene.listen(lambda e, p: events.append(e))
+    try:
+        base = ml.MotionLabels(path="a.labels.csv", segments=[ml.Segment(label="걷기", start=0.0, end=0.5),
+                                                               ml.Segment(label="서기", start=0.5, end=1.0)])
+        a.labels = base
+        new, seg = ml.split(base, base.segments[0], 0.2, a.robot.fps)
+        assert scene.edit_labels(a, base, new, "구간 나누기", before=base.segments[0], after=seg)
+        assert a.labels is new and scene.labels_dirty(a) and "labels" in events
+        assert scene.label_undo_text(a) == ("구간 나누기", None)
+        assert not scene.edit_labels(a, base, new, "다시")  # made from labels that are no longer there: refused
+        assert scene.edit_labels(a, new, new, "그대로") and scene.label_undo_text(a)[0] == "구간 나누기"  # no step
+        assert scene.undo_labels(a) == ("구간 나누기", base.segments[0]) and a.labels is base
+        assert not scene.labels_dirty(a) and scene.label_undo_text(a) == (None, "구간 나누기")
+        assert scene.undo_labels(a, redo=True) == ("구간 나누기", seg) and a.labels is new
+        path = str(tmp_path / "a.labels.csv")
+        ml.save_csv(new, path)
+        saved = scene.labels_saved(a, new, path)
+        assert not scene.labels_dirty(a) and saved.path == os.path.abspath(path) and not saved.edited
+        assert scene.labels_saved(a, new, path) is None  # not those labels any more
+        scene.set_labels(a, None)  # 빼기 is a step too
+        assert a.labels is None and scene.undo_labels(a) == ("라벨 빼기", None) and a.labels is saved
+        assert set(scene.label_names()) == {"걷기", "서기"}
+        hist = scene.label_history[a]
+        a.retarget = {"foot_flat": False, "swing_clearance_cm": 0.0, "self_collision": False}
+        monkeypatch.setattr(scene, "_load_with", lambda item, ff, sw, sc: scene_module_load(item))
+        b = scene.retarget_again(a, foot_flat=True)
+        assert b.labels is saved and scene.label_history.get(b) is hist and a not in scene.label_history
+        scene.remove(b)
+        assert b not in scene.label_history
+    finally:
+        scene._listeners.pop()
+        for it in list(scene.items):
+            scene.remove(it)
+
+
+def scene_module_load(item):
+    """A retarget stand-in: the same motion again (test_label_edits_undo_and_save)."""
+    import copy
+
+    new = copy.copy(item)
+    new.handles, new.info, new.metrics = {}, dict(item.info), dict(item.metrics)
+    return new
+
+
+def test_undo_after_saving_over_the_file_is_unsaved(scene, tmp_path):
+    """Saved over the file the labels came from, then undone: what comes back is no longer in that file."""
+    from retlens import motion_labels as ml
+
+    a = scene.add(SAMPLE)
+    try:
+        path = str(tmp_path / "x.labels.csv")
+        ml.save_csv(ml.MotionLabels(path="", segments=[ml.Segment("a", 0.0, 1.0)]), path)
+        loaded = scene.set_labels(a, path)
+        new, _seg = ml.relabeled(loaded, loaded.segments[0], "b")
+        assert scene.edit_labels(a, loaded, new, "라벨 바꾸기")
+        ml.save_csv(new, path)
+        scene.labels_saved(a, new, path)
+        assert not scene.labels_dirty(a)
+        scene.undo_labels(a)
+        assert a.labels.segments[0].label == "a" and scene.labels_dirty(a)
+    finally:
+        scene.remove(a)
+
+
+def test_fall_causes_shown(scene):
+    """넘어짐 원인: a MuJoCo result's falls with their first causes (clip and after it), the name tag from the onset
+    (at most FALL_NOTE_LEAD_S before), the hover text, the result line, the API's falls; a failed diagnosis, an
+    older result and Isaac's first 20 say so."""
+    from types import SimpleNamespace as NS
+
+    from retlens.app import api_core
+
+    toe = {"fall_time_s": 0.5, "primary_cause": "toe_catch", "primary_onset_s": 0.3,
+           "primary_evidence": {"feet": ["left_ankle_roll_link"], "clip_foot_speed_mps": [0.9],
+                                "clip_clearance_cm": [3.0], "sim_sole_height_cm": [0.2], "contact_force_n": [310]},
+           "candidates": [{"cause": "toe_catch", "onset_s": 0.3, "active_at_window_start": False, "active_since_s": 0.3},
+                          {"cause": "support_exit", "onset_s": 0.2, "active_at_window_start": True,
+                           "active_since_s": 0.05}], "rule": "tilt"}
+    exit_ = {"fall_time_s": 2.5, "primary_cause": "support_exit", "primary_onset_s": 1.2, "primary_evidence": {},
+             "candidates": [], "rule": "drop"}
+    slip = {"fall_time_s": 3.2, "primary_cause": "foot_slip", "primary_onset_s": 3.0, "primary_evidence": {},
+            "candidates": [], "rule": "low"}
+    pol = {"controller": "pd", "falls": 2, "fall_times_s": [0.5, 2.5], "fall_causes": ["tilt", "drop"], "hold_falls": 1,
+           "hold_fall_times_s": [3.2], "hold_fall_causes": ["low"], "first_fall_cause": "toe_catch",
+           "fall_diagnosis": [toe, exit_], "hold_fall_diagnosis": [slip]}
+    src = NS(info={"policy_replay": pol}, metrics={"phys_falls": 2, "phys_body_error_cm": 9.0, "phys_saturated_pct": 20.0})
+    assert scene.falls_of(src) == [(0.5, "발끝 걸림"), (2.5, "지지면 이탈"), (3.2, "클립이 끝난 뒤 · 발 미끄러짐")]
+    assert scene.fall_note(src, 0.35) == "넘어짐 0.50s · 발끝 걸림 0.30s부터" and scene.fall_note(src, 0.1) == ""
+    assert scene.fall_note(src, 1.5) == "" and scene.fall_note(src, 1.8) == "넘어짐 2.50s · 지지면 이탈 1.20s부터"
+    assert scene.fall_note(src, 3.1) == "넘어짐 3.20s (클립이 끝난 뒤) · 발 미끄러짐 3.00s부터"
+    tip = scene.fall_tip(src, scene.fall_details(src)[0])
+    assert tip.splitlines()[0] == "넘어짐 0.50s · 1차 원인 발끝 걸림 (0.30s부터, 0.20초 전)"
+    assert "근거: 왼발" in tip and "함께: 지지면 이탈 (0.05s부터 계속)" in tip and tip.endswith("넘어짐 판정: 기울어짐")
+    assert scene.result_text(src).startswith("넘어짐 2 (발끝 걸림 1 · 지지면 이탈 1) (+1 끝난 뒤)")
+    falls = api_core.falls_info(scene, src)
+    assert [(f["time_s"], f["cause_id"], f["rule"], f["after_clip"]) for f in falls] == [
+        (0.5, "toe_catch", "tilt", False), (2.5, "support_exit", "drop", False), (3.2, "foot_slip", "low", True)]
+    assert falls[0]["others"][0]["since_s"] == 0.05 and falls[2]["cause"] == "클립이 끝난 뒤 · 발 미끄러짐"
+    failed = NS(info={"policy_replay": {**pol, "fall_diagnosis": [], "hold_fall_diagnosis": [],
+                                        "fall_diagnosis_error": "ValueError: x"}}, metrics={})
+    assert scene.falls_of(failed)[0] == (0.5, "기울어짐")
+    assert "원인 분석 실패: ValueError: x" in scene.fall_tip(failed, scene.fall_details(failed)[0])
+    old = NS(info={"policy_replay": {"fall_times_s": [0.5], "fall_causes": ["tilt"]}}, metrics={})
+    assert scene.fall_tip(old, scene.fall_details(old)[0]).endswith("판정 기울어짐 (원인 분석이 없는 이전 결과)")
+    isaac = NS(info={"physics": {"fall_times_s": [float(t) for t in range(25)], "harness_scale": 1.0, "fall_diagnosis": [
+        {"fall_time_s": float(t), "primary_cause": "support_exit", "primary_onset_s": t - 0.2} for t in range(20)]}},
+        metrics={"phys_falls": 25})
+    assert "(지지면 이탈 20, 앞 20회)" in scene.result_text(isaac)
+    assert scene.fall_details(isaac)[22]["why_none"] == "원인 분석은 앞 20회만"
+

@@ -33,10 +33,10 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 | `align REF FILE...` | 기준에 시간 자동 정렬(다리 관절각이 가장 잘 맞는 오프셋) | `offsets_s`, `notes` |
 | `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM] [--self-collision]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장 | `out`, `frames`, `fps`, `kind` |
 | `autolabel FILE... [--rules R.yaml] [--out DIR] [--summary]` | 자동 라벨: 규칙 파일대로 사람 동작을 보고 구간 라벨(리타게팅 없이). `--out`이면 라벨을 붙인 모션마다 그 폴더 안에 `<이름>.labels.csv`(구간이 없으면 열 이름만). 이름이 겹치면 원래 폴더 구조를 그 아래에, 같은 폴더의 `X.c3d`·`X.bvh`는 `c3d\`·`bvh\` 아래에 둠. 실패한 모션은 지난 실행의 CSV를 지움. 종료 코드 1 = 모두 실패, 2 = 일부 실패 | `rules`, `motions[]`(file, labels{auto, tracks, segments[], notes, error}, csv, csv_removed) |
-| `batch FILE\|DIR... [--physics] [--rules R.yaml] [--csv OUT.csv]` + 리타게팅 보정 옵션 | 데이터셋 일괄 처리: 폴더 아래 모션마다 리타게팅·측정한 한 줄(점수, QC, 주된 감점, 문제 구간 초, 품질·발 지표, 물체 닿음, 라벨, `--physics`면 MuJoCo 보조 힘 결과). 파일·설정별로 캐시되어 다시 돌리면 끝난 것은 바로 나옴. 종료 코드 2 = 일부 못 읽음 | `motions`, `read`, `errors`, `total_s`, `qc_fail`, `qc_warn`, `with_falls`, `labelled`, `rows[]`, `csv` |
+| `batch FILE\|DIR... [--physics] [--rules R.yaml] [--csv OUT.csv]` + 리타게팅 보정 옵션 | 데이터셋 일괄 처리: 폴더 아래 모션마다 리타게팅·측정한 한 줄(점수, QC, 주된 감점, 문제 구간 초, 품질·발 지표, 물체 닿음, 라벨, `--physics`면 MuJoCo 보조 힘 결과와 `phys_first_cause`(첫 넘어짐 원인)·`phys_fall_causes`(원인별 횟수, 클립 안)). 파일·설정별로 캐시되어 다시 돌리면 끝난 것은 바로 나옴. 종료 코드 2 = 일부 못 읽음 | `motions`, `read`, `errors`, `total_s`, `qc_fail`, `qc_warn`, `with_falls`, `first_fall_causes`({원인: 모션 수}), `labelled`, `rows[]`, `csv` |
 | `summary FILE\|DIR... [--rules R.yaml] [--csv OUT.csv]` | 데이터셋 요약(리타게팅 없이): 폴더 아래 모션마다 길이, 라벨(옆의 라벨 파일, `--rules`면 자동 라벨) 트랙·라벨별 시간, FBX 물체. 폴더별·라벨별 합계. 종료 코드 2 = 일부 못 읽음 | `total_s`, `total_h`, `per_folder`, `per_label`(seconds, segments, share_pct), `files[]`(duration_s, labels, label_seconds, objects, error), `csv` |
 | `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이) | 마커 수, `missing_pct`, `most_missing`, `longest_gap_s`, `spike_frames` |
-| `physics FILE [--balance harness]` | 물리 검사. 기본은 MuJoCo 골반 보조 힘(클립당 몇 초, 라이선스 동의 불필요). `--balance pd`/`gmt`는 MuJoCo 제어기 없음 / GMT, `isaac [--assist 1]`은 Isaac PhysX(짧은 클립 약 1분, EULA 동의 필요) | `physics.metrics`(phys_falls, phys_harness_pct, phys_saturated_pct, phys_body_error_cm, phys_ok), `physics.falls[]` |
+| `physics FILE [--balance harness]` | 물리 검사. 기본은 MuJoCo 골반 보조 힘(클립당 몇 초, 라이선스 동의 불필요). `--balance pd`/`gmt`는 MuJoCo 제어기 없음 / GMT, `isaac [--assist 1]`은 Isaac PhysX(짧은 클립 약 1분, EULA 동의 필요) | `physics.metrics`(phys_falls, phys_fall_causes, phys_harness_pct, phys_saturated_pct, phys_body_error_cm, phys_ok), `physics.falls[]`(`time_s`, `cause`(한글), `cause_id`, `onset_s`, `rule`(MuJoCo 판정), `after_clip`, `evidence`, `others`), `physics.first_fall_cause` |
 | `video FILE [--out X.mp4] [--physics [--balance B]]` | Isaac으로 녹화(EULA 동의 필요). `--physics`면 그 균형 제어로 시뮬레이션한 결과를 녹화 | `video` 경로 |
 | `setup [--offline]` | 설치 도우미 점검: Blender·GMT·Isaac Sim·SMPL-X가 이 PC에 있는지, 없으면 설치할 수 있는지(GPU·드라이버·디스크·인터넷·쓰기 권한) | `components[]`(key, state, action, found, detail, note, requirements[], license) |
 | `setup --install KEY [--accept-license] [--source ZIP]` | 그 구성 요소를 필요할 때만 설치. 이미 호환되는 것이 있으면 아무것도 받지 않음 | 설치 뒤 상태 |
@@ -78,11 +78,15 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 | `GET /api/library?query=walk` | 모션 파일 목록 |
 | `POST /api/open {"paths": [...]}` | 열기(창에 나타나고 선택됨) |
 | `POST /api/retarget {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 리타게팅 보정(창의 "리타게팅" 메뉴). 다음에 여는 사람 모션부터 적용되고, 이미 연 모션은 그대로입니다. 지금 설정은 `/api/status`의 `retarget` |
-| `POST /api/remove {"id"}` | 닫기 |
+| `POST /api/remove {"id", "discard_edits"?}` | 닫기. 라벨에 저장하지 않은 편집이 있으면 409(`discard_edits: true`는 사용자가 버려도 된다고 했을 때만) |
 | `GET /api/motion?id=...` | 모션 하나의 QC·지표·C3D·물리·구간 라벨 |
 | `POST /api/item {"id", "visible"?, "offset_s"?, "show_human"?}` | 보이기, 시간 오프셋, 사람 스켈레톤 |
 | `POST /api/labels {"id", "path"?}` | 구간 라벨: `path` 파일을 붙임 / `"path": null`이면 뺌 / `path`가 없으면 다시 읽음(모션 옆에서 찾은 라벨은 열 때처럼 다시 찾고, 고른 파일은 그 파일을) |
-| `POST /api/labels {"id", "auto": true, "rules"?}` | 자동 라벨: 규칙 파일(`rules`, 없으면 사용자가 고른 설정)대로 붙임. 붙일 수 없으면(로봇 모션, 깨진 규칙) 422이고 라벨은 그대로 |
+| `POST /api/labels {"id", "auto": true, "rules"?}` | 자동 라벨: 규칙 파일(`rules`, 없으면 사용자가 고른 설정)대로 붙임. 붙일 수 없으면(로봇 모션, 깨진 규칙) 422이고 라벨은 그대로. 저장하지 않은 편집이 있으면 위 둘과 함께 409(`discard_edits: true`) |
+| `POST /api/labels {"id", "edit", "index"?, "expect"?, ...}` | 라벨 편집(창과 같은 한 단계, Ctrl+Z로 되돌림): `bounds {"start_s"?, "end_s"?}`, `rename {"label"}`, `split {"time_s"}`, `delete`, `merge {"with": "next"\|"prev"}`, `add {"track", "time_s", "label"}`(그 시각의 빈칸을 채움), `undo`, `redo`. `index`는 `labels.segments`의 순서, `expect {"label", "start_s"}`가 다르면 409(그사이 바뀜). 시간은 모션 초, 프레임에 맞춰짐. 답의 `segment`는 편집한/새 구간의 순서. `labels.unsaved_edits`, `undo`, `redo` |
+| `POST /api/labels {"id", "save": true \| "D:/x.labels.csv", "overwrite"?}` | 라벨을 CSV로 저장(`true`: 모션 옆 `<이름>.labels.csv`). 있는 파일은 `overwrite: true`일 때만(무엇을 잃는지 409 메시지에), 폴더의 여러 모션 표·라벨 파일이 아닌 파일에는 저장하지 않음 |
+| `GET /api/session` | 작업 세션: 열린 세션 파일(`path`), 바뀜(`dirty`), 여는 중이면 `restoring {done, total, current}`, 열지 못한 모션(`unresolved`) |
+| `POST /api/session {"save": true \| "C:/x.retlens", "overwrite"?}` / `{"open": PATH, "mode": "replace"\|"add", "discard_changes"?}` | 작업 세션 저장 / 열기(열린 모션, 보정, 시간 오프셋, 보이기, 라벨(고친 것 포함), 겹쳐 비교, 씬 설정, 물리 모드, 재생 위치). 여는 것은 바로 돌아오고 `GET /api/session`의 `restoring`이 없어질 때까지 기다린 뒤 `last_open`(열린 모션, `failed`, `notes`)을 봅니다. 모션이 열려 있으면 `mode`가 필요(409). `replace`는 열린 세션에 저장하지 않은 변경이 있거나, 세션 파일이 없는 작업에 저장하지 않은 라벨 편집이 있으면 409(`discard_changes`). `add`는 모션만 더하고(씬 설정·물리·겹쳐 비교는 그대로), API로 열면 물리 모드는 MuJoCo 보조 힘·없음만 다시 켭니다(GMT·Isaac은 꺼진 채, `notes`에 나옴) |
 | `POST /api/playback {"play"?, "time_s"?, "speed"?, "loop"?}` | 재생/정지, 시각 이동 |
 | `GET /api/metrics?ref=...` | 분석 표 |
 | `POST /api/align {"ref"}` | 시간 자동 정렬 |
@@ -157,7 +161,8 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | `static_unbalanced_pct` | 정적 불균형 (%) | 거의 멈춘 채 CoM이 발 밖 2 cm 넘게 0.2 s 이상 | 5% 넘으면 QC WARN, 로봇이 설 수 없는 자세. 디딤발이 평평하지 않은 리타겟이면 `--foot-flat`으로 다시 봄 |
 | (표만) | 기준 대비 다리 / 전체 RMSE (°) | 기준과 겹치는 구간의 관절별 RMSE 중앙값 | 같은 촬영의 다른 소스끼리 몇 도 이내면 일치 |
 | `phys_harness_pct` | 물리: 보조 힘 (체중 %) | 골반 보조 힘 평균(MuJoCo 없음·GMT는 0) | 클수록 로봇 혼자 균형 잡기 어려움 |
-| `phys_falls` | 물리: 넘어짐 | 넘어진 횟수 | 0이 목표. `physics.falls[]`에 시각과 1차 원인(MuJoCo는 넘어짐 판정 기준) |
+| `phys_falls` | 물리: 넘어짐 | 넘어진 횟수 | 0이 목표. `physics.falls[]`에 시각과 1차 원인(MuJoCo·Isaac 모두, `cause_id`), MuJoCo는 넘어짐 판정 기준(`rule`)도 |
+| `phys_fall_causes` | 물리: 넘어짐 원인 | 1차 원인별 횟수, 많은 순(같으면 발끝 걸림·발 미끄러짐·자기충돌 근접·토크 포화·지지면 이탈·보조 힘 급증 순. 예: `지지면 이탈 7 · 발끝 걸림 1 · 토크 포화 1`, Isaac은 앞 20회만이면 `(앞 20회)`) | 넘어짐 직전 0.75초에 먼저 시작된 조건. `toe_catch`(발끝 걸림) → 스윙 발 보정, `support_exit`(지지면 이탈)이고 `evidence.clip_com_margin_cm` < 0이면 원본 자체가 불균형(디딤발 평평 보정·`static_unbalanced_pct`), `self_collision` → 자기 관통 보정, `torque_saturation` → `evidence.joint`, `foot_slip` → `planted_slip_pct`. GMT에서는 정책이 발을 일부러 디디고 있어도 발끝 걸림으로 나올 수 있음 |
 | `phys_body_error_cm` | 물리: 몸 위치 오차 (cm) | MuJoCo 결과만: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치가 원본과 다른 평균 | CMU 17클립에서 GMT 3–7 cm, 제어기 없음 7–11 cm |
 | `phys_saturated_pct` | 물리: 토크 한계 초과 (%) | 관절 토크가 모터 한계를 넘은 프레임 | |
 | `phys_ok` | 물리 판정 | "통과" 또는 걸린 기준 | 넘어짐 없음, 보조 힘 > 체중 20% 프레임 5% 이하, 토크 초과 5% 이하 |
@@ -170,7 +175,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 2. **같은 촬영의 두 소스 비교(예: CMU 02_01 BVH vs AMASS SMPL-X):**
    - `compare A B --align`으로 부위별 평균·최대와 `worst_moments`를 받습니다.
    - 창이 떠 있으면 `/api/open` → `/api/align` → `/api/compare` → `/api/playback {"time_s": <worst>}` → `/api/screenshot`으로 그 순간을 보여 줍니다.
-3. **로봇이 실제로 할 수 있는 동작인지:** `physics FILE`(기본 MuJoCo 보조 힘, 클립당 몇 초, 동의 필요 없음. `--balance isaac`은 EULA 동의가 필요하고 약 1분) → `phys_ok`, `falls[]`(MuJoCo는 넘어짐 판정 규칙, Isaac은 1차 원인, 예: 발끝 걸림)를 보고, 원인이 스윙 발이면 `retarget --swing-clearance 2.5`로 다시 만들어 비교합니다.
+3. **로봇이 실제로 할 수 있는 동작인지:** `physics FILE`(기본 MuJoCo 보조 힘, 클립당 몇 초, 동의 필요 없음. `--balance isaac`은 EULA 동의가 필요하고 약 1분) → `phys_ok`, `phys_fall_causes`, `falls[].cause_id`와 `evidence`(예: `toe_catch` 발끝 걸림)를 보고, 원인이 스윙 발이면 `retarget --swing-clearance 2.5`로 다시 만들어 비교합니다.
 4. **서 있는데 균형이 안 맞는 클립(`static_unbalanced_pct`가 높음):**
    - `inspect FILE`과 `inspect FILE --foot-flat`을 비교합니다. 보정으로 정적 불균형이 내려가면, 원인은 디딤발이 바닥에 평평하게 붙지 않던 리타겟입니다. `foot_flat.stance_tilt_deg`(디딤발 기울기 전→후)와 두 발 높이차(`foot_flat.two_feet_height_diff_cm`)로 확인합니다. 기준 자세가 이미 발 pitch를 맞추므로 `stance_pitch_deg`는 크게 바뀌지 않을 수 있습니다. 골반을 낮춘 높이(`foot_flat.root_drop_cm`)와 `swing_low_pct` 변화도 함께 보고합니다.
    - 창이 떠 있으면 `/api/open`(보정 전) → `/api/retarget {"foot_flat": true}` → 같은 파일을 `/api/open`하면 전후가 나란히 보입니다. 끝나면 `/api/retarget {"foot_flat": false}`로 되돌립니다.
@@ -192,6 +197,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 - **라이선스 제한 데이터는 배포·공유하지 마세요:** SMPL-X 모델 파일, AMASS, LAFAN1, Unitree LAFAN1 리타겟과 그 파생물(리타겟 npz·동영상 포함)이 해당합니다. CMU 데이터는 공개해도 됩니다.
 - **Isaac 물리·녹화는 오래 걸립니다(클립당 수십 초에서 몇 분, MuJoCo 물리는 몇 초).** 여러 개면 사용자에게 먼저 알리고, `/api/jobs`로 진행을 봅니다. 같은 요청을 반복해서 보내지 마세요(캐시와 대기열이 처리함).
 - 사용자의 캐시(`cache\`), 설정 파일, 원본 데이터를 지우거나 바꾸지 마세요.
+- **사용자가 고친 라벨은 사용자의 작업입니다.** 저장하지 않은 편집(`labels.unsaved_edits`)을 `discard_edits`로 버리거나, 있는 라벨 파일에 `overwrite`로 덮어쓰거나, 작업 세션을 `discard_changes`로 닫고 열기는 사용자가 그렇게 하라고 했을 때만 합니다. 저장은 사용자가 말한 경로에만 합니다.
 - 새 소프트웨어나 데이터를 내려받거나 설치하기 전에는 출처와 크기를 말하고 물어보세요.
 - 숫자를 보고할 때는 어떤 모션(라벨), 어떤 기준(ref), 어떤 설정(허용 오차, heading, assist, 리타게팅 보정)이었는지 함께 적으세요.
 - 창의 리타게팅 보정을 바꿨으면 작업이 끝난 뒤 원래대로 돌려 놓으세요. 사용자가 다음에 여는 모션에도 적용되기 때문입니다.

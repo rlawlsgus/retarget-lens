@@ -11,6 +11,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 sys.path.insert(0, ROOT)
 
 from retlens import batch  # noqa: E402
+from retlens.synthetic import g1_motion  # noqa: E402
 
 SAMPLES = os.path.join(ROOT, "data", "samples")
 
@@ -53,10 +54,43 @@ def test_batch_rows_cache_and_errors(session, tmp_path):
     assert stopped == []
     t = batch.totals(rows)
     assert t["motions"] == 3 and t["read"] == 2 and t["errors"] == 1 and t["labelled"] == 1
+    assert t["first_fall_causes"] == {}
     out = batch.write_csv(rows, str(tmp_path / "table.csv"))
     with open(out, encoding="utf-8-sig") as f:
         lines = f.read().splitlines()
     assert lines[0].split(",")[:4] == ["모션", "폴더", "길이 (s)", "리타게팅 점수"] and len(lines) == 4
+    header = lines[0].split(",")
+    assert header.index("첫 넘어짐 원인") == header.index("물리 넘어짐") + 1
+
+
+def test_batch_key_and_fall_causes(session, tmp_path, monkeypatch):
+    """Physics rows are made again when the MuJoCo results change meaning (policy_replay.RESULT_VERSION), the
+    other rows are not; totals count the rows per first fall cause."""
+    from retlens import policy_replay as pr
+
+    path = str(session / "walk.bvh")
+    plain = batch.Batch(batch.BatchOptions(), cache_dir=str(tmp_path / "batch"))
+    phys = batch.Batch(batch.BatchOptions(physics=True), cache_dir=str(tmp_path / "batch"))
+    k_plain, k_phys = plain.key(path), phys.key(path)
+    assert k_plain != k_phys
+    monkeypatch.setattr(pr, "RESULT_VERSION", pr.RESULT_VERSION + 1)
+    assert plain.key(path) == k_plain and phys.key(path) != k_phys
+
+    class Falls:  # policy_replay.run's result for a clip with two falls (no MuJoCo needed)
+        metrics = {"falls": 2, "torque_saturated_ratio": 0.1, "consistent": False, "issues": ["2 fall(s)"],
+                   "harness_force_per_body_weight": {"mean": 0.2}, "first_fall_cause": "toe_catch",
+                   "fall_diagnosis": [{"primary_cause": "toe_catch"}, {"primary_cause": "support_exit"}]}
+
+    monkeypatch.setattr(pr, "run", lambda *a, **k: Falls())
+    phys._sim = object()  # the harness sim, not made here
+    row = phys._physics(g1_motion(seconds=1.0))
+    assert row["phys_falls"] == 2 and row["phys_first_cause"] == "발끝 걸림" and row["phys_ok"] == "넘어짐 2회"
+    assert row["phys_fall_causes"] == "발끝 걸림 1 · 지지면 이탈 1"
+    rows = [{"phys_falls": 3, "phys_first_cause": "지지면 이탈"}, {"phys_falls": 1, "phys_first_cause": "발끝 걸림"},
+            {"phys_falls": 2, "phys_first_cause": "지지면 이탈"}, {"phys_falls": 0, "phys_first_cause": None},
+            {"error": "ValueError: bad", "phys_first_cause": "토크 포화"}]
+    t = batch.totals(rows)
+    assert t["first_fall_causes"] == {"지지면 이탈": 2, "발끝 걸림": 1} and t["with_falls"] == 3
 
 
 def test_batch_physics(session, tmp_path):
@@ -68,6 +102,8 @@ def test_batch_physics(session, tmp_path):
     b = batch.Batch(batch.BatchOptions(physics=True), cache_dir=str(tmp_path / "batch"))
     row = b.process(str(session / "walk.bvh"))
     assert row["phys_falls"] is not None and row["phys_harness_pct"] is not None and row["phys_ok"]
+    assert "phys_first_cause" in row and "phys_fall_causes" in row  # the first fall's cause (None: no fall)
+    assert (row["phys_first_cause"] is None) == (row["phys_falls"] == 0)
 
 
 def test_dataset_table_sorts_and_filters():

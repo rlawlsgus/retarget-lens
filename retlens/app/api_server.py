@@ -10,19 +10,36 @@
                         {"id", corrections...}  this motion retargeted again with them (the others: its own), in
                                                 its place; {"id", "recommend": true}: the 8 combinations ranked by
                                                 리타게팅 점수 (slow the first time: 8 retargets)
-    POST /api/remove    {"id": ..}
+    POST /api/remove    {"id": .., "discard_edits"?}   409 when its labels have unsaved edits, unless discard_edits
     GET  /api/motion?id=..              one motion: QC, metrics, C3D QC, physics state
     POST /api/item      {"id", "visible"?, "offset_s"?, "show_human"?}
     POST /api/labels    {"id", "path"?}  labelled segments on the timeline: load this file / "path": null takes
                                          them off / no "path" reads the motion's label file again
                         {"id", "auto": true, "rules"?}  label the motion by a rule file (the 자동 라벨 setting
                                          when "rules" is left out; retlens.autolabel). 422 when it cannot
-                                         (robot motion, broken rules): the motion keeps its labels
+                                         (robot motion, broken rules): the motion keeps its labels. Replacing
+                                         labels with unsaved edits (path, null, reload, auto): 409 unless
+                                         "discard_edits": true
+                        {"id", "edit": "bounds" | "rename" | "split" | "delete" | "merge" | "add" | "undo" | "redo",
+                         "index"?, "expect"?: {"label", "start_s"}, ...}   label editing: bounds {"start_s"?,
+                         "end_s"?}, rename {"label"}, split {"time_s"}, merge {"with": "next" | "prev"}, add {"track",
+                         "time_s", "label"}; index into labels.segments (409 when "expect" no longer matches);
+                         times in motion seconds, on frames. The reply's "segment": the edited / new segment's index
+                        {"id", "save": true | "D:/x/02_01.labels.csv", "overwrite"?}   save the labels to a CSV
+                         (true: <name>.labels.csv next to the motion); 409 over an existing file unless overwrite,
+                         and always over a table of several motions or a file that is not a label file
     POST /api/playback  {"play"?, "time_s"?, "speed"?, "loop"?, "problem"?: 1 | -1, "id"?}   "problem": go to the
                                          next / previous problem start (of motion "id", else every visible one)
     GET  /api/segments                  유형별 재생: every 'track: label' of the open motions (segments, seconds)
     POST /api/segments  {"key", "solo"?, "play"?} | {"step": 1 | -1} | {"stop": true}   play one label's segments
                                          one after another (solo: only that segment's motion shown)
+    GET  /api/session                   작업 세션: the file open, unsaved changes?, opening progress, what did
+                                         not open
+    POST /api/session   {"save": true | "C:/x.retlens", "overwrite"?}  save the window's work (409 over another
+                                         file unless overwrite; true: the file open)
+                        {"open": "C:/x.retlens", "mode"?: "replace" | "add", "discard_changes"?}  open one
+                                         (returns at once: GET until "restoring" is null); mode is needed while
+                                         motions are open; replace with unsaved changes: 409 unless discard_changes
     GET  /api/batch                     데이터셋 일괄 처리 in the window: running?, totals, its rows so far
     POST /api/batch     {"folders", "physics"?, "auto_labels"?} | {"stop": true}   start (with the 리타게팅 menu's
                                          corrections) / stop after the current motion (retlens.batch)
@@ -56,7 +73,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
-from .. import paths
+from .. import motion_labels, paths
 from ..batch import totals as batch_totals
 from . import api_core
 from .scene import BALANCE
@@ -115,6 +132,7 @@ class ApiBackend:
             (p, "/api/item"): self.item, (p, "/api/labels"): self.labels, (p, "/api/playback"): self.playback,
             (g, "/api/segments"): self.segments, (p, "/api/segments"): self.segments,
             (g, "/api/batch"): self.batch, (p, "/api/batch"): self.batch,
+            (g, "/api/session"): self.session, (p, "/api/session"): self.session,
             (g, "/api/metrics"): self.metrics,
             (p, "/api/align"): self.align, (p, "/api/compare"): self.compare, (p, "/api/physics"): self.physics,
             (p, "/api/video"): self.video, (g, "/api/jobs"): self.jobs, (p, "/api/camera"): self.camera,
@@ -176,6 +194,9 @@ class ApiBackend:
 
     def remove(self, q: dict) -> dict:
         item = self._item(q.get("id"))
+        if self.scene.labels_dirty(item) and not q.get("discard_edits"):
+            raise ApiError(f"{item.label}: its labels have unsaved edits: save them ({{\"save\": true}} on /api/labels) "
+                           "or give \"discard_edits\": true", 409)
         self.scene.remove(item)
         return {"removed": item.label}
 
@@ -194,6 +215,13 @@ class ApiBackend:
 
     def labels(self, q: dict) -> dict:
         item = self._item(q.get("id"))
+        if "edit" in q or "save" in q:
+            if sum(k in q for k in ("edit", "save", "path", "auto")) > 1:
+                raise ApiError("give one of 'edit', 'save', 'path' or \"auto\"", 400)
+            return self._label_edit(item, q) if "edit" in q else self._label_save(item, q)
+        if self.scene.labels_dirty(item) and not q.get("discard_edits"):
+            raise ApiError(f"{item.label}: its labels have unsaved edits that this would replace: save them first "
+                           "({\"save\": true}) or give \"discard_edits\": true (undo brings them back)", 409)
         for key in ("path", "rules"):
             if q.get(key) is not None and not isinstance(q[key], str):
                 raise ApiError(f"'{key}' must be a file path (string) or null", 400)
@@ -217,6 +245,81 @@ class ApiBackend:
         if lab is not None and lab.auto and lab.error and lab is not item.labels:  # not put on: the motion kept its labels
             raise ApiError(f"자동 라벨을 붙이지 못했습니다 (라벨은 그대로): {lab.error}", 422)
         return {"id": item.label, "labels": api_core.item_info(self.scene, item)["labels"]}
+
+    def _label_edit(self, item, q: dict) -> dict:
+        """One label edit (motion_labels), as the window's: one undo step of the motion."""
+        sc, op = self.scene, q.get("edit")
+        if op in ("undo", "redo"):
+            done = sc.undo_labels(item, redo=op == "redo")
+            if done is None:
+                raise ApiError(f"nothing to {op}", 409)
+            lab = item.labels
+            seg = done[1]
+            index = next((i for i, s in enumerate(lab.segments) if s is seg), None) if lab is not None else None
+            return {"id": item.label, "done": done[0], "segment": index,
+                    "labels": api_core.item_info(sc, item)["labels"]}
+        base, fps, dur = item.labels, item.robot.fps, item.robot.duration
+        seg = None
+        if op != "add":
+            if base is None or not isinstance(q.get("index"), int) or not 0 <= q["index"] < len(base.segments):
+                raise ApiError("'index' must be the index of one of the motion's labels.segments", 404)
+            seg = base.segments[q["index"]]
+            exp = q.get("expect")
+            if isinstance(exp, dict) and (exp.get("label", seg.label) != seg.label or
+                                          abs(float(exp.get("start_s", seg.start)) - seg.start) > 1e-4):
+                raise ApiError("the segment at 'index' is not the one expected: the labels changed, read them again", 409)
+        try:
+            if op == "bounds":
+                result = motion_labels.with_bounds(base, seg, float(q.get("start_s", seg.start)),
+                                                   float(q.get("end_s", seg.end)), fps, dur)
+            elif op == "rename":
+                result = motion_labels.relabeled(base, seg, str(q.get("label", "")))
+            elif op == "split":
+                result = motion_labels.split(base, seg, float(q["time_s"]), fps)
+            elif op == "delete":
+                result = motion_labels.removed(base, seg)
+            elif op == "merge":
+                result = motion_labels.merged(base, seg, -1 if q.get("with") == "prev" else 1)
+            elif op == "add":
+                result = motion_labels.added(base, str(q.get("track") or ""), float(q["time_s"]), fps, dur,
+                                             str(q.get("label") or motion_labels.NEW_LABEL))
+            else:
+                raise ApiError("'edit' must be bounds, rename, split, delete, merge, add, undo or redo", 400)
+        except (KeyError, TypeError) as e:
+            raise ApiError(f"missing or wrong parameter for {op}: {e}", 400)
+        except ValueError as e:
+            raise ApiError(str(e), 422)
+        new, sel = result
+        what = {"bounds": "구간 시간 고치기", "rename": "라벨 바꾸기", "split": "구간 나누기", "delete": "구간 삭제",
+                "merge": "구간 합치기", "add": "구간 추가"}[op]
+        if not sc.edit_labels(item, base, new, what, before=seg, after=sel):
+            raise ApiError("the labels changed meanwhile: read them again", 409)
+        index = next((i for i, s in enumerate(new.segments) if s is sel), None) if sel is not None else None
+        return {"id": item.label, "segment": index, "labels": api_core.item_info(sc, item)["labels"]}
+
+    def _label_save(self, item, q: dict) -> dict:
+        base, target = item.labels, q.get("save")
+        if base is None:
+            raise ApiError(f"{item.label}: no labels to save", 409)
+        if target is True:
+            target = os.path.splitext(item.source)[0] + ".labels.csv"
+        if not isinstance(target, str) or not target.lower().endswith(".csv") or not os.path.isabs(target):
+            raise ApiError("'save' must be true or an absolute path ending in .csv", 400)
+        if not os.path.isdir(os.path.dirname(target)):
+            raise ApiError(f"no such folder: {os.path.dirname(target)}", 404)
+        solved = item.info.get("solved_motion")
+        why = motion_labels.overwrite_problem(target, item.source, [solved] if solved else ())
+        if why:
+            raise ApiError(f"not saved over {target}: {why}", 409)
+        if os.path.exists(target) and not q.get("overwrite"):
+            raise ApiError(f"{target} exists: give \"overwrite\": true to replace it (what it would lose: "
+                           f"{'; '.join(motion_labels.overwrite_losses(target, base)) or 'nothing noted'})", 409)
+        try:
+            motion_labels.save_csv(base, target)
+        except OSError as e:
+            raise ApiError(f"could not write {target}: {e}", 500)
+        self.scene.labels_saved(item, base, target)
+        return {"id": item.label, "saved": os.path.abspath(target), "labels": api_core.item_info(self.scene, item)["labels"]}
 
     def playback(self, q: dict) -> dict:
         sc = self.scene
@@ -276,6 +379,73 @@ class ApiBackend:
         rows = list(panel.model.rows)
         return {"running": panel._running, "folders": list(panel.folders), **batch_totals(rows),
                 "rows": api_core.jsonable(rows)}
+
+    def session(self, q: dict) -> dict:
+        """작업 세션 (retlens/app/session.py): save / open, in the window (headless: in this scene, synchronously)."""
+        from . import session as work
+
+        w = self.window
+        if q.get("save") is not None:
+            target = q["save"]
+            if target is True:
+                target = w.session_path if w is not None else None
+                if not target:
+                    raise ApiError("no work session file is open: give a path (\"save\": \"C:/x.retlens\")", 409)
+            elif not isinstance(target, str) or not os.path.isabs(target):
+                raise ApiError("'save' must be true or an absolute path", 400)
+            else:
+                if not target.lower().endswith(work.EXTS):
+                    target += work.EXT
+                same = w is not None and w.session_path and os.path.normcase(os.path.abspath(target)) == \
+                    os.path.normcase(os.path.abspath(w.session_path))
+                if os.path.exists(target) and not same and not q.get("overwrite"):
+                    raise ApiError(f"{target} exists: give \"overwrite\": true to replace it", 409)
+            if not os.path.isdir(os.path.dirname(os.path.abspath(target))):
+                raise ApiError(f"no such folder: {os.path.dirname(target)}", 404)
+            if w is None:
+                path = work.write(target, work.capture(self.scene, os.path.dirname(os.path.abspath(target))))
+            else:
+                if not self.on_gui(lambda: w.save_session(target)):
+                    raise ApiError("not saved (a work session is being opened, or the file could not be written)", 409)
+                path = w.session_path
+            return {"saved": os.path.abspath(path), "motions": len(self.scene.items)}
+        if q.get("open") is not None:
+            path, mode = q["open"], q.get("mode")
+            if not isinstance(path, str) or not os.path.isfile(path):
+                raise ApiError(f"no such file: {path}", 404)
+            if mode is not None and mode not in work.MODES:
+                raise ApiError(f"'mode' must be one of {', '.join(work.MODES)}", 400)
+            if w is None:
+                if self.scene.items and mode is None:
+                    raise ApiError("motions are open: give mode replace or add", 409)
+                if (mode or "replace") == "replace" and not q.get("discard_changes") and \
+                        any(self.scene.labels_dirty(it) for it in self.scene.items):
+                    raise ApiError("labels have unsaved edits: save them first or give discard_changes", 409)
+                try:
+                    data = work.read(path)
+                except work.SessionError as e:
+                    raise ApiError(str(e), 400)
+                r = work.restore(self.scene, data, os.path.dirname(os.path.abspath(path)), mode or "replace",
+                                 physics_ready=work.mujoco_ready(self.scene))
+                return {"opened": [it.label for it in r.items.values()], "failed": [
+                    {"label": work.entry_label(e), "error": why} for e, why in r.failed], "notes": r.notes}
+            code, why = self.on_gui(lambda: w.open_session(path, mode, interactive=False,
+                                                           discard=bool(q.get("discard_changes"))))
+            if code:
+                raise ApiError(why, code)
+        return self._session_state()
+
+    def _session_state(self) -> dict:
+        from . import session as work
+
+        w = self.window
+        if w is None:
+            return {"path": None, "dirty": None, "restoring": None, "unresolved": [], "autosave": work.autosave_info()}
+        r = w._restore
+        return {"path": w.session_path, "dirty": w._session_dirty() if w.session_path else None,
+                "restoring": {"done": r.done, "total": r.total, "current": r.current} if r is not None else None,
+                "unresolved": [{"label": work.entry_label(e), "file": work.ref_text(e.get("file"))} for e in w._carry_list()],
+                "last_open": w._last_restore, "autosave": work.autosave_info(), "recent": w._recent()}
 
     # ---------------------------------------------------------------- analysis
     def metrics(self, q: dict) -> dict:

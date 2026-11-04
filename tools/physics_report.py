@@ -16,12 +16,11 @@ import glob
 import json
 import os
 import sys
-from collections import Counter
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
 from retlens.compare import _issue_ko  # noqa: E402
-from retlens.diagnosis import CAUSE_KO  # noqa: E402
+from retlens.diagnosis import causes_text  # noqa: E402
 
 
 def pct(v) -> str:
@@ -29,15 +28,9 @@ def pct(v) -> str:
 
 
 def causes(p: dict, show: int = 3) -> str:
-    """First cause of each fall (retlens/diagnosis.py), e.g. "발끝 걸림 1.47s (넘어짐 2.07s)";
+    """First cause of each fall (retlens/diagnosis.py causes_text), e.g. "발끝 걸림 1.47s (넘어짐 2.07s)";
     beyond ``show`` falls, a count per cause."""
-    diag = p.get("fall_diagnosis") or []
-    out = [f"{CAUSE_KO.get(d['primary_cause'], d['primary_cause'])} {d['primary_onset_s']}s (넘어짐 {d['fall_time_s']}s)"
-           for d in diag[:show]]
-    if len(diag) > show:
-        rest = Counter(CAUSE_KO.get(d["primary_cause"], d["primary_cause"]) for d in diag[show:])
-        out.append("외 " + ", ".join(f"{k} {v}" for k, v in rest.most_common()))
-    return "; ".join(out) or "-"
+    return causes_text(p.get("fall_diagnosis") or [], show)
 
 
 def row(path: str, root: str) -> str:

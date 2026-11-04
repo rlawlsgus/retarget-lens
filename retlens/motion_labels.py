@@ -25,6 +25,10 @@ UTF-8 (with or without BOM) or CP949 (Excel's Korean CSV). Segment tables of a l
 columns (seq, track, label, start_s, end_s, ...) read as they are.
 
 JSON: {"fps": 30, "segments": [{"label": .., "start_s": .., "end_s": .., "track"?: ..}, ..]} or just the list.
+
+Labels can be edited in the window (with_bounds, relabeled, split, merged, removed, added below): an edit
+gives new labels (edited=True) that live in the window until they are saved to a CSV (save_csv). A file
+that was read is never written without the user saying so, and never one that holds other motions' rows.
 """
 
 from __future__ import annotations
@@ -35,7 +39,8 @@ import io
 import json
 import math
 import os
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass, field, replace
 
 SUFFIXES = (".labels.csv", ".labels.json", "_labels.csv", "_labels.json", "_subtask.csv")
 FOLDER_TABLES = ("labels.csv", "labels.json")
@@ -51,7 +56,7 @@ class Segment:
     start: float  # s from the motion's first frame
     end: float  # s, exclusive
     track: str = ""
-    name: str = ""  # a longer name of the label (e.g. 준비 자세·손 뻗기 for reach)
+    name: str = ""  # a longer, human-readable name of the label
     note: str = ""  # object / note columns
     color: tuple | None = None
 
@@ -72,6 +77,7 @@ class MotionLabels:
     notes: list[str] = field(default_factory=list)
     auto: str = ""
     found: bool = False
+    edited: bool = False  # changed in RetLens since it was read or made (not saved to a file yet)
 
     @property
     def tracks(self) -> list[str]:
@@ -81,16 +87,18 @@ class MotionLabels:
         """{track: (starts, segments by start, any overlap)} in track order. Built again only when
         the segment list changes: at() runs every frame for every motion (3D tag, timeline)."""
         key = (id(self.segments), len(self.segments))
-        if getattr(self, "_idx_key", None) != key:
-            by: dict[str, list[Segment]] = {}
-            for s in self.segments:
-                by.setdefault(s.track, []).append(s)
-            idx = {}
-            for track, segs in by.items():
-                segs = sorted(segs, key=lambda s: s.start)  # stable: equal starts keep the file's order
-                idx[track] = ([s.start for s in segs], segs, any(b.start < a.end for a, b in zip(segs, segs[1:])))
-            self._idx, self._idx_key = idx, key
-        return self._idx
+        cache = getattr(self, "_idx_cache", None)  # (key, index), read once: a snapshot's cache may be dropped meanwhile
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        by: dict[str, list[Segment]] = {}
+        for s in self.segments:
+            by.setdefault(s.track, []).append(s)
+        idx = {}
+        for track, segs in by.items():
+            segs = sorted(segs, key=lambda s: s.start)  # stable: equal starts keep the file's order
+            idx[track] = ([s.start for s in segs], segs, any(b.start < a.end for a, b in zip(segs, segs[1:])))
+        self._idx_cache = (key, idx)
+        return idx
 
     def at(self, t: float) -> list[Segment]:
         """The segment under motion time t in each track (in track order; none where unlabelled).
@@ -215,9 +223,9 @@ def _decode(raw: bytes) -> str:
 TEXT_COLUMNS = ("note", "name", "object")  # a comma typed into these without quotes runs on into extra values
 
 
-def _read(path: str) -> tuple[list[dict], float | None, list[str]]:
-    """Rows (lower-case column names, stripped text), the file's fps (JSON only) and notes on what
-    was off. A CSV row with more values than the header has (a trailing comma, a comma in a note
+def _read(path: str) -> tuple[list[dict], float | None, list[str], list[str]]:
+    """Rows (lower-case column names, stripped text), the file's fps (JSON only), notes on what
+    was off and the columns (a CSV's header: one saved without segments still has them). A CSV row with more values than the header has (a trailing comma, a comma in a note
     without quotes) keeps its columns: the extra values join the last column when that is a text
     column, else they are left out."""
     with open(path, "rb") as f:
@@ -228,7 +236,8 @@ def _read(path: str) -> tuple[list[dict], float | None, list[str]]:
         if not isinstance(segs, list) or not all(isinstance(s, dict) for s in segs):
             raise ValueError("segments는 {label, start_s, end_s} 목록이어야 합니다")
         rows = [{str(k).strip().lower(): "" if v is None else str(v).strip() for k, v in s.items()} for s in segs]
-        return rows, float(d["fps"]) if isinstance(d, dict) and d.get("fps") else None, []
+        return rows, float(d["fps"]) if isinstance(d, dict) and d.get("fps") else None, [], list(dict.fromkeys(
+            k for r in rows for k in r))
     reader = csv.reader(io.StringIO(text))
     head = [c.strip().lower() for c in next(reader, [])]
     rows, joined, dropped = [], 0, 0
@@ -250,7 +259,7 @@ def _read(path: str) -> tuple[list[dict], float | None, list[str]]:
                      "(쉼표가 든 값은 따옴표로 감싸세요)")
     if dropped:
         notes.append(f"값이 열 이름보다 많은 행 {dropped}개: 넘친 값은 버렸습니다 (쉼표가 든 값은 따옴표로 감싸세요)")
-    return rows, None, notes
+    return rows, None, notes, head
 
 
 def _color(text: str) -> tuple | None:
@@ -321,8 +330,8 @@ def load(path: str, source: str, fps: float, duration: float | None = None, tabl
 
 def _load(path: str, sources: list[str], fps: float, duration: float | None, table: bool) -> MotionLabels | None:
     lab = MotionLabels(path=os.path.abspath(path))
-    rows, file_fps, lab.notes = _read(path)
-    keys = set().union(*rows) if rows else set()
+    rows, file_fps, lab.notes, cols = _read(path)
+    keys = set().union(set(cols), *rows)
     if "label" not in keys:
         empty = " (segments 목록이 없거나 비었음)" if path.lower().endswith(".json") else " (빈 파일)"
         lab.error = "label 열이 없습니다" + (f" (열: {', '.join(sorted(keys))})" if keys else empty)
@@ -392,11 +401,241 @@ def _load(path: str, sources: list[str], fps: float, duration: float | None, tab
 def save_csv(lab: MotionLabels, path: str) -> str:
     """Write the segments as a label file (UTF-8 with BOM, so Excel reads the Korean); it reads back
     with load to the same segments. Times are written in full: rounded, a boundary on frame k/30
-    (2.2666...) could read back after its frame (2.2667) and move it to the neighbour."""
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["track", "label", "name", "start_s", "end_s", "note", "color"])
-        for s in lab.segments:
-            w.writerow([s.track, s.label, s.name, repr(float(s.start)), repr(float(s.end)), s.note,
-                        "#%02x%02x%02x" % s.color if s.color else ""])
+    (2.2666...) could read back after its frame (2.2667) and move it to the neighbour. Written to a
+    temporary file next to it first: a failed write (the file open in Excel) leaves the old one."""
+    folder = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".labels-", suffix=".tmp", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["track", "label", "name", "start_s", "end_s", "note", "color"])
+            for s in lab.segments:
+                w.writerow([s.track, s.label, s.name, repr(float(s.start)), repr(float(s.end)), s.note,
+                            "#%02x%02x%02x" % s.color if s.color else ""])
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return path
+
+# ---------------------------------------------------------------- editing
+# An edit never changes a MotionLabels or its segments: it returns new labels (edited=True) with a new segment
+# list that shares the segments it did not change, so whatever is keyed on the labels object (the timeline's
+# picture, the index above, the window's dirty mark) sees it. Segment compares by its fields (two rows can be
+# alike), so a segment is found by identity, never with ==, in or index().
+EPS = 1e-6
+NEW_LABEL = "새 라벨"
+
+
+def frame_snap(t: float, fps: float) -> float:
+    """t on the nearest frame of a motion playing at fps."""
+    return round(t * fps) / fps if fps > 0 else t
+
+
+def index_of(lab: MotionLabels, seg: Segment) -> int:
+    for i, s in enumerate(lab.segments):
+        if s is seg:
+            return i
+    raise ValueError("고른 구간이 이 라벨에 없습니다 (라벨이 바뀌었습니다)")
+
+
+def lane(lab: MotionLabels | None, track: str) -> list[Segment]:
+    """A track's segments by start."""
+    entry = lab._index().get(track) if lab is not None else None
+    return entry[1] if entry else []
+
+
+def neighbours(lab: MotionLabels, seg: Segment) -> tuple[Segment | None, Segment | None]:
+    """The segments just before and after seg on its track (ones overlapping it are passed over)."""
+    others = [s for s in lane(lab, seg.track) if s is not seg]
+    prev = max((s for s in others if s.end <= seg.start + EPS), key=lambda s: s.end, default=None)
+    nxt = min((s for s in others if s.start >= seg.end - EPS), key=lambda s: s.start, default=None)
+    return prev, nxt
+
+
+def _edited(lab: MotionLabels | None, segs: list[Segment]) -> MotionLabels:
+    """New labels with these segments, from the same place (until they are saved somewhere)."""
+    if lab is None:
+        return MotionLabels(path="", segments=segs, edited=True)
+    return MotionLabels(path=lab.path, segments=segs, notes=list(lab.notes) if not lab.error else [], auto=lab.auto,
+                        found=lab.found, edited=True)
+
+
+def _like(lab: MotionLabels | None, label: str, track: str) -> tuple[str, tuple | None]:
+    """(name, color) of a segment that already has this label (its track's first), so a label looks the same."""
+    segs = lab.segments if lab is not None else []
+    s = next((s for s in segs if s.label == label and s.track == track), None) or \
+        next((s for s in segs if s.label == label), None)
+    return (s.name, s.color) if s is not None else ("", None)
+
+
+def with_bounds(lab: MotionLabels, seg: Segment, start: float, end: float, fps: float, duration: float,
+                together: bool = True) -> tuple[MotionLabels, Segment]:
+    """seg from start to end, on frames, at least a frame long, not over its neighbours on the track nor the motion's
+    ends. together: an edge the neighbour shares (back-to-back segments) moves the neighbour's edge with it.
+    Unchanged: the same labels and segment back."""
+    frame = 1.0 / fps if fps > 0 else 1e-3
+    prev, nxt = neighbours(lab, seg)
+    # a moved edge goes on a frame; one given back as it was (rounded by an editor) stays exactly where it is (a
+    # file's times need not be on frames)
+    start = seg.start if abs(float(start) - seg.start) < 5e-4 else frame_snap(float(start), fps)
+    end = seg.end if abs(float(end) - seg.end) < 5e-4 else frame_snap(float(end), fps)
+    joined_prev = together and prev is not None and abs(prev.end - seg.start) < EPS
+    joined_next = together and nxt is not None and abs(nxt.start - seg.end) < EPS
+    lo = prev.start + min(frame, prev.duration) if joined_prev else (prev.end if prev is not None else 0.0)
+    hi = nxt.end - min(frame, nxt.duration) if joined_next else (nxt.start if nxt is not None else max(duration, seg.end))
+    min_len = min(frame, seg.duration)
+    if start != seg.start and end != seg.end:  # moved as a whole: within its room
+        start = min(max(start, lo), hi - min_len)
+        end = max(min(end, hi), start + min_len)
+    elif start != seg.start:
+        start = min(max(start, lo), seg.end - min_len)
+    elif end != seg.end:
+        end = max(min(end, hi), start + min_len)
+    if abs(start - seg.start) < EPS and abs(end - seg.end) < EPS:
+        return lab, seg
+    segs = list(lab.segments)
+    new = replace(seg, start=start, end=end)
+    segs[index_of(lab, seg)] = new
+    if joined_prev and abs(start - seg.start) >= EPS:
+        segs[index_of(lab, prev)] = replace(prev, end=start)
+    if joined_next and abs(end - seg.end) >= EPS:
+        segs[index_of(lab, nxt)] = replace(nxt, start=end)
+    return _edited(lab, segs), new
+
+
+def relabeled(lab: MotionLabels, seg: Segment, label: str) -> tuple[MotionLabels, Segment]:
+    """seg with another label (its name and colour follow a segment that already has that label)."""
+    label = str(label).strip()
+    if not label:
+        raise ValueError("라벨 이름이 비었습니다")
+    if label == seg.label:
+        return lab, seg
+    name, color = _like(lab, label, seg.track)
+    new = replace(seg, label=label, name=name, color=color)
+    segs = list(lab.segments)
+    segs[index_of(lab, seg)] = new
+    return _edited(lab, segs), new
+
+
+def split(lab: MotionLabels, seg: Segment, t: float, fps: float) -> tuple[MotionLabels, Segment]:
+    """seg cut in two at t (on a frame strictly inside it); the first half is returned."""
+    t = frame_snap(float(t), fps)
+    if not seg.start + EPS < t < seg.end - EPS:
+        raise ValueError("재생 위치가 고른 구간 안에 있어야 나눌 수 있습니다")
+    first, second = replace(seg, end=t), replace(seg, start=t)
+    segs = list(lab.segments)
+    i = index_of(lab, seg)
+    segs[i:i + 1] = [first, second]
+    return _edited(lab, segs), first
+
+
+def removed(lab: MotionLabels, seg: Segment) -> tuple[MotionLabels, None]:
+    segs = list(lab.segments)
+    del segs[index_of(lab, seg)]
+    return _edited(lab, segs), None
+
+
+def merged(lab: MotionLabels, seg: Segment, direction: int) -> tuple[MotionLabels, Segment]:
+    """seg and the next (direction > 0) or previous segment on its track as one segment with seg's label, the gap
+    between them included."""
+    prev, nxt = neighbours(lab, seg)
+    other = nxt if direction > 0 else prev
+    if other is None:
+        raise ValueError(f"{'다음' if direction > 0 else '이전'} 구간이 없습니다")
+    new = replace(seg, start=min(seg.start, other.start), end=max(seg.end, other.end))
+    segs = list(lab.segments)
+    segs[index_of(lab, seg)] = new
+    del segs[index_of(lab, other)]
+    return _edited(lab, segs), new
+
+
+def added(lab: MotionLabels | None, track: str, t: float, fps: float, duration: float,
+          label: str = NEW_LABEL) -> tuple[MotionLabels, Segment]:
+    """A new segment filling the unlabelled gap under motion time t on a track (a new track: the whole motion).
+    Labels that could not be read start again from this segment (the file they came from is kept)."""
+    label = str(label).strip()
+    if not label:
+        raise ValueError("라벨 이름이 비었습니다")
+    usable = lab if lab is not None and not lab.error else None
+    segs_on = lane(usable, track)
+    if any(s.start - EPS <= t < s.end for s in segs_on):
+        raise ValueError("재생 위치에 이미 구간이 있습니다 (나누기: S)")
+    lo = max((s.end for s in segs_on if s.end <= t + EPS), default=0.0)
+    hi = min((s.start for s in segs_on if s.start > t), default=max(duration, lo))
+    if hi - lo < 0.5 / max(fps, 1.0):
+        raise ValueError("빈칸이 한 프레임보다 짧습니다")
+    name, color = _like(usable, label, track)
+    new = Segment(label=label, start=lo, end=hi, track=track, name=name, color=color)
+    segs = list(usable.segments) if usable is not None else []
+    at = max((i + 1 for i, s in enumerate(segs) if s.track == track and s.start <= lo), default=None)
+    if at is None:  # first on its track: before the track's other segments, or a new track last
+        at = next((i for i, s in enumerate(segs) if s.track == track), len(segs))
+    segs.insert(at, new)
+    if usable is None:
+        return MotionLabels(path=lab.path if lab is not None else "", segments=segs, edited=True), new
+    return _edited(usable, segs), new
+
+
+def renamed_track(lab: MotionLabels, old: str, new: str) -> MotionLabels:
+    new = str(new).strip()
+    if new == old:
+        return lab
+    if new in lab.tracks:
+        raise ValueError(f"트랙 '{new}'이(가) 이미 있습니다")
+    return _edited(lab, [replace(s, track=new) if s.track == old else s for s in lab.segments])
+
+
+SAVED_COLUMNS = {"track", "axis", "label", "name", "start_s", "end_s", "note", "color", "object", "start_frame",
+                 "end_frame", "fps"}
+
+
+def overwrite_problem(path: str, source: str | None = None, also=()) -> str:
+    """Why labels of the motion file `source` (also: other names it goes by, a C3D's solved motion) must not be
+    saved to this file ('' when they may): a folder table's name (a table of several motions, read for every motion
+    in the folder, even a new one), a JSON file, an existing file of another kind or with rows of another motion
+    (seq). Files are only ever written by save_csv."""
+    if os.path.isdir(path):
+        return "폴더입니다"
+    if os.path.basename(path).lower() in FOLDER_TABLES:
+        return ("폴더의 여러 모션 표 이름입니다(그 폴더의 모든 모션이 이 파일을 읽음). <이름>.labels.csv처럼 "
+                "모션 이름을 넣어 저장하세요")
+    if path.lower().endswith(".json"):
+        return "JSON 라벨 파일에는 저장하지 않습니다. CSV 이름으로 저장하세요"
+    if not os.path.exists(path):
+        return ""
+    if not is_label_file(path):
+        return "라벨 파일이 아닙니다 (모션 파일일 수 있습니다)"
+    try:
+        rows, _fps, _notes, _cols = _read(path)
+    except Exception as e:  # noqa: BLE001
+        return f"읽지 못하는 파일입니다 ({type(e).__name__})"
+    seqs = {r.get("seq") for r in rows if r.get("seq")}
+    if len(seqs) > 1:
+        return "seq 열에 여러 모션이 있는 표입니다. 덮어쓰면 다른 모션의 행이 사라집니다"
+    if seqs:
+        mine, err, _note = _pick_seq(rows, [source, *also], table=False) if source else (None, "", "")
+        if not source or err or mine is None or len(mine) != len([r for r in rows if r.get("seq")]):
+            return f"다른 모션({next(iter(seqs))})의 행이 있는 표입니다. 덮어쓰면 그 행이 사라집니다"
+    return ""
+
+
+def overwrite_losses(path: str, lab: MotionLabels | None = None) -> list[str]:
+    """What overwriting this label file would lose (columns save_csv does not write, frame columns turned into
+    seconds, rows left out when it was read): said before the file is replaced."""
+    try:
+        rows, _fps, _notes, cols = _read(path)
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    extra = [c for c in cols if c and c not in SAVED_COLUMNS]
+    if extra:
+        out.append("저장하지 않는 열: " + ", ".join(extra))
+    if {"start_frame", "end_frame"} <= set(cols) and not {"start_s", "end_s"} <= set(cols):
+        out.append("프레임 열(start_frame·end_frame)이 초(start_s·end_s)로 바뀝니다")
+    if "seq" in cols:
+        out.append("seq 열 (이 모션의 이름)")
+    if lab is not None and lab.path and os.path.abspath(lab.path) == os.path.abspath(path):
+        out += [f"불러올 때: {n}" for n in lab.notes if any(w in n for w in ("뺐", "뺌", "자름", "버렸"))]
+    return out
+

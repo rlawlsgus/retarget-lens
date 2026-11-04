@@ -22,6 +22,19 @@ All use GMT's G1 model (the 29-DoF G1 with the wrists fixed: 23 DoF; 4 contact s
 height, drop below the clip; not the 0.5 m root distance, which a tracker drifting along its own path
 would trip). After a fall the robot restarts in the clip's pose at that time.
 
+Each fall (in the clip and in the hold after it) also gets its first cause, with the conditions and
+thresholds of the Isaac replay (retlens/diagnosis.py, configs/physics.yaml "diagnosis"). FallProbe
+samples once per 50 Hz tick, before the fall check (so a fall's tick holds the fallen state, as the
+Isaac replay's frame does): the sole points of the robot and of the clip's pose, the foot contact
+forces, both CoMs, the left/right foot and knee distances, the torque demand of the last 1 ms step and
+the harness force over the tick. Differences from Isaac: 4 contact spheres per foot (a narrower support
+polygon than the Isaac feet's box corners), GMT's torque-limit table, the model's exact CoM and 50 Hz
+ticks (min_frames counts 30 fps frames, so 2 becomes 3 ticks; 5 ticks settle after a restart);
+self-collision is the same distance proxy. The metrics get first_fall_cause, fall_diagnosis (one per
+fall_times_s, each with the fall rule as "rule"), hold_fall_diagnosis and hold_fall_causes (one per
+hold_fall_times_s); fall_causes keeps the rules (tilt / low / drop). A diagnosis that fails leaves
+fall_diagnosis_error instead, and the rules.
+
 The GMT part is a numpy port of the authors' sim2sim.py / utils/motion_lib.py (commit 2a590de):
 same observation layout and scales, same velocity estimate (finite difference + 19-frame box filter
 with zero padding), same action scaling and torque PD. One deliberate difference: at the end of the
@@ -74,6 +87,14 @@ KEY_BODIES = ["torso_link", "left_knee_link", "right_knee_link", "left_ankle_rol
               "left_elbow_link", "right_elbow_link", "left_rubber_hand", "right_rubber_hand"]
 CONTROLLERS = ("pd", "harness", "gmt")
 LABELS = {"pd": "제어기 없음 (PD 재생)", "harness": "골반 보조 힘 (PD 재생 + 가상 하네스)", "gmt": "추적 정책 (GMT)"}
+RESULT_VERSION = 2  # bump when run()'s metrics change meaning (cached results are made again; 1: fall diagnosis,
+# 2: a condition counts as already on only when its run starts with the window)
+
+# fall diagnosis (retlens/diagnosis.py) at the 50 Hz control rate
+FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
+KNEES = ["left_knee_link", "right_knee_link"]
+DIAG_SETTLE = 5  # ticks after a restart while the robot settles (0.1 s, as the Isaac replay's 3 frames at 30 fps)
+DIAG_CONFIG_FPS = 30.0  # configs/physics.yaml "diagnosis" min_frames counts frames of a 30 fps retarget (Isaac)
 
 
 def gmt_dir() -> str:
@@ -327,6 +348,8 @@ class G1Sim:
         if names != GMT_DOFS:
             raise ValueError(f"unexpected joint order in {model_path}: {names}")
         self.pd_kp, self.pd_kd, self.fall_cfg = pd_gains(physics_config)
+        cfg = load_config(physics_config)
+        self.diag_cfg = cfg.get("diagnosis") or {}  # without the block: diagnosis.py's defaults, as Isaac's
         if controller in ("pd", "harness"):
             # stiff servos as MuJoCo position actuators (kv integrated implicitly): explicit torque PD
             # with kd 20-40 on light links is unstable at 1 kHz
@@ -351,9 +374,9 @@ class G1Sim:
                      and self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
         self.mass = float(self.model.body_mass.sum())
         self.weight = self.mass * float(-self.model.opt.gravity[2])
+        self.tau_ratio = np.zeros(len(GMT_DOFS))  # |torque demand| / limit of the last apply()
         self.report_cfg = {}
         if controller == "harness":  # tools/isaac_replay.py's gains: critically damped per kg of robot
-            cfg = load_config(physics_config)
             self.report_cfg = cfg.get("report", {})
             a = cfg.get("assist", {})
             wn = 2 * np.pi * float(a.get("pos_hz", 2.0))
@@ -424,7 +447,8 @@ class G1Sim:
         return np.clip(raw, -10.0, 10.0) * ACTION_SCALE + GMT_DEFAULT
 
     def apply(self, target, ref_dof_vel=None) -> bool:
-        """Joint drives for one 1 ms step; True when a joint asks for more than its torque limit."""
+        """Joint drives for one 1 ms step; True when a joint asks for more than its torque limit. The demand
+        before clipping, per limit, stays in tau_ratio (the fall diagnosis samples the last step's)."""
         d = self.data
         q, qd = d.qpos[self.dof_q], d.qvel[self.dof_v]
         if self.controller == "gmt":
@@ -433,7 +457,9 @@ class G1Sim:
         else:  # position servo: ctrl = q* + kd/kp qd*, force = kp (ctrl - q) - kd qd = kp (q* - q) + kd (qd* - qd)
             d.ctrl[:] = target + self.pd_kd / self.pd_kp * ref_dof_vel
             tau = self.pd_kp * (target - q) + self.pd_kd * (ref_dof_vel - qd)
-        return bool(np.any(np.abs(tau) > TORQUE_LIMIT))
+        demand = np.abs(tau)
+        self.tau_ratio = demand / TORQUE_LIMIT
+        return bool(np.any(demand > TORQUE_LIMIT))
 
     def pull(self, pos, rot_xyzw, vel, ang_vel) -> tuple[float, float]:
         """The pelvis harness for one 1 ms step, toward the clip's root pose and velocities (world
@@ -473,10 +499,79 @@ class G1Sim:
         return None
 
 
+class FallProbe:
+    """What the fall diagnosis (retlens/diagnosis.py) needs from a run, sampled once per control tick:
+    sole points (contact sphere centre minus its radius) of the robot and of the clip's pose, the normal
+    force of each foot's floor contacts, both CoMs, the left/right foot and knee distances, the torque
+    demand per limit of the last 1 ms step and the harness force per body weight over the tick."""
+
+    def __init__(self, sim: G1Sim):
+        m = sim.model
+        self.sim = sim
+        self.foot_bodies = [m.body(n).id for n in FEET]
+        self.knees = [m.body(n).id for n in KNEES]
+        self.geoms = np.array([[g for g in sim.feet if m.geom_bodyid[g] == b] for b in self.foot_bodies])  # (2, C)
+        self.geom_foot = {int(g): k for k, gs in enumerate(self.geoms) for g in gs}
+        self.drop = np.zeros(self.geoms.shape + (3,))
+        self.drop[..., 2] = m.geom_size[self.geoms, 0]
+        self.rec = {k: [] for k in ("soles", "ref_soles", "com", "ref_com", "force", "feet_m", "knees_m", "tau",
+                                    "harness")}
+        self._f6 = np.zeros(6)
+
+    def sample(self, ref_data, harness: float = 0.0) -> None:
+        """Record this tick: the robot as the fall check sees it, the clip's pose in ref_data, and the
+        harness force per body weight since the previous tick."""
+        sim, d, m = self.sim, self.sim.data, self.sim.model
+        r = self.rec
+        r["soles"].append(d.geom_xpos[self.geoms] - self.drop)
+        r["ref_soles"].append(ref_data.geom_xpos[self.geoms] - self.drop)
+        r["com"].append(d.subtree_com[sim.pelvis].copy())
+        r["ref_com"].append(ref_data.subtree_com[sim.pelvis].copy())
+        force = np.zeros(len(self.foot_bodies))
+        if d.ncon:
+            g1, g2 = d.contact.geom1, d.contact.geom2
+            w1, w2 = m.geom_bodyid[g1] == 0, m.geom_bodyid[g2] == 0
+            for i in np.flatnonzero(w1 != w2):  # a robot geom on the floor (the world body)
+                k = self.geom_foot.get(int(g2[i] if w1[i] else g1[i]))
+                if k is not None:
+                    sim.mj.mj_contactForce(m, d, int(i), self._f6)
+                    force[k] += abs(self._f6[0])  # contact frame: normal first
+        r["force"].append(force)
+        x = d.xpos
+        r["feet_m"].append(float(np.linalg.norm(x[self.foot_bodies[0]] - x[self.foot_bodies[1]])))
+        r["knees_m"].append(float(np.linalg.norm(x[self.knees[0]] - x[self.knees[1]])))
+        r["tau"].append(sim.tau_ratio.copy())
+        r["harness"].append(float(harness))
+
+    def signals(self, fall_ticks: list[int]):
+        """diagnosis.FallSignals of the ticks sampled so far; fall_ticks: every tick a restart followed
+        (in the clip and in the hold), where the simulation's ZMP is filtered apart."""
+        from . import stability
+        from .analysis import floor_track, slowest_sole_speed
+        from .diagnosis import FallSignals
+        from .qc import QCConfig
+
+        r = {k: np.array(v, dtype=float) for k, v in self.rec.items()}
+        fps = 1.0 / CONTROL_DT
+        contact_h = QCConfig().support_contact_height
+        sim_track = stability.balance_track(r["com"], r["soles"], fps, 0.0, contact_h,
+                                            breaks=[k + 1 for k in fall_ticks])  # the floor is at z = 0
+        ref_low = r["ref_soles"][..., 2].min(-1)
+        ref_floor = floor_track(ref_low, slowest_sole_speed(r["ref_soles"], fps), fps)  # retargets drift
+        ref_track = stability.balance_track(r["ref_com"], r["ref_soles"], fps, ref_floor, contact_h)
+        harness = self.sim.controller == "harness"
+        return FallSignals(fps=fps, feet=list(FEET), ref_soles=r["ref_soles"], soles=r["soles"], foot_force=r["force"],
+                           weight=self.sim.weight, tau_ratio=r["tau"], joint_names=list(GMT_DOFS), sim_track=sim_track,
+                           distances={"feet": r["feet_m"], "knees": r["knees_m"]},
+                           harness=r["harness"] if harness else None, assist=1.0 if harness else 0.0,
+                           ref_track=ref_track)
+
+
 def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, home: bool = False,
         duration_s: float | None = None, progress=None) -> Result:
     """Simulate the clip, then hold_s on its last pose. A fall restarts from the clip at that time (and is
-    not checked again for grace_s). Falls and torque limits in the hold are reported apart from the clip's."""
+    not checked again for grace_s). Falls and torque limits in the hold are reported apart from the clip's.
+    Falls get their first cause (fall_diagnosis; not from GMT's own start, home)."""
     mj = sim.mj
     total = duration_s if duration_s is not None else ref.length + hold_s
     n_ctrl = int(round(total / CONTROL_DT))
@@ -486,11 +581,19 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         sim.reset_to(ref, 0.0)
     times, roots, quats, dofs = [], [], [], []
     joint_err, body_err, height_err, tilt_err, corr = [], [], [], [], []
-    falls, causes, hold_falls, drift_at_fall = [], [], [], []
+    falls, causes, hold_falls, hold_causes, drift_at_fall = [], [], [], [], []
+    fall_ticks, hold_ticks = [], []
     sat = {True: 0, False: 0}  # steps over a torque limit, in the clip / in the hold
     steps = {True: 0, False: 0}
     harness = sim.controller == "harness"
     pull_f, pull_f_max, pull_t = [], [], []  # per control tick in the clip: mean / max force, mean torque
+    pull_last = 0.0  # mean harness force over the last tick's steps (N), in the clip or the hold
+    probe, probe_error = None, None
+    if not home:
+        try:
+            probe = FallProbe(sim)
+        except Exception as e:  # never fail a run over its diagnosis: the fall rules still say what happened
+            probe_error = f"{type(e).__name__}: {e}"
     last_reset = 0.0
     step_t = np.arange(DECIMATION) * SIM_DT
     for k in range(n_ctrl):
@@ -498,14 +601,23 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         in_clip = t <= ref.length
         pos, rot, vel, ang, dof, dvel = ref.frame([t])
         pos, rot, dof = pos[0], rot[0], dof[0]
+        sim.set_pose(sim.ref_data, pos, rot, dof)  # the clip's pose at this tick (its last pose in the hold)
+        if probe is not None:  # before the fall check and its restart: a fall's tick holds the fallen state
+            try:
+                probe.sample(sim.ref_data, pull_last / sim.weight)
+            except Exception as e:  # never fail a run over its diagnosis
+                probe, probe_error = None, f"{type(e).__name__}: {e}"
         if not home and t - last_reset >= grace_s:
             cause = sim.fallen(pos, rot)
             if cause:
                 if in_clip:
                     falls.append(round(t, 3))
                     causes.append(cause)
+                    fall_ticks.append(k)
                 else:
                     hold_falls.append(round(t, 3))
+                    hold_causes.append(cause)
+                    hold_ticks.append(k)
                 drift_at_fall.append(float(np.linalg.norm(sim.data.qpos[:2] - pos[:2])))
                 sim.reset_to(ref, t)
                 last_reset = t
@@ -516,7 +628,6 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         quats.append(d.qpos[3:7].copy())
         dofs.append(d.qpos[sim.dof_q].copy())
         if in_clip:
-            sim.set_pose(sim.ref_data, pos, rot, dof)
             joint_err.append(d.qpos[sim.dof_q] - dof)
             body_err.append(np.linalg.norm(sim._local_bodies(d) - sim._local_bodies(sim.ref_data), axis=1).mean())
             height_err.append(d.qpos[2] - pos[2])
@@ -543,6 +654,8 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
                 if harness:
                     forces[i], torques[i] = sim.pull(pos_s[i], rot_s[i], vel_s[i], ang_s[i])
                 mj.mj_step(sim.model, sim.data)
+            if harness:
+                pull_last = forces.mean()
             if harness and in_clip:
                 pull_f.append(forces.mean())
                 pull_f_max.append(forces.max())
@@ -563,6 +676,7 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         "first_fall_s": falls[0] if falls else None,
         "hold_falls": len(hold_falls),  # standing on the last pose after the clip
         "hold_fall_times_s": hold_falls,
+        "hold_fall_causes": hold_causes,
         "joint_rmse_deg": round(float(np.sqrt(np.mean(je ** 2))), 2) if je.size else None,
         "leg_joint_rmse_deg": round(float(np.sqrt(np.mean(je[:, legs] ** 2))), 2) if je.size else None,
         "body_error_cm": round(100 * float(np.mean(body_err)), 2) if body_err else None,
@@ -578,7 +692,53 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
     if harness:
         metrics.update(harness_metrics(sim, np.array(pull_f), np.array(pull_f_max), np.array(pull_t),
                                        len(falls), metrics["torque_saturated_ratio"]))
+    metrics.update(fall_diagnosis(sim, probe, fall_ticks, hold_ticks, causes, hold_causes, probe_error))
     return Result(sim.controller, np.array(times), np.array(roots), np.array(quats), np.array(dofs), metrics)
+
+
+def _plain(x):
+    """numpy scalars / arrays and tuples inside x as plain Python (json)."""
+    if isinstance(x, dict):
+        return {str(k): _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_plain(v) for v in x]
+    if isinstance(x, np.ndarray):
+        return _plain(x.tolist())
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
+
+
+def fall_diagnosis(sim: G1Sim, probe: FallProbe | None, fall_ticks: list[int], hold_ticks: list[int],
+                   causes: list[str], hold_causes: list[str], error: str | None = None) -> dict:
+    """The first cause of every fall (retlens/diagnosis.py) from the probe's ticks: first_fall_cause,
+    fall_diagnosis (in the clip) and hold_fall_diagnosis (in the hold), each diagnosis with the fall rule
+    as "rule". All ticks are diagnosed in order (a window never reaches back past the previous restart)
+    with DIAG_SETTLE ticks of settling and min_frames counted at 50 Hz: round(min_frames * 50 / 30), 3 for
+    the configured 2. No falls: nothing to compute (no balance tracks). A failure gives
+    fall_diagnosis_error instead (json-safe in any case)."""
+    out = {"first_fall_cause": None, "fall_diagnosis": [], "hold_fall_diagnosis": []}
+    ticks = sorted(fall_ticks + hold_ticks)
+    if not ticks:
+        return out
+    if probe is None:  # recording failed: say why (as it was), the fall rules still tell what happened
+        return {**out, "fall_diagnosis_error": error or "nothing was recorded"}
+    try:
+        from . import diagnosis
+
+        cfg = sim.diag_cfg
+        min_frames = max(1, int(round(int(cfg.get("min_frames", 2)) * (1.0 / CONTROL_DT) / DIAG_CONFIG_FPS)))
+        diags = diagnosis.diagnose_falls(probe.signals(ticks), cfg, ticks, settle=DIAG_SETTLE, min_frames=min_frames,
+                                         chronic_needs_run=True)
+        rules = {**dict(zip(fall_ticks, causes)), **dict(zip(hold_ticks, hold_causes))}
+        by_tick = {k: {**d, "rule": rules[k]} for k, d in zip(ticks, diags)}
+        clip, hold = [by_tick[k] for k in fall_ticks], [by_tick[k] for k in hold_ticks]
+        got = _plain({"first_fall_cause": clip[0]["primary_cause"] if clip else None, "fall_diagnosis": clip,
+                      "hold_fall_diagnosis": hold})
+        json.dumps(got)  # save_result writes it outside this try
+        return got
+    except Exception as e:  # never fail a run over its diagnosis: the fall rules still say what happened
+        return {**out, "fall_diagnosis_error": f"{type(e).__name__}: {e}"}
 
 
 def _stats(x: np.ndarray, digits: int = 3) -> dict:

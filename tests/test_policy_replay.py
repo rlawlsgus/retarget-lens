@@ -1,7 +1,8 @@
 """Balance on / off in MuJoCo (retlens/policy_replay.py, tools/policy_replay.py): the numpy port of
 GMT's reference sampling, and - with GMT installed (scripts/install_gmt.ps1) - that the tracking
-policy keeps the G1 up where the open-loop PD replay falls."""
+policy keeps the G1 up where the open-loop PD replay falls, and that every fall gets its first cause."""
 
+import json
 import os
 import sys
 
@@ -120,4 +121,82 @@ def test_gmt_balances_where_open_loop_pd_falls(tmp_path):
     assert out["gmt"]["falls"] == 0 and out["gmt"]["body_error_cm"] < 5.0
     assert out["pd"]["falls"] >= 1  # no balance feedback: even the authors' clean example falls
     assert out["pd"]["joint_rmse_deg"] < out["gmt"]["joint_rmse_deg"]  # the policy bends the joints to stay up
-    assert tool.write_summary(str(tmp_path)).endswith("summary.md")
+    summary = tool.write_summary(str(tmp_path))
+    with open(summary, encoding="utf-8") as f:
+        text = f.read()
+    assert summary.endswith("summary.md") and "| 넘어짐 원인 |" in text
+
+
+def test_every_fall_gets_its_first_cause(monkeypatch):
+    """The diagnosis lines up with the falls and their rules (in the clip and in the hold), the recording
+    changes nothing else, and a diagnosis that fails leaves the run and its rules as they were."""
+    files = _gmt()
+    import policy_replay as tool
+    from retlens import diagnosis
+
+    ref = pr.Reference.from_motion(tool.gmt_sample("squat"))
+    m = pr.run(pr.G1Sim(files["model"], "pd"), ref, hold_s=0.5).metrics
+    diags, hold = m["fall_diagnosis"], m["hold_fall_diagnosis"]
+    assert m["falls"] >= 1 and len(diags) == m["falls"] and "fall_diagnosis_error" not in m
+    assert [d["fall_time_s"] for d in diags] == m["fall_times_s"] and [d["rule"] for d in diags] == m["fall_causes"]
+    assert [d["fall_time_s"] for d in hold] == m["hold_fall_times_s"]
+    assert [d["rule"] for d in hold] == m["hold_fall_causes"]
+    assert m["first_fall_cause"] == diags[0]["primary_cause"]
+    assert all(d["primary_cause"] in diagnosis.CAUSES + ("undetermined",) for d in diags + hold)
+    assert all(d["primary_cause"] != "harness_spike" for d in diags)  # no harness in "pd"
+    assert json.loads(json.dumps(m)) == m  # plain json: save_result writes it as it is
+
+    def rest(x):
+        return {k: v for k, v in x.items()
+                if k not in ("first_fall_cause", "fall_diagnosis", "hold_fall_diagnosis", "fall_diagnosis_error")}
+
+    with monkeypatch.context() as mp:
+        mp.setattr(pr.FallProbe, "sample", lambda self, *a, **k: None)  # nothing recorded
+        bare = pr.run(pr.G1Sim(files["model"], "pd"), ref, hold_s=0.5).metrics
+    assert rest(bare) == rest(m)  # the falls, their times and every other number are the run's own
+    assert bare["fall_diagnosis"] == [] and bare["first_fall_cause"] is None and bare["fall_diagnosis_error"]
+
+    def broken(*a, **k):
+        raise ValueError("broken diagnosis")
+
+    monkeypatch.setattr(diagnosis, "diagnose_falls", broken)
+    failed = pr.run(pr.G1Sim(files["model"], "pd"), ref, hold_s=0.5).metrics
+    assert failed["fall_diagnosis_error"] == "ValueError: broken diagnosis" and rest(failed) == rest(m)
+    assert failed["fall_diagnosis"] == [] and failed["hold_fall_diagnosis"] == [] and failed["first_fall_cause"] is None
+
+
+def test_fall_probe_samples_each_tick(monkeypatch):
+    """The probe: per tick 2 feet x 4 sole points and the feet's floor forces (which carry the robot's weight
+    while it stands in the harness, which pulls sideways only), and the signals diagnose_falls takes."""
+    files = _gmt()
+    probes = []
+
+    class Keep(pr.FallProbe):
+        def __init__(self, sim):
+            super().__init__(sim)
+            probes.append(self)
+
+    monkeypatch.setattr(pr, "FallProbe", Keep)
+    n, fps = 60, 30.0
+    still = pr.Reference(np.tile([0.0, 0.0, 0.793], (n, 1)), np.tile([0.0, 0.0, 0.0, 1.0], (n, 1)),
+                         np.tile(pr.GMT_DEFAULT, (n, 1)), fps)
+    sim = pr.G1Sim(files["model"], "harness")
+    m = pr.run(sim, still, hold_s=0.5).metrics
+    assert m["falls"] == 0 and m["fall_diagnosis"] == [] and m["first_fall_cause"] is None
+    assert m["hold_fall_causes"] == [] and "fall_diagnosis_error" not in m
+    rec = {k: np.array(v) for k, v in probes[-1].rec.items()}
+    T = int(round((still.length + 0.5) / pr.CONTROL_DT))
+    assert rec["soles"].shape == rec["ref_soles"].shape == (T, 2, 4, 3) and rec["force"].shape == (T, 2)
+    assert np.allclose(rec["force"][10:].sum(1), sim.weight, rtol=0.1)
+    assert np.abs(rec["soles"][10:, ..., 2]).max() < 0.01  # standing: the sole points on the floor
+    centres = rec["soles"].mean(2)  # (T, 2, 3): the feet's ankle links lie above these, mirrored
+    assert np.allclose(rec["feet_m"][10:], np.linalg.norm(centres[10:, 0] - centres[10:, 1], axis=1), atol=0.03)
+    sig = probes[-1].signals([])
+    assert sig.assist == 1.0 and sig.harness.shape == (T,) and sig.tau_ratio.shape == (T, len(pr.GMT_DOFS))
+    assert np.isfinite(sig.sim_track.com_margin[10:]).all() and sig.ref_track is not None
+    pd = pr.G1Sim(files["model"], "pd")
+    pr.run(pd, still, duration_s=0.2)
+    sig = probes[-1].signals([3])
+    assert sig.assist == 0.0 and sig.harness is None and len(sig.soles) == 10
+    made = len(probes)
+    assert pr.run(pd, still, home=True, duration_s=0.1).metrics["fall_diagnosis"] == [] and len(probes) == made

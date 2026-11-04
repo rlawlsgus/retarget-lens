@@ -8,10 +8,12 @@ Per file: the retarget (cached like any retarget) with the corrections of the op
 what cost it the most, the foot / balance / quality metrics, the problem spans (retlens.problems: seconds per
 kind), the objects captured with it (FBX) and how well the robot's hands meet them, its labels (the label
 file next to it, else 자동 라벨 by the options' rule file) and, with physics on, the MuJoCo harness check
-(falls, harness force, verdict). A file that cannot be read gives a row with "error".
+(falls, the first fall's cause and the falls per cause (retlens/diagnosis.py), harness force, verdict). A file
+that cannot be read gives a row with "error".
 
-Rows are cached per file (path, size, modification time) and options (retarget corrections, physics, the
-rule file and its modification time), so a run that was stopped or a folder run again skips what is done.
+Rows are cached per file (path, size, modification time) and options (retarget corrections, physics with
+policy_replay.RESULT_VERSION, the rule file and its modification time), so a run that was stopped or a folder
+run again skips what is done.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import hashlib
 import json
 import os
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import Callable
 
@@ -38,7 +41,8 @@ COLUMNS = [
     ("self_collision_pct", "자기 충돌 (%)", "{:.1f}"), ("joint_limit_pct", "관절 한계 (%)", "{:.1f}"),
     ("objects", "물체", "{}"), ("hand_obj_reach_pct", "물체 닿음 (%)", "{:.0f}"),
     ("labels", "라벨", "{}"), ("label_segments", "라벨 구간", "{}"),
-    ("phys_falls", "물리 넘어짐", "{}"), ("phys_harness_pct", "보조 힘 (%)", "{:.0f}"), ("phys_ok", "물리 판정", "{}"),
+    ("phys_falls", "물리 넘어짐", "{}"), ("phys_first_cause", "첫 넘어짐 원인", "{}"),
+    ("phys_harness_pct", "보조 힘 (%)", "{:.0f}"), ("phys_ok", "물리 판정", "{}"),
     ("kind", "종류", "{}"), ("error", "오류", "{}"), ("file", "파일", "{}"),
 ]
 
@@ -88,6 +92,10 @@ class Batch:
         o = asdict(self.opts)
         rules = o.pop("rules")
         o.pop("smpl_model_dir")
+        if o["physics"]:  # MuJoCo results that change meaning make the physics rows again (only those)
+            from .policy_replay import RESULT_VERSION
+
+            o["physics"] = RESULT_VERSION
         rule_id = [os.path.abspath(rules), os.path.getmtime(rules)] if rules and os.path.isfile(rules) else rules
         raw = json.dumps([BATCH_VERSION, os.path.abspath(path), st.st_size, st.st_mtime_ns, o, rule_id], sort_keys=True)
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
@@ -127,7 +135,8 @@ class Batch:
             row = {"error": f"{type(e).__name__}: {e}"}
         row = {"file": os.path.abspath(path), "folder": os.path.basename(os.path.dirname(os.path.abspath(path))),
                "name": os.path.splitext(os.path.basename(path))[0], **row, "seconds_taken": round(time.time() - t0, 2)}
-        if "error" not in row:  # failures are tried again next time (a missing Blender, a file being written)
+        if "error" not in row and "phys_diagnosis_error" not in row:  # failures are tried again next time (a missing
+            # Blender, a file being written, a fall diagnosis that failed)
             os.makedirs(self.cache_dir, exist_ok=True)
             with open(self._cache_file(path), "w", encoding="utf-8") as f:
                 json.dump(row, f, ensure_ascii=False)
@@ -193,11 +202,19 @@ class Batch:
         except Exception as e:
             return {"phys_error": f"{type(e).__name__}: {e}"}
         from .compare import _issue_ko
+        from .diagnosis import CAUSE_KO, cause_counts_text
 
+        if m.get("fall_diagnosis_error"):
+            self.log(f"MuJoCo fall diagnosis failed: {m['fall_diagnosis_error']}")
         pull = (m.get("harness_force_per_body_weight") or {}).get("mean")
+        first = m.get("first_fall_cause")
         return {"phys_falls": m["falls"], "phys_harness_pct": None if pull is None else round(100 * pull, 1),
                 "phys_saturated_pct": round(100 * m["torque_saturated_ratio"], 1),
-                "phys_ok": "통과" if m.get("consistent") else "; ".join(map(_issue_ko, m.get("issues", [])))}
+                "phys_ok": "통과" if m.get("consistent") else "; ".join(map(_issue_ko, m.get("issues", []))),
+                # the falls inside the clip: the first one's cause, and how many per cause
+                "phys_first_cause": CAUSE_KO.get(first, first) if first else None,
+                "phys_fall_causes": cause_counts_text(m.get("fall_diagnosis") or []) or None,
+                **({"phys_diagnosis_error": m["fall_diagnosis_error"]} if m.get("fall_diagnosis_error") else {})}
 
     # ------------------------------------------------------------ many files
     def run(self, files: list[str], progress: Callable[[int, int, dict], None] | None = None,
@@ -216,12 +233,14 @@ class Batch:
 
 
 def totals(rows: list[dict]) -> dict:
-    """Counts and seconds of the rows: all, readable, with errors, QC FAIL / WARN, physics falls, labelled."""
+    """Counts and seconds of the rows: all, readable, with errors, QC FAIL / WARN, physics falls (and the
+    rows per first fall cause, {Korean cause: rows}, the most common first), labelled."""
     ok = [r for r in rows if not r.get("error")]
+    first = Counter(r["phys_first_cause"] for r in ok if r.get("phys_first_cause"))
     return {"motions": len(rows), "read": len(ok), "errors": len(rows) - len(ok),
             "total_s": round(sum(r.get("duration_s") or 0.0 for r in ok), 2),
             "qc_fail": sum(r.get("qc") == "FAIL" for r in ok), "qc_warn": sum(r.get("qc") == "WARN" for r in ok),
-            "with_falls": sum(bool(r.get("phys_falls")) for r in ok),
+            "with_falls": sum(bool(r.get("phys_falls")) for r in ok), "first_fall_causes": dict(first.most_common()),
             "labelled": sum(bool(r.get("labels")) for r in ok), "with_objects": sum(bool(r.get("objects")) for r in ok)}
 
 

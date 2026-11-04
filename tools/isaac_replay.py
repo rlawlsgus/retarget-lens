@@ -902,101 +902,27 @@ def _stats(x: np.ndarray, digits: int = 3) -> dict:
 def fall_diagnosis(d: dict, fps: float, fall_frames: list[int], robot, ref_sp: np.ndarray, SP: np.ndarray,
                    LP: np.ndarray, FF: np.ndarray, weight: float, tau_ratio: np.ndarray, joint_names: list[str],
                    sim_track, harness: np.ndarray, assist: float, ref_track=None) -> list[dict]:
-    """First cause of every fall (retlens/diagnosis.py). ref_sp / SP: (T, feet, C, 3) sole points
-    of the clip (reference pass) and of the simulation; LP (T, L, 3) simulated link positions;
-    FF (T, feet) foot contact forces (NaN if unavailable); tau_ratio (T, joints) drive demand / limit.
-    ref_track: the clip's BalanceTrack, so support_exit evidence shows whether the clip itself
-    had the CoM outside its feet at that moment (a data issue) or only the simulation did."""
-    from retlens.analysis import floor_track, slowest_sole_speed
-    from retlens.diagnosis import diagnose_fall
+    """First cause of every fall (retlens/diagnosis.py diagnose_falls, shared with the MuJoCo
+    replays). ref_sp / SP: (T, feet, C, 3) sole points of the clip (reference pass) and of the
+    simulation; LP (T, L, 3) simulated link positions; FF (T, feet) foot contact forces (NaN if
+    unavailable); tau_ratio (T, joints) drive demand / limit. ref_track: the clip's BalanceTrack,
+    so support_exit evidence shows whether the clip itself had the CoM outside its feet at that
+    moment (a data issue) or only the simulation did. Settles 3 frames after a (re)start."""
+    from retlens.diagnosis import FallSignals, diagnose_falls
 
     if not fall_frames:
         return []
     T = len(SP)
     feet = robot.foot_names
-    ref_low = ref_sp[..., 2].min(-1)
-    ref_speed = slowest_sole_speed(ref_sp, fps)
-    ref_clear = ref_low - floor_track(ref_low, ref_speed, fps)[:, None]
-    sim_low = SP[..., 2].min(-1)
-    sim_speed = slowest_sole_speed(SP, fps)
-    ff = np.nan_to_num(FF, nan=0.0)
-    contact_h = float(d.get("contact_height_m", 0.005))
-    on_floor = (sim_low < contact_h) | (ff > float(d.get("contact_force_bw", 0.05)) * weight)
-    # the clip's foot swings (fast and off the floor: a touchdown at 0.6 m/s is not a swing)
-    toe = on_floor & (ref_speed > float(d.get("swing_speed_mps", 0.5))) & (ref_clear > contact_h)
-    slip_v = float(d.get("slip_speed_mps", 0.3))
-    slip = on_floor & (sim_speed > slip_v) & (ref_speed < slip_v)
     idx = {n: i for i, n in enumerate(robot.link_names)}
     pairs = {"feet": [idx[f] for f in feet[:2]] if len(feet) >= 2 else [],
              "knees": [i for n, i in idx.items() if "knee" in n.lower()][:2]}
     dist = {k: np.linalg.norm(LP[:, v[0]] - LP[:, v[1]], axis=1) if len(v) == 2 else np.full(T, np.inf)
             for k, v in pairs.items()}
-    selfc = np.minimum(dist["feet"], dist["knees"]) < float(d.get("self_distance_m", 0.09))
-    tmax, targ = tau_ratio.max(1), tau_ratio.argmax(1)
-    torque = tmax > float(d.get("torque_ratio", 1.5))
-    cm = np.nan_to_num(sim_track.com_margin, nan=0.0)
-    zm = np.nan_to_num(sim_track.zmp_margin, nan=0.0)
-    exit_ = cm < -float(d.get("com_outside_m", 0.03))
-    if assist <= 0:  # with the harness on, the ZMP includes its pull and leaves the feet all the time
-        exit_ |= zm < -float(d.get("zmp_outside_m", 0.05))
-    exit_ &= sim_track.supported
-    spike = harness > float(d.get("harness_bw", 0.5)) if assist > 0 else np.zeros(T, bool)
-
-    def r(x, k=2):
-        return None if x is None or not np.isfinite(x) else round(float(x), k)
-
-    def toe_ev(i, a, b):
-        ks = np.flatnonzero(toe[i])
-        return {"feet": [feet[k] for k in ks],
-                "clip_foot_speed_mps": [r(ref_speed[i, k]) for k in ks],
-                "clip_clearance_cm": [r(100 * ref_clear[i, k], 1) for k in ks],
-                "sim_sole_height_cm": [r(100 * sim_low[i, k], 1) for k in ks],
-                "contact_force_n": [r(ff[i, k], 0) for k in ks]}
-
-    def slip_ev(i, a, b):
-        ks = np.flatnonzero(slip[i])
-        return {"feet": [feet[k] for k in ks], "sim_foot_speed_mps": [r(sim_speed[i, k]) for k in ks],
-                "peak_speed_in_window_mps": r(sim_speed[a:b + 1].max())}
-
-    def self_ev(i, a, b):
-        return {"feet_distance_m": r(dist["feet"][i], 3), "knees_distance_m": r(dist["knees"][i], 3),
-                "min_in_window_m": r(min(dist["feet"][a:b + 1].min(), dist["knees"][a:b + 1].min()), 3)}
-
-    def torque_ev(i, a, b):
-        w = a + int(np.argmax(tmax[a:b + 1]))
-        return {"joint": joint_names[targ[i]], "demand_per_limit": r(tmax[i]),
-                "peak_joint": joint_names[targ[w]], "peak_demand_per_limit": r(tmax[w]), "peak_s": r(w / fps, 3)}
-
-    def exit_ev(i, a, b):
-        ev = {"com_margin_cm": r(100 * sim_track.com_margin[i], 1), "zmp_margin_cm": r(100 * sim_track.zmp_margin[i], 1),
-              "feet_on_floor": int(sim_track.phase[i]),
-              "min_com_margin_in_window_cm": r(100 * np.nanmin(sim_track.com_margin[a:b + 1]), 1)
-              if np.isfinite(sim_track.com_margin[a:b + 1]).any() else None}
-        if ref_track is not None and i < len(ref_track.com_margin):
-            ev["clip_com_margin_cm"] = r(100 * ref_track.com_margin[i], 1)  # < 0: the clip's own CoM was outside too
-        return ev
-
-    def harness_ev(i, a, b):
-        return {"harness_per_body_weight": r(harness[i]), "peak_in_window": r(harness[a:b + 1].max())}
-
-    conditions = {"toe_catch": toe.any(1), "foot_slip": slip.any(1), "self_collision": selfc,
-                  "torque_saturation": torque, "support_exit": exit_}
-    evidence = {"toe_catch": toe_ev, "foot_slip": slip_ev, "self_collision": self_ev,
-                "torque_saturation": torque_ev, "support_exit": exit_ev}
-    if assist > 0:
-        conditions["harness_spike"] = spike
-        evidence["harness_spike"] = harness_ev
-    window = max(1, int(round(float(d.get("window_s", 0.75)) * fps)))
-    settle = 3  # frames after a (re)start, while the robot settles on the floor
-    out, prev = [], 0
-    for fr in fall_frames:
-        if fr >= T:
-            break
-        start = min(max(prev + settle, fr - window), fr)
-        out.append(diagnose_fall(conditions, evidence, fr, start, fps, int(d.get("min_frames", 2)),
-                                 earliest=min(prev + settle, fr)))
-        prev = fr
-    return out
+    sig = FallSignals(fps=fps, feet=feet, ref_soles=ref_sp, soles=SP, foot_force=FF, weight=weight,
+                      tau_ratio=tau_ratio, joint_names=joint_names, sim_track=sim_track, distances=dist,
+                      harness=harness, assist=assist, ref_track=ref_track)
+    return diagnose_falls(sig, d, fall_frames)
 
 
 def run_physics(robot, human, skel, human_qc, robot_qc, qc_cfg: QCConfig, cfg: dict, substeps: int) -> int:

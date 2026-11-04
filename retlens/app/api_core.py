@@ -19,7 +19,7 @@ import numpy as np
 
 from .. import cmu_labels, paths, settings
 from ..compare import Item, library_files
-from .scene import METRIC_DESC, METRIC_ROWS, MotionScene, SceneOptions, load_robot_urdf
+from .scene import BALANCE, METRIC_DESC, METRIC_ROWS, MotionScene, SceneOptions, load_robot_urdf
 
 API_VERSION = 1
 APP = "RetLens"  # QSettings organisation / application (the editor's settings, Isaac EULA consent)
@@ -79,6 +79,23 @@ def find_item(scene: MotionScene, key) -> Item:
     raise KeyError(f"no motion {key!r}; open ones: {[it.label for it in items]}")
 
 
+def falls_info(scene, shown, details: bool = True) -> list[dict]:
+    """The falls of what is shown: time, first cause (Korean, the timeline's text; cause_id: retlens.diagnosis's id,
+    None without a diagnosis), its onset, MuJoCo's fall rule, after the clip; details: the cause's numbers and the
+    other conditions too."""
+    out = []
+    for (t, text), d in zip(scene.falls_of(shown), scene.fall_details(shown)):
+        f = {"time_s": t, "cause": text, "cause_id": d["cause"], "onset_s": d["onset_s"], "rule": d["rule"],
+             "after_clip": d["after_clip"]}
+        if details:
+            f.update(evidence=d["evidence"], others=[{"cause": c, "onset_s": o, "already_on": a, "since_s": s}
+                                                     for c, o, a, s in d["others"]])
+        if d["why_none"]:
+            f["why_no_cause"] = d["why_none"]
+        out.append(f)
+    return out
+
+
 def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
     """One motion: what it is, its timing, QC, and (metrics=True) every measured value."""
     r, m = item.robot, item.metrics
@@ -116,17 +133,34 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
     # labelled time segments (retlens.motion_labels): None = no label file; "now" at the scene's time
     labels = item.labels  # read once: the window's threads may replace it meanwhile
     out["labels"] = labels.summary(scene.t - item.offset, segments=metrics) if labels is not None else None
+    if out["labels"] is not None and hasattr(scene, "label_undo_text"):  # label editing (the window's undo history)
+        undo, redo = scene.label_undo_text(item)
+        out["labels"].update(unsaved_edits=labels.edited, undo=undo, redo=redo)
     # where the problems are (retlens.problems; falls under "fall"), in motion time: {kind: [[start_s, end_s], ...]}
     out["problems"] = {k: [list(s) for s in sp] for k, sp in scene.problems(item).items()}
     if metrics:
         out["metrics"] = {k: v for k, v in m.items() if not k.startswith("_") and k not in ("qc", "qc_notes")}
-    if scene.physics_on or item.handles.get("phys"):
+    sim = scene.is_sim_result(item)  # a physics result file opened as it is: its own falls, made its own way
+    if scene.physics_on or item.handles.get("phys") or sim:
         shown = scene.shown(item)
-        out["physics"] = {"state": scene.job_text(item), "balance": scene.balance, "mode": scene.mode_label(),
-                          "assist": scene.assist,
-                          "result_ready": shown is not item,
-                          "falls": [{"time_s": t, "cause": c} for t, c in scene.falls(item)]}
-        if shown is not item:
+        balance, mode, assist = scene.balance, scene.mode_label(), scene.assist
+        if sim:
+            pol, iso = shown.info.get("policy_replay"), shown.info.get("physics", {})
+            if pol:
+                balance = pol.get("controller") or "pd"
+                mode, assist = BALANCE.get(balance, balance), 1.0 if balance == "harness" else 0.0
+            else:
+                balance, assist = "isaac", float(iso.get("harness_scale", 1.0))
+                mode = f"{BALANCE['isaac']} x{assist:g}"
+        out["physics"] = {"state": scene.job_text(item), "balance": balance, "mode": mode, "assist": assist,
+                          "source": "result_file" if sim else "physics_mode",
+                          "result_ready": shown is not item or sim,
+                          "falls": falls_info(scene, shown, metrics)}
+        diags = (shown.info.get("policy_replay") or shown.info.get("physics") or {})
+        out["physics"]["first_fall_cause"] = diags.get("first_fall_cause")
+        if diags.get("fall_diagnosis_error"):
+            out["physics"]["fall_diagnosis_error"] = diags["fall_diagnosis_error"]
+        if shown is not item or sim:
             out["physics"]["metrics"] = {k: v for k, v in shown.metrics.items() if k.startswith("phys_")}
     return jsonable(out)
 

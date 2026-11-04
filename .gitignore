@@ -31,3 +31,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
+
+# 작업 세션 files: the user's own, with local absolute paths
+*.retlens
+*.retlens.json

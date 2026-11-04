@@ -126,6 +126,31 @@ def test_physics_result_metrics_and_labels():
     assert m["phys_falls"] == 2 and abs(m["phys_harness_pct"] - 19.0) < 1e-9 and abs(m["phys_saturated_pct"] - 3.5) < 1e-9
     assert m["phys_ok"] == "넘어짐 2회; 보조 힘 > 체중 20%: 프레임 48.8%; 토크 한계 초과: 프레임 3.5%"
     assert _issue_ko("something else") == "something else"
+    assert m["phys_fall_causes"] is None  # no diagnosis in this result (made before there was one)
+
+
+def test_physics_fall_causes_metric():
+    """물리: 넘어짐 원인 for both engines: falls per first cause (in the clip); Isaac keeps the first 20."""
+    def fall(cause):
+        return {"primary_cause": cause, "primary_onset_s": 0.5, "fall_time_s": 1.0}
+
+    isaac = Item(label="sim", source="x_sim.npz", kind="Isaac PhysX sim", robot=g1_motion(seconds=1.0), info={
+        "physics": {"consistent": False, "falls": 3, "issues": ["3 fall(s)"],
+                    "fall_diagnosis": [fall("toe_catch"), fall("support_exit"), fall("toe_catch")]}})
+    compute_metrics(isaac, None, None)
+    assert isaac.metrics["phys_fall_causes"] == "발끝 걸림 2 · 지지면 이탈 1"
+    isaac.info["physics"].update(falls=25, fall_diagnosis=[fall("support_exit")] * 20)
+    compute_metrics(isaac, None, None)
+    assert isaac.metrics["phys_fall_causes"] == "지지면 이탈 20 (앞 20회)"
+    mujoco = Item(label="sim", source="x_pd_sim.npz", kind="MuJoCo 재생 · 제어기 없음", robot=g1_motion(seconds=1.0), info={
+        "policy_replay": {"controller": "pd", "falls": 2, "torque_saturated_ratio": 0.1,
+                          "fall_diagnosis": [fall("torque_saturation"), fall("undetermined")],
+                          "hold_fall_diagnosis": [fall("foot_slip")]}})
+    compute_metrics(mujoco, None, None)
+    assert mujoco.metrics["phys_fall_causes"] == "토크 포화 1 · 미상 1" and mujoco.metrics["phys_ok"] == "넘어짐 2회"
+    mujoco.info["policy_replay"].update(falls=0, fall_diagnosis=[], hold_fall_diagnosis=[])
+    compute_metrics(mujoco, None, None)
+    assert mujoco.metrics["phys_fall_causes"] is None
 
 
 def test_physics_report_fall_cause_column():
@@ -140,3 +165,4 @@ def test_physics_report_fall_cause_column():
     assert causes(p) == "발끝 걸림 1.467s (넘어짐 2.067s)"
     p = {"fall_diagnosis": [fall("support_exit", 0.4, 1.0)] * 3 + [fall("foot_slip", 5, 6)] + [fall("support_exit", 7, 8)] * 2}
     assert causes(p).endswith("; 외 지지면 이탈 2, 발 미끄러짐 1")
+    assert causes({"fall_diagnosis": [fall("undetermined", None, 3.0)]}) == "미상 (넘어짐 3.0s)"  # no onset to show
