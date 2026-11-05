@@ -59,6 +59,7 @@ class Settings:
     smpl_model_dir: str = ""  # folder holding smplx/SMPLX_*.npz
     video_dir: str = ""  # where 동영상 저장 writes
     library_dirs: list[str] = field(default_factory=list)  # motion folders besides the defaults
+    robot_model: str = ""  # the robot: its MJCF / URDF (any humanoid, retlens.robot_profile); empty = Unitree G1
     robot_usd: str = ""  # robot USD for Isaac (local file or URL); empty = G1 from NVIDIA's asset library
     gmt_dir: str = ""  # GMT folder (assets\pretrained_checkpoints\pretrained.pt); empty = the usual places
     api_enabled: bool = True  # the window's local HTTP API for AI agents (127.0.0.1 + token, retlens/app/api_server.py)
@@ -308,6 +309,38 @@ def find_gmt(s: Settings | None = None) -> Found:
                  ("" if os.path.isfile(os.path.join(folder, GMT_MODEL)) else " (프로그램에 들어 있는 것)"))
 
 
+# ------------------------------------------------------------------------------ the robot
+ROBOT_EXT = (".xml", ".urdf")
+
+
+def robot_spec(s: Settings | None = None) -> str:
+    """The robot to retarget to and show: the chosen MJCF / URDF, else the built-in Unitree G1."""
+    s = s or load()
+    return s.robot_model.strip().strip('"') or "unitree_g1"
+
+
+def find_robot(s: Settings | None = None) -> Found:
+    """The robot model in use and whether its legs, arms and feet can be found in it."""
+    s = s or load()
+    spec = robot_spec(s)
+    try:
+        from .robot_profile import RobotError, load as load_robot
+
+        prof = load_robot(spec)
+    except Exception as e:  # RobotError (no file, wrong type) or an import problem
+        return Found(None, "설정", problem=str(e))
+    source = "기본" if prof.builtin else "설정"
+    if importlib.util.find_spec("mujoco") is None:  # the parts need MuJoCo: report the file only
+        return Found(prof.mjcf, source, prof.name)
+    try:
+        parts = prof.parts
+    except RobotError as e:
+        return Found(None, source, problem=f"{prof.name}: {e}")
+    except Exception as e:  # MuJoCo cannot compile it
+        return Found(None, source, problem=f"{prof.name}: MuJoCo가 읽지 못함 ({type(e).__name__}: {e})")
+    return Found(prof.mjcf, source, f"{prof.name}, {prof.model().nq - 7} DoF, 키 {parts.top_height:.2f} m")
+
+
 # ------------------------------------------------------------------------------ robot USD
 USD_EXT = (".usd", ".usda", ".usdc", ".usdz")
 
@@ -318,6 +351,8 @@ def find_robot_usd(s: Settings | None = None) -> Found:
     s = s or load()
     v = s.robot_usd.strip().strip('"')
     if not v:
+        if robot_spec(s) != "unitree_g1":  # NVIDIA's G1 would replay another robot's motions
+            return Found(None, "설정", problem="G1이 아닌 로봇은 그 로봇의 USD를 골라야 Isaac에서 돌릴 수 있습니다")
         return Found("", "기본 (NVIDIA 에셋 서버)", "Isaac Sim 에셋 라이브러리의 Unitree G1, 인터넷 필요")
     if "://" in v:
         return Found(v, "설정 (URL)", "Isaac이 이 주소에서 읽음")
@@ -386,16 +421,20 @@ def check_all(s: Settings | None = None) -> list[Check]:
     """What each feature needs and whether it is there, for the settings window and startup."""
     s = s or load()
     out = []
-    urdf = paths.robot_urdf()
-    out.append(Check("robot", "로봇 모델 (Unitree G1)", os.path.isfile(urdf), True, urdf, "",
-                     "모든 화면", "설치가 깨졌습니다. 프로그램을 다시 설치하세요" if paths.INSTALLED else
+    robot = find_robot(s)
+    custom = robot_spec(s) != "unitree_g1"
+    out.append(Check("robot", "로봇 모델", robot.path is not None, True, robot.path or "",
+                     " · ".join(x for x in (robot.detail, robot.source) if x) if robot.path else robot.problem,
+                     "모든 화면", "" if robot.path else
+                     "환경 설정의 로봇 모델에서 MJCF(.xml) / URDF(.urdf)를 다시 고르거나 칸을 비워 G1을 쓰세요" if custom else
+                     "설치가 깨졌습니다. 프로그램을 다시 설치하세요" if paths.INSTALLED else
                      "저장소 옆에 GMR이 있어야 합니다 (scripts\\install_gmr.ps1)"))
     libs = [m for m in ("mink", "mujoco") if importlib.util.find_spec(m) is None]
-    mjcf = os.path.join(paths.robot_assets_dir(), "unitree_g1", "g1_mocap_29dof.xml")
-    gmr = not libs and os.path.isfile(mjcf)  # GMR's solver itself ships in retlens/gmr
-    out.append(Check("gmr", "리타게팅 (GMR)", gmr, False, mjcf, "GMR(내장), mink, MuJoCo, G1 MJCF" if gmr else
-                     (f"{', '.join(libs)} 없음" if libs else "G1 MJCF 없음"),
+    gmr = not libs and robot.path is not None  # GMR's solver itself ships in retlens/gmr
+    out.append(Check("gmr", "리타게팅 (GMR)", gmr, False, robot.path or "", "GMR(내장), mink, MuJoCo, 로봇 모델" if gmr else
+                     (f"{', '.join(libs)} 없음" if libs else "로봇 모델 없음"),
                      "사람 모션(BVH·FBX·SMPL-X·C3D) 열기", "" if gmr else
+                     "로봇 모델을 확인하세요" if custom else
                      "설치가 깨졌습니다. 프로그램을 다시 설치하세요" if paths.INSTALLED else "scripts\\install_gmr.ps1을 실행하세요"))
     for key, name, found, needed_for, hint in (
             ("isaac", "Isaac Sim", find_isaac(s), "물리 모드 '보조 힘 (Isaac)', 동영상 저장",
@@ -411,6 +450,7 @@ def check_all(s: Settings | None = None) -> list[Check]:
     out.append(Check("robot_usd", "로봇 USD (Isaac)", usd.path is not None, False, usd.path or "",
                      " · ".join(x for x in (usd.detail, usd.source) if x) if usd.path is not None else usd.problem,
                      "물리 모드 '보조 힘 (Isaac)', 동영상 저장", "" if usd.path is not None else
+                     "이 로봇의 USD 파일을 고르세요" if custom else
                      "USD 파일을 고르거나 칸을 비워 NVIDIA 에셋 서버의 G1을 쓰세요"))
     gmt = find_gmt(s)  # the policy runs in numpy (retlens/gmt_policy.py): no PyTorch needed
     mujoco = importlib.util.find_spec("mujoco") is not None

@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 from retlens import retarget_quality as rq  # noqa: E402
 from retlens.motion import RobotMotion  # noqa: E402
+from retlens.robot_profile import Point  # noqa: E402
 
 BVH = os.path.join(ROOT, "data", "samples", "synthetic_walk.bvh")
 
@@ -47,7 +48,7 @@ def test_self_collision(g1):
     i = fk.joint_names.index("left_shoulder_roll_joint")
     q[1, i] = fk.lo[i]  # the arm across the chest, as far as the joint goes
     m = RobotMotion("t", fk.joint_names, np.tile([0.0, 0.0, 0.8], (2, 1)), np.tile([1.0, 0, 0, 0], (2, 1)), q, 30.0)
-    _, _, hits = fk.run(m, [1])
+    _, _, hits = fk.run(m, [Point(1, np.zeros(3))])
     assert hits[0] == set()
     assert any("torso_link" in (fk.name(a), fk.name(b)) for a, b in hits[1])
 

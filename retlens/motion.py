@@ -96,7 +96,10 @@ class RobotMotion:
         return self.num_frames / self.fps if self.fps > 0 else 0.0
 
     def save_npz(self, path: str) -> None:
-        """Write the project's canonical robot-motion file."""
+        """Write the project's canonical robot-motion file (with the robot's name and model digest
+        when known: meta["robot_ident"], retlens.robot_profile.RobotProfile.ident)."""
+        ident = self.meta.get("robot_ident") or {}
+        extra = {f"robot_{k}": np.array(str(ident[k])) for k in ("name", "digest") if ident.get(k)}
         np.savez_compressed(
             path,
             fps=np.float64(self.fps),
@@ -104,4 +107,5 @@ class RobotMotion:
             root_pos=self.root_pos.astype(np.float32),
             root_quat_wxyz=self.root_quat.astype(np.float32),
             dof_pos=self.dof_pos.astype(np.float32),
+            **extra,
         )

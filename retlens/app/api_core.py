@@ -19,7 +19,7 @@ import numpy as np
 
 from .. import cmu_labels, paths, settings
 from ..compare import Item, library_files
-from .scene import BALANCE, METRIC_DESC, METRIC_ROWS, MotionScene, SceneOptions, load_robot_urdf
+from .scene import BALANCE, METRIC_DESC, METRIC_ROWS, MotionScene, SceneOptions, load_robot_drawing
 
 API_VERSION = 1
 APP = "RetLens"  # QSettings organisation / application (the editor's settings, Isaac EULA consent)
@@ -60,9 +60,10 @@ def headless_scene(log=None, mesh_cell: float = 0.004, **opts) -> MotionScene:
         port = sock.getsockname()[1]
     server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
     s = settings.load()
+    opts = {"robot": settings.robot_spec(s), **opts}
     opts = SceneOptions(smpl_model_dir=settings.find_smpl(s).path or paths.smpl_model_dir(), video_dir=settings.video_dir(s),
                         **opts)
-    return MotionScene(server, load_robot_urdf(paths.robot_urdf(), mesh_cell, log=log), opts, log=log)
+    return MotionScene(server, load_robot_drawing(opts.robot, opts.urdf, mesh_cell, log=log), opts, log=log)
 
 
 def find_item(scene: MotionScene, key) -> Item:
@@ -107,6 +108,8 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
         "ik_position_residual": item.info.get("ik_position_residual"),
         "retarget": item.retarget or None,  # human inputs: smooth_hz, foot_flat, swing_clearance_cm, self_collision
     }
+    if item.info.get("robot_mismatch"):  # a robot motion made for another robot (scene._check_robot)
+        out["robot_mismatch"] = item.info["robot_mismatch"]
     if m.get("_quality"):  # retlens.retarget_quality: worst limbs, pinned joints, colliding parts, what cost points
         out["retarget_quality"] = m["_quality"]
     if item.info.get("foot_flat"):
@@ -165,6 +168,19 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
     return jsonable(out)
 
 
+def robot_info(scene: MotionScene) -> dict:
+    """The robot the window retargets to and shows (환경 설정 > 로봇 모델; retlens.robot_profile)."""
+    prof = scene.robot_profile
+    out = {"name": prof.name, "builtin": prof.builtin, "model": prof.mjcf, "digest": prof.digest}
+    try:
+        p = prof.parts
+        out.update({"dof": prof.model().nq - 7, "height_m": round(p.top_height, 3),
+                    "standing_pelvis_m": round(p.standing_height, 3), "notes": list(p.notes)})
+    except Exception as e:  # MuJoCo missing, or a model whose parts cannot be found
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def status(scene: MotionScene) -> dict:
     """The scene at a glance."""
     lo, hi = scene.time_range()
@@ -178,6 +194,7 @@ def status(scene: MotionScene) -> dict:
         "compare": {"on": pair is not None, "a": c.ref.label if pair else None, "b": c.item.label if pair else None,
                     "heading": c.heading, "tol_cm": c.tol_cm},
         "retarget": scene.retarget_settings(),  # for the human motions opened next
+        "robot": robot_info(scene),
         "motions": [item_info(scene, it, metrics=False) for it in list(scene.items)],
     })
 

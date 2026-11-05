@@ -3,13 +3,13 @@ same way (retlens/retarget_quality.py), so "this robot retargets well, that one 
 comes out as one table.
 
     python tools/retarget_benchmark.py                                  # G1, the CMU BVH clips (public)
-    python tools/retarget_benchmark.py --robot unitree_g1 --robot <another GMR robot> data/raw/cmu_bvh
+    python tools/retarget_benchmark.py --robot unitree_g1 --robot D:/robots/x/x.xml data/raw/cmu_bvh   # vs another robot
     python tools/retarget_benchmark.py data/raw/cmu_bvh --foot-flat --out reports/retarget_quality/foot_flat
 
 Inputs: human motion files or folders of them (BVH, FBX, AMASS SMPL-X npz; robot motions are
 skipped), retargeted with the same settings for every robot (cached in data/cache/retarget/).
-A robot takes part once retlens/retarget.py has its T-pose tables (TPOSE_LIMBS, TPOSE_FEET),
-the same tables retargeting BVH / FBX / SMPL-X to it needs.
+A robot is unitree_g1 or the path of a humanoid's MJCF / URDF; it takes part once its legs, arms
+and feet can be found in its model (retlens.robot_profile), as retargeting to it needs.
 
 Writes <out>/summary.md (per robot: score, grades and the median of every quality metric; per
 clip: score and what cost points) and <out>/results.json. Outputs of licence-gated inputs
@@ -63,12 +63,12 @@ def human_files(inputs: list[str]) -> list[str]:
 def run_robot(robot: str, files: list[str], args, log=print) -> list[dict]:
     from retlens.retarget import robot_model, unavailable
 
-    why = unavailable(robot) or ("" if rq.supported(robot) else "no T-pose tables in retlens/retarget.py")
+    why = unavailable(robot)
     if why:
         log(f"[skip] {robot}: {why}")
         return []
     model = robot_model(robot)
-    fk = analysis.FootKinematics(robot, foot_bodies=rq.foot_bodies(robot))
+    fk = analysis.FootKinematics(robot)
     limits = rq.model_limits(model)
     rows = []
     for f in files:
@@ -156,7 +156,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="*", default=[os.path.join(ROOT, "data", "raw", "cmu_bvh")],
                     help="human motion files or folders (default: data/raw/cmu_bvh)")
-    ap.add_argument("--robot", action="append", default=None, help="GMR robot (repeatable; default unitree_g1)")
+    ap.add_argument("--robot", action="append", default=None,
+                    help="unitree_g1 or a robot's MJCF / URDF path (repeatable; default unitree_g1)")
     ap.add_argument("--smooth", type=float, default=6.0, metavar="HZ")
     ap.add_argument("--foot-flat", action="store_true")
     ap.add_argument("--swing-clearance", type=float, default=2.0, metavar="CM", help="default 2 (the recommended setting)")

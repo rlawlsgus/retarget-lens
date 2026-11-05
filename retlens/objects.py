@@ -27,7 +27,6 @@ from .motion import ObjectTrack, RobotMotion, SkeletonMotion
 CONTACT_M = 0.06  # palm point to surface: a hand on the object
 MAX_POINTS = 1500  # surface points per object for the distances (a subset of a dense mesh's vertices)
 CHUNK = 256  # frames per distance batch
-ROBOT_HANDS = ("left_rubber_hand", "right_rubber_hand")
 
 
 def human_scale(h: SkeletonMotion, r: RobotMotion) -> float:
@@ -73,11 +72,12 @@ def palm_points(h: SkeletonMotion) -> np.ndarray:
 
 
 def robot_hands(r: RobotMotion, fk) -> np.ndarray:
-    """(T, 2, 3) the robot's hand bodies through FK (an analysis.FootKinematics: its MuJoCo model)."""
+    """(T, 2, 3) the robot's hand bodies (the arms' last bodies, robot_profile) through FK (an
+    analysis.FootKinematics: its MuJoCo model and robot)."""
+    from .robot_profile import SIDES
+
     mj, model, data = fk.mj, fk.model, fk.data
-    bodies = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n) for n in ROBOT_HANDS]
-    if min(bodies) < 0:
-        raise ValueError(f"robot model has no {ROBOT_HANDS}")
+    bodies = [fk.profile.parts.arms[s].tip_body for s in SIDES]
     col = {n: i for i, n in enumerate(r.joint_names)}
     idx = [col.get(n) for n in fk.joint_names]
     q = model.qpos0.copy()

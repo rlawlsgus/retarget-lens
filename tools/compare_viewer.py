@@ -49,7 +49,7 @@ import plotly.graph_objects as go  # noqa: E402
 import viser  # noqa: E402
 
 from retlens.app.scene import (BALANCE, METRIC_NOTES, RETARGET_NOTE, RETARGET_TIPS,  # noqa: E402
-                                 SWING_CLEARANCE_CM, MotionScene, add_scene_arguments, hexcolor, load_robot_urdf,
+                                 SWING_CLEARANCE_CM, MotionScene, add_scene_arguments, hexcolor, load_robot_drawing,
                                  scene_options)
 from retlens import paths, settings  # noqa: E402
 from retlens.compare import MOTION_EXT, Item, library_files, save_upload  # noqa: E402
@@ -540,9 +540,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
 
-    urdf = load_robot_urdf(args.urdf, args.mesh_cell, log=log)
+    opts = scene_options(args)
+    urdf = load_robot_drawing(opts.robot, opts.urdf, args.mesh_cell, log=log)
     server = viser.ViserServer(host=args.host, port=args.port, label="RetLens motion compare")
-    scene = MotionScene(server, urdf, scene_options(args), log=log)
+    scene = MotionScene(server, urdf, opts, log=log)
     viewer = Viewer(server, scene, args.library)
     atexit.register(scene.shutdown)  # no Isaac process outlives the viewer
     server.on_client_connect(lambda c: log(f"client {c.client_id} connected"))

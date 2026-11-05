@@ -45,7 +45,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QStyle, QStyledItemDelegate, QTableView, QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import autolabel, batch, cmu_labels, motion_labels, problems
+from .. import autolabel, batch, cmu_labels, dataset, motion_labels, problems
+from . import export_dialogs
 from . import session as work
 from .. import paths as app_paths  # "paths" is a common local name here
 from .. import settings
@@ -2496,6 +2497,10 @@ class DatasetPanel(QWidget):
                               "수십 초, 계산해 둔 것은 바로 나옵니다")
         self.start.clicked.connect(self.run)
         top.addWidget(self.start)
+        self.export_btn = QPushButton("내보내기...")
+        self.export_btn.setToolTip("기준을 넘는 모션을 한 폴더에 로봇 모션·라벨·manifest로 모읍니다(문제 구간을 잘라 낼 수 있음)")
+        self.export_btn.clicked.connect(self.export)
+        top.addWidget(self.export_btn)
         self.stop = QPushButton("멈춤")  # in 시작's place while it runs
         self.stop.setToolTip("지금 모션이 끝나면 멈춥니다. 다시 시작하면 남은 것부터 합니다")
         self.stop.setVisible(False)
@@ -2660,14 +2665,7 @@ class DatasetPanel(QWidget):
             self.win.status("일괄 처리: 자동 라벨 규칙 파일이 없습니다(⋯ > 자동 라벨 규칙 파일...). 라벨 파일만 셉니다", 8000)
         self.model.clear()
         self._filled = set()
-        self._stop, self._running, self._total = False, True, len(files)
-        self.start.setVisible(False)
-        self.stop.setEnabled(True)
-        self.stop.setVisible(True)
-        self.progress.setRange(0, len(files))
-        self.progress.setValue(0)
-        self.progress.setFormat(f"%v / {len(files)}")
-        self.progress.setVisible(True)
+        self._begin(len(files))
         self._apply_columns()
         self._show_totals()
         runner = batch.Batch(opts, log=self.win.scene.log)
@@ -2683,6 +2681,74 @@ class DatasetPanel(QWidget):
 
         threading.Thread(target=work, daemon=True, name="batch").start()
 
+    def _begin(self, total: int, what: str = "") -> None:
+        """시작 / 내보내기 make way for 멈춤 and the progress."""
+        self._stop, self._running, self._total = False, True, total
+        self.start.setVisible(False)
+        self.export_btn.setEnabled(False)
+        self.stop.setEnabled(True)
+        self.stop.setVisible(True)
+        self.progress.setRange(0, total)
+        self.progress.setValue(0)
+        self.progress.setFormat(f"{what}%v / {total}")
+        self.progress.setVisible(True)
+
+    def _end(self) -> None:
+        self._running = False
+        self.start.setVisible(True)
+        self.export_btn.setEnabled(True)
+        self.stop.setVisible(False)
+        self.progress.setVisible(False)
+
+    def export(self) -> None:
+        """데이터셋 내보내기 (retlens.dataset) of the folders with this tab's options, in the background."""
+        if self._running:
+            return
+        files = batch.motion_files(self.folders)
+        if not files:
+            self.win.status("데이터셋 내보내기: 모션 파일이 없습니다(폴더를 더하세요)", 5000)
+            return
+        start = os.path.join(os.path.dirname(self.folders[0]), "dataset_export")
+        dlg = export_dialogs.DatasetExportDialog(self, getattr(self.win, "settings", None), len(files),
+                                                 self.physics.isChecked(), start)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        out, eopts = dlg.values()
+        if not export_dialogs.confirm_folder(self, out, "데이터셋 내보내기"):
+            return
+        try:
+            exporter = dataset.Exporter(self.options(), eopts, out, log=self.win.scene.log)
+        except Exception as e:
+            QMessageBox.warning(self, "데이터셋 내보내기", f"{type(e).__name__}: {e}")
+            return
+        self._begin(len(files), "내보내기 ")
+        folders = list(self.folders)
+
+        def progress(done, total, name):
+            self.win.bridge.gui.emit(lambda: self.progress.setValue(done))
+
+        def work():
+            result = None
+            try:
+                result = exporter.run(folders, progress=progress, cancel=lambda: self._stop)
+            except Exception as e:  # shown, never lost in the thread
+                result = {"error": f"{type(e).__name__}: {e}"}
+            finally:
+                self.win.bridge.gui.emit(lambda: self._export_done(result, out))
+
+        threading.Thread(target=work, daemon=True, name="export").start()
+
+    def _export_done(self, m: dict | None, out: str) -> None:
+        self._end()
+        if not m or m.get("error"):
+            QMessageBox.warning(self, "데이터셋 내보내기", f"내보내지 못했습니다: {(m or {}).get('error', '?')}")
+            return
+        text = export_dialogs.manifest_text(m)
+        self.win.status(f"데이터셋 내보내기 {'멈춤' if m.get('stopped') else '끝'}: {text.splitlines()[0]}", 10000)
+        export_dialogs.report(self, "데이터셋 내보내기",
+                              f"{out}\n\n{text}\n\n뺀 것과 이유는 manifest.json의 excluded에 있습니다.",
+                              out, self.win.open_path)
+
     def _row_done(self, done: int, total: int, row: dict) -> None:
         self.model.add(row)
         self.progress.setValue(done)
@@ -2697,10 +2763,7 @@ class DatasetPanel(QWidget):
             self.table.resizeColumnsToContents()
 
     def _finished(self) -> None:
-        self._running = False
-        self.start.setVisible(True)
-        self.stop.setVisible(False)
-        self.progress.setVisible(False)
+        self._end()
         self._show_totals()
         t = batch.totals(self.model.rows)
         self.win.status(f"일괄 처리 {'멈춤' if self._stop else '끝'}: 모션 {t['read']}개 · 오류 {t['errors']}개", 8000)
@@ -2902,6 +2965,14 @@ def short_text(v: str, limit: int = 18) -> str:
 OK_COLOR, WARN_COLOR, BAD_COLOR = "#5cb85c", "#e0a030", "#e05050"
 
 
+def same_robot_spec(a: str, b: str) -> bool:
+    """Do two robot specs (registry key or model path) name the same model file?"""
+    def norm(s):
+        return s if not s or s in ("unitree_g1", "unitree_g1_with_hands") else os.path.normcase(os.path.abspath(s))
+
+    return norm(a or "unitree_g1") == norm(b or "unitree_g1")
+
+
 def check_html(c: settings.Check) -> str:
     """One line of a check: ✓ what was found, or ⚠/✗ what is missing, what it is for and how to fix it."""
     if c.ok:
@@ -2921,6 +2992,7 @@ class SettingsDialog(QDialog):
     """환경 설정: where the external programs and the folders are, each checked as it is typed.
     Empty fields mean "find it" (environment variables, the usual install places)."""
     ROWS = [  # key, label, picks a file (filter) or a folder (None), settings field
+        ("robot", "로봇 모델", "로봇 모델 MJCF / URDF (*.xml *.urdf);;모든 파일 (*)", "robot_model"),
         ("isaac", "Isaac Sim", "Isaac Sim python.bat (python.bat);;모든 파일 (*)", "isaac_python"),
         ("blender", "Blender 4.5", "blender.exe (blender.exe);;모든 파일 (*)", "blender"),
         ("smpl", "SMPL-X 모델 폴더", None, "smpl_model_dir"),
@@ -2928,7 +3000,10 @@ class SettingsDialog(QDialog):
         ("robot_usd", "로봇 USD (선택)", "USD (*.usd *.usda *.usdc *.usdz);;모든 파일 (*)", "robot_usd"),
         ("video", "동영상 저장 폴더", None, "video_dir"),
     ]
-    TIPS = {"isaac": "동영상 저장과 물리 모드의 '보조 힘 (Isaac)'에 씁니다. 설치 폴더(python.bat이 있는 곳)나 python.bat을 "
+    TIPS = {"robot": "리타게팅하고 보여 주는 로봇입니다. 아무 휴머노이드의 MJCF(.xml)나 URDF(.urdf)를 고르면 다리·팔·발과 "
+                     "관절 역할을 모델에서 찾습니다(떠 있는 몸통, 다리 둘, 팔 둘이 있어야 함). 비우면 내장 Unitree G1. "
+                     "바꾸면 다시 시작할 때 적용됩니다.",
+            "isaac": "동영상 저장과 물리 모드의 '보조 힘 (Isaac)'에 씁니다. 설치 폴더(python.bat이 있는 곳)나 python.bat을 "
                      "고르세요.",
             "robot_usd": "Isaac이 시뮬레이션·녹화에 쓰는 로봇 USD입니다. 비우면 NVIDIA 에셋 서버의 Unitree G1을 받아 씁니다"
                          "(인터넷 필요). 오프라인이면 로컬에 둔 G1 USD(참조 파일 포함)나 사내 Nucleus 주소를 지정하세요. "
@@ -3037,7 +3112,7 @@ class SettingsDialog(QDialog):
         pf = QGridLayout(prog)
         pf.setColumnStretch(1, 1)
         self.prog_status: dict[str, QLabel] = {}
-        rows = [("robot", "로봇 모델"), ("gmr", "리타게팅 (GMR)")]
+        rows = [("gmr", "리타게팅 (GMR)")]
         for r, (key, label) in enumerate(rows):
             pf.addWidget(QLabel(f"<b>{label}</b>"), r, 0)
             st = QLabel()
@@ -3087,7 +3162,9 @@ class SettingsDialog(QDialog):
                       "smpl": settings.find_smpl(auto).path, "gmt": settings.find_gmt(auto).path,
                       "video": settings.video_dir(auto)}
         for key, _, _, _ in self.ROWS:
-            if key == "robot_usd":
+            if key == "robot":
+                self.edits[key].setPlaceholderText("비우면 내장 Unitree G1")
+            elif key == "robot_usd":
                 self.edits[key].setPlaceholderText("비우면 NVIDIA 에셋 서버의 Unitree G1 (인터넷 필요)")
             else:
                 self.edits[key].setPlaceholderText(f"자동: {found_auto[key]}" if found_auto[key] else "자동: 찾지 못함")
@@ -3136,6 +3213,11 @@ class SettingsDialog(QDialog):
         settings.save(self.current())
         self.win.apply_settings()
         super().accept()
+        if not same_robot_spec(settings.robot_spec(), self.win.scene.opts.robot):
+            robot = settings.find_robot()
+            QMessageBox.information(self.win, APP_NAME, "로봇 모델은 RetLens를 다시 시작하면 바뀝니다." + (
+                "" if robot.path else f"\n\n지금 이 모델은 쓸 수 없습니다: {robot.problem}\n"
+                                      "그대로 두면 다음 시작 때 내장 G1로 시작합니다."))
 
     def _merge_saved(self, typed_wins: bool) -> None:
         """The paths the setup assistant saves (prereqs.SETTING) that changed on disk since this window
@@ -3549,6 +3631,10 @@ class EditorWindow(QMainWindow):
         self.a_batch = act("폴더 일괄 처리...", lambda: (self.docks["dataset"].show(), self.docks["dataset"].raise_(),
                                                     self.dataset._add_folder()),
                            tip="촬영 세션 폴더의 모션을 모두 리타게팅·측정해 데이터셋 탭의 표에 모읍니다")
+        self.a_export = act("데이터셋 내보내기...", lambda: (self.docks["dataset"].show(), self.docks["dataset"].raise_(),
+                                                       self.dataset.export() if self.dataset.folders else
+                                                       self.dataset._add_folder()),
+                            tip="데이터셋 탭의 폴더에서 기준을 넘는 모션을 한 폴더에 로봇 모션·라벨·manifest로 모읍니다")
         self.a_quit = act("종료", self.close, "Ctrl+Q")
         self.a_remove = act("선택한 모션 제거", self.delete_selected, "Delete",
                             tip="고른 모션을 닫습니다 (타임라인이나 구간 표에서 라벨 구간을 골랐으면 그 구간을 지움)")
@@ -3628,7 +3714,7 @@ class EditorWindow(QMainWindow):
         m.setToolTipsVisible(True)
         self.m_recent = QMenu("최근 작업 세션", self)
         self.m_recent.aboutToShow.connect(lambda: self._fill_recent_menu(self.m_recent))
-        for a in (self.a_open, self.a_batch, None, self.a_session_new, self.a_session_open, self.m_recent,
+        for a in (self.a_open, self.a_batch, self.a_export, None, self.a_session_new, self.a_session_open, self.m_recent,
                   self.a_session_save, self.a_session_save_as, None, self.a_video, self.a_video_dir, self.a_folders, None,
                   self.a_settings, self.a_setup, None, self.a_quit):
             m.addSeparator() if a is None else m.addMenu(a) if isinstance(a, QMenu) else m.addAction(a)
@@ -4160,6 +4246,7 @@ class EditorWindow(QMainWindow):
         if self.scene.video_file(it):
             m.addAction("저장된 동영상 열기", lambda: self.open_path(self.scene.video_file(it)))
         m.addAction("파일 위치 열기", lambda: self.open_path(os.path.dirname(it.source)))
+        m.addAction("로봇 모션 내보내기...", lambda: self.export_motion(it))
         m.addSeparator()
         self.add_label_actions(m.addMenu("라벨"), it)
         m.addSeparator()
@@ -4167,6 +4254,44 @@ class EditorWindow(QMainWindow):
         m.addAction("겹쳐 비교: 대상(B)으로", lambda: self.start_compare(item=it))
         m.addSeparator()
         m.addAction("제거", lambda: self.remove(it))
+
+    def export_motion(self, it: Item) -> None:
+        """로봇 모션 내보내기 (retlens.dataset.export_motion): this motion's robot motion, or a range of it, with problems
+        cut out, its labels (as in the window) and a .json each."""
+        sc = self.scene
+        sel = self.label_selection()
+        seg = sel[2] if sel is not None and sel[0] is it else None
+        shown = sc.shown(it)
+        falls = [t for t, _c in sc.falls(it) if t <= it.robot.duration] if shown is not it else None
+        stem = os.path.splitext(os.path.basename(it.source))[0]
+        dlg = export_dialogs.MotionExportDialog(
+            self, self.settings, it.label, it.robot.duration,
+            (f"{seg.track}: {seg.label}" if seg.track else seg.label, seg.start, seg.end) if seg is not None else None,
+            None if falls is None else len(falls), os.path.dirname(it.source))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        out = dlg.folder.path()
+        if not export_dialogs.confirm_folder(self, out, "로봇 모션 내보내기"):
+            return
+        try:
+            res = dataset.export_motion(
+                it.robot, out, stem, labels=it.labels if dlg.labels.isChecked() else None, cut=dlg.cut.value(),
+                qc_bad=dataset.qc_bad_spans(it.robot, sc.limits), problems=it.metrics.get("_problems") or {},
+                falls=falls or [], range_s=dlg.range_s(), formats=dlg.formats.value(), limits=sc.limits,
+                info={"retarget": it.retarget or None, "kind": it.kind, "source_sha256": dataset.sha256(it.source)})
+        except Exception as e:
+            QMessageBox.warning(self, "로봇 모션 내보내기", f"{type(e).__name__}: {e}")
+            return
+        n = len(res["pieces"])
+        secs = sum(p["duration_s"] for p in res["pieces"])
+        text = f"파일 {n}개 · {secs:.1f}초"
+        if res["cut_s"] or res["short_s"]:
+            text += f"\n잘라 낸 {res['cut_s']:.1f}초, 짧아서 버린 {res['short_s']:.1f}초"
+        if res["pieces"]:
+            text += "\n\n" + "\n".join(os.path.basename(p["files"][0]) for p in res["pieces"][:12])
+            text += f"\n외 {n - 12}개" if n > 12 else ""
+        self.status(f"로봇 모션 내보내기: {it.label} → {out} ({n}개)", 8000)
+        export_dialogs.report(self, "로봇 모션 내보내기", f"{out}\n\n{text}", out, self.open_path)
 
     # ---------------------------------------------------------------- labels (retlens.motion_labels)
     def add_label_actions(self, m: QMenu, it: Item) -> None:
@@ -5200,7 +5325,7 @@ def run(argv=None) -> int:
 
     import viser
 
-    from .scene import add_scene_arguments, load_robot_urdf, scene_options
+    from .scene import add_scene_arguments, load_robot_drawing, scene_options
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_scene_arguments(ap)
@@ -5242,15 +5367,27 @@ def run(argv=None) -> int:
     if no_sandbox:
         log("scene view: Chromium sandbox off (conda Qt layout); it only shows the local scene server")
     port = args.port or free_port()
+    opts = scene_options(args)
     try:
-        urdf = load_robot_urdf(args.urdf, args.mesh_cell, log=log)
+        if not args.robot and opts.robot != "unitree_g1":  # 환경 설정's robot: one that no longer loads falls back to the G1
+            from ..robot_profile import load as load_robot
+
+            try:
+                load_robot(opts.robot).parts
+            except Exception as e:
+                log(f"robot model {opts.robot} unusable ({type(e).__name__}: {e}); starting with the built-in G1")
+                QMessageBox.warning(None, APP_NAME, "환경 설정의 로봇 모델을 쓸 수 없어 내장 Unitree G1로 시작합니다.\n\n"
+                                    f"{opts.robot}\n{type(e).__name__}: {e}\n\n"
+                                    "파일 > 환경 설정 > 로봇 모델에서 고치거나 비우세요.")
+                opts.robot = "unitree_g1"
+        urdf = load_robot_drawing(opts.robot, opts.urdf, args.mesh_cell, log=log)
     except Exception as e:  # without the robot model nothing can be shown: say why instead of vanishing
         robot = next(c for c in settings.check_all() if c.key == "robot")
-        QMessageBox.critical(None, APP_NAME, f"로봇 모델을 불러오지 못해 시작할 수 없습니다.\n\n{args.urdf}\n"
+        QMessageBox.critical(None, APP_NAME, f"로봇 모델을 불러오지 못해 시작할 수 없습니다.\n\n{opts.urdf or opts.robot}\n"
                                              f"{type(e).__name__}: {e}\n\n{robot.hint}")
         return 1
     server = viser.ViserServer(host="127.0.0.1", port=port, label=APP_NAME, verbose=False)
-    scene = MotionScene(server, urdf, scene_options(args), log=log)
+    scene = MotionScene(server, urdf, opts, log=log)
     if args.body_mesh:
         scene.view.body_mesh = True
     server.initial_camera.position = (3.0, -3.0, 1.8)

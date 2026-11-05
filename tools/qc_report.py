@@ -47,7 +47,7 @@ def main() -> int:
     ap.add_argument("--balance", action="store_true",
                     help="robot motions: CoM / ZMP against the feet's support polygon and the soft flag "
                          "static_unbalanced (needs GMR's robot model; --robot)")
-    ap.add_argument("--robot", default="unitree_g1", help="GMR robot model for --balance")
+    ap.add_argument("--robot", default="unitree_g1", help="robot for --balance: unitree_g1 or an MJCF / URDF path")
     args = ap.parse_args()
 
     cfg_all = {}

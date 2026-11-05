@@ -1,5 +1,7 @@
-# Vendored unchanged from GMR (github.com/YanjieZe/GMR @ bb1bbe40774794fceb2a7c579a3464a28e68c844,
-# general_motion_retargeting/motion_retarget.py, MIT, see LICENSE in this folder).
+# Vendored from GMR (github.com/YanjieZe/GMR @ bb1bbe40774794fceb2a7c579a3464a28e68c844,
+# general_motion_retargeting/motion_retarget.py, MIT, see LICENSE in this folder). RetLens changes:
+# the IK limits go to solve_ik as limits=; the constructor also takes a compiled model and the
+# config dict (any robot, no shared tables); the velocity limit is keyed by joint name.
 
 import mink
 import mujoco as mj
@@ -21,13 +23,19 @@ class GeneralMotionRetargeting:
         damping: float=5e-1, # change from 1e-1 to 1e-2.
         verbose: bool=True,
         use_velocity_limit: bool=False,
+        model=None,
+        ik_config: dict=None,
     ) -> None:
 
-        # load the robot model
-        self.xml_file = str(ROBOT_XML_DICT[tgt_robot])
-        if verbose:
-            print("Use robot model: ", self.xml_file)
-        self.model = mj.MjModel.from_xml_path(self.xml_file)
+        # load the robot model (RetLens: or take the compiled one and the config as given)
+        if model is not None:
+            self.xml_file = None
+            self.model = model
+        else:
+            self.xml_file = str(ROBOT_XML_DICT[tgt_robot])
+            if verbose:
+                print("Use robot model: ", self.xml_file)
+            self.model = mj.MjModel.from_xml_path(self.xml_file)
         
         # Print DoF names in order
         print("[GMR] Robot Degrees of Freedom (DoF) names and their order:")
@@ -56,10 +64,13 @@ class GeneralMotionRetargeting:
                 print(f"Motor ID {i}: {motor_name}")
 
         # Load the IK config
-        with open(IK_CONFIG_DICT[src_human][tgt_robot]) as f:
-            ik_config = json.load(f)
-        if verbose:
-            print("Use IK config: ", IK_CONFIG_DICT[src_human][tgt_robot])
+        if ik_config is not None:
+            ik_config = json.loads(json.dumps(ik_config))  # a copy: the scale table is changed below
+        else:
+            with open(IK_CONFIG_DICT[src_human][tgt_robot]) as f:
+                ik_config = json.load(f)
+            if verbose:
+                print("Use IK config: ", IK_CONFIG_DICT[src_human][tgt_robot])
         
         # compute the scale ratio based on given human height and the assumption in the IK config
         if actual_human_height is not None:
@@ -98,8 +109,9 @@ class GeneralMotionRetargeting:
         self.task_errors2 = {}
 
         self.ik_limits = [mink.ConfigurationLimit(self.model)]
-        if use_velocity_limit:
-            VELOCITY_LIMITS = {k: 3*np.pi for k in self.robot_motor_names.keys()}
+        if use_velocity_limit:  # RetLens: keyed by joint (mink's VelocityLimit takes joint names)
+            VELOCITY_LIMITS = {k: 3*np.pi for k in self.robot_dof_names.keys()
+                               if self.model.jnt_type[mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, k)] != mj.mjtJoint.mjJNT_FREE}
             self.ik_limits.append(mink.VelocityLimit(self.model, VELOCITY_LIMITS)) 
             
         self.setup_retarget_configuration()

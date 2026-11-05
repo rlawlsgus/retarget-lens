@@ -1,11 +1,11 @@
 ---
 name: retlens
-description: Drive RetLens (Retarget Lens), the tool that retargets human mocap (BVH, FBX, AMASS SMPL-X, C3D markers) to the Unitree G1 robot and validates it - QC, smoothness / foot / balance metrics, overlay comparison of two motions, MuJoCo / Isaac Sim physics checks and Isaac videos. Use it when the user asks to retarget or check mocap, compare motions or capture sources, find what is wrong with a clip, run a physics check, inspect C3D marker quality, or show / operate something in the open RetLens window. Commands give JSON; a running window has a local HTTP API.
+description: Drive RetLens (Retarget Lens), the tool that retargets human mocap (BVH, FBX, AMASS SMPL-X, C3D markers) to a humanoid robot (Unitree G1 by default, or any humanoid's MJCF / URDF) and validates it - QC, smoothness / foot / balance metrics, overlay comparison of two motions, MuJoCo / Isaac Sim physics checks and Isaac videos. Use it when the user asks to retarget or check mocap, compare motions or capture sources, find what is wrong with a clip, run a physics check, inspect C3D marker quality, or show / operate something in the open RetLens window. Commands give JSON; a running window has a local HTTP API.
 ---
 
 # RetLens로 일하기 (AI용 안내)
 
-RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)으로 옮기고(리타게팅, GMR) 그 결과를 검증하는 데스크톱 프로그램입니다. AI는 두 가지 방법으로 다룹니다.
+RetLens는 사람 모션캡처를 휴머노이드 로봇으로 옮기고(리타게팅, GMR) 그 결과를 검증하는 데스크톱 프로그램입니다. 로봇은 기본이 Unitree G1이고, 환경 설정의 로봇 모델(또는 `--robot`)에 다른 휴머노이드의 MJCF·URDF를 주면 그 로봇으로 합니다. AI는 두 가지 방법으로 다룹니다.
 
 | 방법 | 언제 | 무엇 |
 |---|---|---|
@@ -26,6 +26,7 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 | 명령 | 하는 일 | 주요 출력 |
 |---|---|---|
 | `info` | 버전, 파일 위치, 환경 점검 | `locations`, `checks[]`(key, ok, needed_for, hint), `isaac_eula_accepted` |
+| `robot [MODEL]` | 로봇 모델(기본은 환경 설정, 비면 G1)에서 리타게팅이 찾은 부위: 다리·팔의 관절(proximal / bend / distal, `*`는 비틀림), 무릎·팔꿈치 굽힘 방향(`flex_sign`), 손·발 몸체, IK 대상 몸체, 키·서 있는 골반 높이, `notes`(예: 허리 pitch 없음). 못 찾으면 `error`에 무엇을 못 찾았는지 | `robot`(name, dof, legs, arms, tasks, height_m, notes) |
 | `library [--query Q] [--limit N]` | 모션 폴더의 파일 목록. Q는 파일 이름과 CMU 동작 설명에서 찾음(예: `143_11`, `walk`, `dance`) | `files[]`(path, folder, name, cmu_description) |
 | `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, foot_reference, self_collision, metrics, retarget_quality, c3d, objects) |
 | `metrics FILE... [--ref N]` | 창의 "분석" 표와 같은 표. 기준(ref, 기본은 첫 파일) 대비 RMSE 포함 | `rows`, `motions[].values`, `row_help` |
@@ -34,6 +35,7 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
 | `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM] [--self-collision]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장 | `out`, `frames`, `fps`, `kind` |
 | `autolabel FILE... [--rules R.yaml] [--out DIR] [--summary]` | 자동 라벨: 규칙 파일대로 사람 동작을 보고 구간 라벨(리타게팅 없이). `--out`이면 라벨을 붙인 모션마다 그 폴더 안에 `<이름>.labels.csv`(구간이 없으면 열 이름만). 이름이 겹치면 원래 폴더 구조를 그 아래에, 같은 폴더의 `X.c3d`·`X.bvh`는 `c3d\`·`bvh\` 아래에 둠. 실패한 모션은 지난 실행의 CSV를 지움. 종료 코드 1 = 모두 실패, 2 = 일부 실패 | `rules`, `motions[]`(file, labels{auto, tracks, segments[], notes, error}, csv, csv_removed) |
 | `batch FILE\|DIR... [--physics] [--rules R.yaml] [--csv OUT.csv]` + 리타게팅 보정 옵션 | 데이터셋 일괄 처리: 폴더 아래 모션마다 리타게팅·측정한 한 줄(점수, QC, 주된 감점, 문제 구간 초, 품질·발 지표, 물체 닿음, 라벨, `--physics`면 MuJoCo 보조 힘 결과와 `phys_first_cause`(첫 넘어짐 원인)·`phys_fall_causes`(원인별 횟수, 클립 안)). 파일·설정별로 캐시되어 다시 돌리면 끝난 것은 바로 나옴. 종료 코드 2 = 일부 못 읽음 | `motions`, `read`, `errors`, `total_s`, `qc_fail`, `qc_warn`, `with_falls`, `first_fall_causes`({원인: 모션 수}), `labelled`, `rows[]`, `csv` |
+| `export FILE\|DIR... --out DIR [--qc PASS\|WARN\|FAIL] [--min-score N] [--physics] [--allow-falls] [--cut] [--cut-kinds K,K] [--pad S] [--min-piece S] [--range START END] [--formats npz,csv,pkl] [--no-labels]` + 리타게팅 보정 옵션 | 데이터셋 내보내기: `batch`(캐시 공유)를 거쳐 기준을 넘는 모션을 `--out`에 입력 폴더 구조대로 씀(모션마다 `<이름>.npz` 등 + `.labels.csv` + `.json`, 맨 위에 `manifest.json`·`manifest.csv`). `--qc`는 넣을 가장 나쁜 판정(기본 WARN). `--min-score`는 리타게팅 점수 하한(로봇 모션 파일은 점수가 없어 받지 않음). `--physics`면 넘어진 모션을 뺌(`--allow-falls`면 둠). `--cut`은 QC가 못 쓰는 프레임, `--cut-kinds`의 문제 구간(기본 `penetration,marker_gap`; `slip`, `swing_low`, `self_collision`, `joint_limit`도 됨), 넘어짐 1초 전–0.25초 뒤를 잘라 `--min-piece`초(기본 1) 이상 남은 조각을 `<이름>_<시작>-<끝>s`로 씀(조각마다 QC 다시 판정). `--range`는 모션 하나의 시간 범위만. 같은 폴더에 다시 내보내면 이전 manifest에 적힌 파일만 지우고 새로 씀. 한 폴더의 같은 촬영(`X.bvh`·`X.fbx`·`X_stageii.npz`·`X.c3d`)은 하나만. csv는 x y z qx qy qz qw + 관절각(머리글 없음), pkl은 GMR. 종료 코드 1 = 모두 못 읽음, 2 = 일부 | `out`, `manifest`, `totals`(motions, exported_motions, clips, seconds, cut_seconds, short_seconds, cut_by_kind, excluded, excluded_by_reason), `clips[]`(files, source, start_s, end_s, duration_s, qc, labels), `excluded[]`(source, reason) |
 | `summary FILE\|DIR... [--rules R.yaml] [--csv OUT.csv]` | 데이터셋 요약(리타게팅 없이): 폴더 아래 모션마다 길이, 라벨(옆의 라벨 파일, `--rules`면 자동 라벨) 트랙·라벨별 시간, FBX 물체. 폴더별·라벨별 합계. 종료 코드 2 = 일부 못 읽음 | `total_s`, `total_h`, `per_folder`, `per_label`(seconds, segments, share_pct), `files[]`(duration_s, labels, label_seconds, objects, error), `csv` |
 | `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이) | 마커 수, `missing_pct`, `most_missing`, `longest_gap_s`, `spike_frames` |
 | `physics FILE [--balance harness]` | 물리 검사. 기본은 MuJoCo 골반 보조 힘(클립당 몇 초, 라이선스 동의 불필요). `--balance pd`/`gmt`는 MuJoCo 제어기 없음 / GMT, `isaac [--assist 1]`은 Isaac PhysX(짧은 클립 약 1분, EULA 동의 필요) | `physics.metrics`(phys_falls, phys_fall_causes, phys_harness_pct, phys_saturated_pct, phys_body_error_cm, phys_ok), `physics.falls[]`(`time_s`, `cause`(한글), `cause_id`, `onset_s`, `rule`(MuJoCo 판정), `after_clip`, `evidence`, `others`), `physics.first_fall_cause` |
@@ -47,7 +49,8 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇(지금은 Unitree G1)�
   - 사람 모션: BVH, FBX(Blender 필요), AMASS SMPL-X `*_stageii.npz`(SMPL-X 모델 필요), C3D.
   - 로봇 모션: npz, Unitree csv, GMR pkl.
   - 사람 모션은 처음 열 때 리타게팅합니다. 처음에는 몇 초에서 수십 초가 걸리고, 다음부터는 캐시에서 바로 나옵니다.
-- **리타게팅 보정:** 모션을 여는 명령(`inspect`, `metrics`, `compare`, `align`, `retarget`, `physics`, `video`)은 사람 모션을 어떻게 리타게팅할지 정하는 옵션을 받습니다. 로봇 모션은 그대로 엽니다.
+- **리타게팅 보정:** 모션을 여는 명령(`inspect`, `metrics`, `compare`, `align`, `retarget`, `batch`, `export`, `physics`, `video`)은 사람 모션을 어떻게 리타게팅할지 정하는 옵션을 받습니다. 로봇 모션은 그대로 엽니다.
+  - `--robot MODEL`: 리타게팅할 로봇. `unitree_g1` 또는 휴머노이드의 MJCF(.xml)·URDF(.urdf) 경로(기본은 환경 설정 > 로봇 모델, 비면 G1). 처음 쓰는 로봇은 `robot MODEL`로 부위가 맞게 찾아졌는지 먼저 봅니다. 결과 캐시는 모델 파일 내용으로 구분됩니다.
   - `--smooth HZ`: 평활화(기본 6, 0 = 끔).
   - `--foot-flat`: 디딤발 평평 보정.
   - `--swing-clearance CM`: 스윙 발 보정(권장 2).
@@ -73,7 +76,7 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 | 요청 | 내용 |
 |---|---|
 | `GET /api/help` | 모든 엔드포인트 |
-| `GET /api/status` | 시각, 재생 상태, 물리 모드, 겹쳐 비교, 열린 모션 |
+| `GET /api/status` | 시각, 재생 상태, 물리 모드, 겹쳐 비교, 열린 모션, `robot`(창의 로봇: name, builtin, model, digest, dof, height_m, notes). 모션에 `robot_mismatch`가 있으면 다른 로봇의 모션일 수 있다는 뜻(관절은 이름으로 맞추고 나머지는 0) |
 | `GET /api/checks` | 환경 점검 |
 | `GET /api/library?query=walk` | 모션 파일 목록 |
 | `POST /api/open {"paths": [...]}` | 열기(창에 나타나고 선택됨) |
@@ -210,7 +213,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | 401 | 토큰이 틀림. 창을 다시 켜면 바뀌므로 `api.json`을 다시 읽음 |
 | FBX·SMPL-X를 못 엶 | `info`의 `checks`(blender / smpl), `setup`. 사용자가 환경 설정이나 설치 도우미에서 지정·설치 |
 | 균형 제어 GMT "설치 필요" | `setup`의 `gmt`. 연구용 라이선스에 사용자가 동의하면 설치 도우미(또는 `setup --install gmt --accept-license`)로 받음. PyTorch는 필요 없음 |
-| 물리 "실행할 수 없음" | Isaac(`balance` `isaac`, 녹화)이면 Isaac Sim 경로(`checks.isaac`)와 라이선스 동의 확인. 로봇 USD는 기본으로 NVIDIA 에셋 서버에서 받으므로 인터넷이 필요. MuJoCo면 G1 모델(설치판에 들어 있음, 저장소는 `..\GMT`) |
+| 물리 "실행할 수 없음" | Isaac(`balance` `isaac`, 녹화)이면 Isaac Sim 경로(`checks.isaac`)와 라이선스 동의 확인. 로봇 USD는 기본으로 NVIDIA 에셋 서버에서 받으므로 인터넷이 필요. MuJoCo면 G1 모델(설치판에 들어 있음, 저장소는 `..\GMT`). G1이 아닌 로봇이면 harness / pd는 그 로봇의 모델로 돌고(G1 게인 × 로봇 질량 / G1 질량, 그 로봇의 토크 한계; 결과 json의 `model`에 적힘), gmt는 G1 전용, isaac은 그 로봇의 USD(환경 설정 > 로봇 USD)가 있어야 됩니다 |
 | 비교 `frames: 0` | 두 모션이 같이 재생되는 구간이 없음. 오프셋을 확인하거나 `--align` |
 
 자세한 설명은 사용 설명서(설치판: 설치 폴더의 `_internal\docs\manual.md`, 저장소: `docs/manual.md`)에, 지표 정의는 `metrics` 결과의 설명(저장소: `retlens/app/scene.py`의 `METRIC_HELP`)에 있습니다.

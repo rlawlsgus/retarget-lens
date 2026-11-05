@@ -3,17 +3,20 @@ JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"
 autolabel / summary / batch: 1 = no motion done, 2 = some not (their rows say why).
 
     retlens-cli info                        # version, file locations, 환경 점검
+    retlens-cli robot [MODEL.xml|.urdf]     # the robot's parts as retargeting finds them (default: 환경 설정)
     retlens-cli library --query walk        # motion files (with CMU descriptions)
     retlens-cli inspect FILE [FILE ...]     # load (retarget if needed): QC, metrics, C3D QC
     retlens-cli metrics FILE [FILE ...] [--ref 0]   # the 분석 table (RMSE vs ref)
     retlens-cli compare A B [--tol 3] [--no-heading] [--align]   # 겹쳐 비교 numbers
     retlens-cli align REF FILE [FILE ...]   # 기준에 시간 자동 정렬
     retlens-cli retarget FILE --out OUT.npz # save the robot motion (+ .json)
-      (commands that open motions take --smooth HZ, --foot-flat, --swing-clearance CM and --self-collision
-       for human ones)
+      (commands that open motions take --robot MODEL (unitree_g1 or an MJCF / URDF; default 환경 설정),
+       --smooth HZ, --foot-flat, --swing-clearance CM and --self-collision for human ones)
     retlens-cli autolabel FILE [FILE ...] [--rules R.yaml] [--out DIR]   # 자동 라벨 by a rule file (no retargeting)
     retlens-cli summary FILE|DIR ... [--rules R.yaml] [--csv OUT.csv]   # 데이터셋 요약: length, label time, objects
     retlens-cli batch FILE|DIR ... [--physics] [--rules R.yaml] [--csv OUT.csv]   # 일괄 처리: retarget + measure each
+    retlens-cli export FILE|DIR ... --out DIR [--qc WARN] [--physics] [--cut] [--formats npz,csv,pkl]
+                                            # 데이터셋 내보내기: the motions that pass, in pieces with --cut, + manifest
     retlens-cli c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
     retlens-cli physics FILE [--balance harness]   # physics check: MuJoCo with the pelvis harness (seconds);
                                             # --balance pd / gmt (MuJoCo), isaac [--assist 1] (needs the EULA accepted)
@@ -49,8 +52,9 @@ def _scene(args):
 
     if not 0.0 <= args.swing_clearance <= 10.0:
         raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    extra = {"robot": args.robot} if getattr(args, "robot", None) else {}
     return api_core.headless_scene(log=_log, smooth=args.smooth, foot_flat=args.foot_flat,
-                                   swing_clearance_cm=args.swing_clearance, self_collision=args.self_collision)
+                                   swing_clearance_cm=args.swing_clearance, self_collision=args.self_collision, **extra)
 
 
 def _open(scene, files: list[str]):
@@ -82,6 +86,11 @@ def run(args) -> dict:
         return {"app": "RetLens", "version": __version__, "api_version": api_core.API_VERSION,
                 "locations": dict(paths.describe()),
                 "isaac_eula_accepted": api_core.eula_accepted(), **api_core.checks()}
+    if c == "robot":  # what retargeting finds in a robot model (no motion needed)
+        from retlens import settings
+        from retlens.robot_profile import load as load_robot
+
+        return {"robot": load_robot(args.model or settings.robot_spec()).describe()}
     if c == "library":
         return api_core.library(args.query, args.limit)
     if c == "api":
@@ -123,10 +132,14 @@ def run(args) -> dict:
         return summary(args)
     if c == "batch":
         return batch(args)
+    if c == "export":
+        return export(args)
     if c == "retarget":
+        from retlens import settings
         from retlens.compare import load_item
 
-        item = load_item(args.file, smooth=args.smooth, swing_clearance=args.swing_clearance / 100.0,
+        item = load_item(args.file, robot=args.robot or settings.robot_spec(), smooth=args.smooth,
+                         swing_clearance=args.swing_clearance / 100.0,
                          foot_flat=args.foot_flat, self_collision=args.self_collision, smpl_model_dir=_smpl(), log=_log)
         item.robot.save_npz(args.out)
         with open(os.path.splitext(args.out)[0] + ".json", "w", encoding="utf-8") as f:
@@ -157,9 +170,11 @@ def run(args) -> dict:
                     raise PermissionError("Isaac Sim needs the NVIDIA Omniverse EULA accepted by the user: open RetLens "
                                           "and accept it once (or the user passes --isaac-accept-eula themselves)")
                 scene.runner.accept_eula = True
-            why = scene.balance_problem(args.balance)
+            # a recording without physics needs Isaac only: its robot, not the MuJoCo balance modes
+            mode = args.balance if c == "physics" or args.physics else "isaac"
+            why = scene.balance_problem(mode) if c == "physics" or args.physics else scene.robot_physics_problem("isaac")
             if why:
-                raise RuntimeError(f"{args.balance}: {why}")
+                raise RuntimeError(f"{mode}: {why}")
             scene.set_balance(args.balance)
             (item,) = _open(scene, [args.file])
             if c == "physics":
@@ -207,7 +222,10 @@ def batch(args) -> dict:
         autolabel.check_rules(args.rules)  # a broken rule file stops here, not once per motion
     if not 0.0 <= args.swing_clearance <= 10.0:
         raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
-    opts = bt.BatchOptions(smooth=args.smooth, smpl_model_dir=_smpl(), foot_flat=args.foot_flat,
+    from retlens import settings
+
+    opts = bt.BatchOptions(robot=args.robot or settings.robot_spec(), smooth=args.smooth, smpl_model_dir=_smpl(),
+                           foot_flat=args.foot_flat,
                            swing_clearance_cm=args.swing_clearance, self_collision=args.self_collision,
                            physics=args.physics, rules=args.rules)
     files = bt.motion_files(args.inputs)
@@ -220,6 +238,46 @@ def batch(args) -> dict:
         out["csv"] = bt.write_csv(rows, args.csv)
     errors = sum(bool(r.get("error")) for r in rows)
     return _Exit(out, 1) if rows and errors == len(rows) else _Exit(out, 2) if errors else out
+
+
+def export(args) -> dict:
+    """데이터셋 내보내기 (retlens.dataset): the motions under the inputs through 일괄 처리 (cached), the ones that pass
+    --qc / --min-score / falls written into --out with their labels and manifest.json / manifest.csv. --cut takes
+    out the QC frames that cannot be used, the --cut-kinds problem spans and the time around each fall (--physics),
+    leaving pieces of --min-piece seconds or more; --range START END exports that time range of one motion. Exit
+    code 1 when no motion could be read, 2 when some could not."""
+    from retlens import batch as bt
+    from retlens import dataset, settings
+    from retlens.app import api_core
+    from retlens.problems import KINDS
+
+    if args.rules:
+        from retlens import autolabel
+
+        autolabel.check_rules(args.rules)
+    if not 0.0 <= args.swing_clearance <= 10.0:
+        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    kinds = tuple(k.strip() for k in args.cut_kinds.split(",") if k.strip())
+    bad = [k for k in kinds if k not in KINDS]
+    if bad:
+        raise ValueError(f"unknown --cut-kinds {', '.join(bad)} (one of {', '.join(KINDS)})")
+    cut = dataset.CutOptions(qc=not args.no_cut_qc, kinds=kinds, falls=not args.no_cut_falls, pad_s=args.pad,
+                             min_piece_s=args.min_piece) if args.cut else None
+    opts = dataset.ExportOptions(qc=args.qc, min_score=args.min_score, allow_falls=args.allow_falls, cut=cut,
+                                 formats=tuple(f.strip() for f in args.formats.split(",") if f.strip()),
+                                 labels=not args.no_labels, range_s=tuple(args.range) if args.range else None)
+    bopts = bt.BatchOptions(robot=args.robot or settings.robot_spec(), smooth=args.smooth, smpl_model_dir=_smpl(),
+                            foot_flat=args.foot_flat, swing_clearance_cm=args.swing_clearance,
+                            self_collision=args.self_collision, physics=args.physics, rules=args.rules)
+    m = dataset.Exporter(bopts, opts, args.out, log=_log).run(
+        args.inputs, progress=lambda done, total, name: _log(f"{done}/{total} {name}"))
+    out = {"out": os.path.abspath(args.out), "manifest": os.path.join(os.path.abspath(args.out), dataset.MANIFEST),
+           "totals": m["totals"], "excluded": m["excluded"],
+           "clips": [{k: c.get(k) for k in ("files", "source", "start_s", "end_s", "duration_s", "qc", "labels")}
+                     for c in m["clips"]]}
+    errors = sum(e["reason"].startswith(("읽지 못함", "내보내기 실패")) for e in m["excluded"])
+    out = api_core.jsonable(out)
+    return _Exit(out, 1) if errors and errors == m["totals"]["motions"] else _Exit(out, 2) if errors else out
 
 
 def summary(args) -> dict:
@@ -353,20 +411,14 @@ class _Exit(dict):
         self.code = code
 
 
-def _folder_below(d: str) -> str:
-    """A folder as a relative path, its drive or network share a folder of its own:
-    C:\\mocap\\s01 -> C\\mocap\\s01, \\\\nas\\mocap\\s01 -> nas_mocap\\s01."""
-    drive, rest = os.path.splitdrive(d)
-    drive = drive.replace(":", "").strip("\\/").replace("\\", "_").replace("/", "_")
-    return os.path.join(drive, rest.lstrip("\\/"))
-
-
 def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
     """<out>/<stem>.labels.csv per motion, always named so RetLens finds it next to its motion. Motions
     of the same name (AMASS: 0000_treadmill_norm_stageii in every subject's folder) keep their folders
     below <out>, from where their paths part (on other drives or shares: from the drive); the same name in
     the same folder (X.c3d and X.bvh) goes one folder further down, by extension (<out>/c3d/X.labels.csv).
     Every path is inside <out>: nothing is written next to the motions."""
+    from retlens.dataset import _folder_below
+
     root = os.path.abspath(out)
     by: dict[str, list[str]] = {}
     for f in dict.fromkeys(files):
@@ -392,6 +444,9 @@ def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
 
 def _retarget_options(p) -> None:
     """How human motions are retargeted (as RetLens's 리타게팅 menu; robot motions load as they are)."""
+    p.add_argument("--robot", default=None, metavar="MODEL",
+                   help="the robot: unitree_g1 or any humanoid's MJCF / URDF path (default: 환경 설정 > 로봇 모델, "
+                        "else unitree_g1)")
     p.add_argument("--smooth", type=float, default=6.0, metavar="HZ", help="smoothing (0 = off; default 6)")
     p.add_argument("--foot-flat", action="store_true",
                    help="디딤발 평평 보정: feet standing still flat on the floor, through legs and pelvis height "
@@ -402,11 +457,20 @@ def _retarget_options(p) -> None:
                    help="자기 관통 보정: robot parts that go through each other pushed apart (hands into hips)")
 
 
+def dataset_cut_kinds() -> tuple[str, ...]:
+    from retlens.dataset import CUT_KINDS
+
+    return CUT_KINDS
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="retlens-cli", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pretty", action="store_true", help="indented JSON")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="version, file locations, environment check")
+    p = sub.add_parser("robot", help="the robot's parts as retargeting finds them (legs, arms, joint roles, size)")
+    p.add_argument("model", nargs="?", default=None,
+                   help="unitree_g1 or an MJCF / URDF path (default: 환경 설정 > 로봇 모델, else unitree_g1)")
     p = sub.add_parser("library", help="motion files in the motion folders")
     p.add_argument("--query", default=None)
     p.add_argument("--limit", type=int, default=200)
@@ -445,6 +509,29 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--physics", action="store_true", help="also the MuJoCo harness check of each (1-3 s per clip)")
     p.add_argument("--rules", default=None, help="자동 라벨 by this rule file for motions without a label file")
     p.add_argument("--csv", default=None, help="also write the table here")
+    p = sub.add_parser("export", help="데이터셋 내보내기: the motions that pass into one folder (+ pieces, labels, manifest)")
+    p.add_argument("inputs", nargs="+", help="motion files or folders (searched below)")
+    p.add_argument("--out", required=True, help="the dataset folder (an earlier export there is replaced)")
+    _retarget_options(p)
+    p.add_argument("--physics", action="store_true", help="also the MuJoCo harness check: motions that fall are left "
+                   "out (or, with --cut, the time around each fall is cut out)")
+    p.add_argument("--rules", default=None, help="자동 라벨 by this rule file for motions without a label file")
+    p.add_argument("--qc", choices=("PASS", "WARN", "FAIL"), default="WARN",
+                   help="the worst QC let in (with --cut / --range: of each piece): PASS, WARN (default) or FAIL (all)")
+    p.add_argument("--min-score", type=float, default=None, help="리타게팅 점수 at least this")
+    p.add_argument("--allow-falls", action="store_true", help="keep motions that fell in the physics check")
+    p.add_argument("--cut", action="store_true", help="문제 구간 잘라 내기: cut problems out, keep the pieces")
+    p.add_argument("--cut-kinds", default=",".join(dataset_cut_kinds()), metavar="K,K",
+                   help="problem kinds --cut takes out (default %(default)s; also slip, swing_low, self_collision, "
+                        "joint_limit; '' for none)")
+    p.add_argument("--no-cut-qc", action="store_true", help="--cut leaves the frames QC cannot use")
+    p.add_argument("--no-cut-falls", action="store_true", help="--cut leaves the falls")
+    p.add_argument("--pad", type=float, default=0.1, metavar="S", help="--cut widens every span by S (default 0.1)")
+    p.add_argument("--min-piece", type=float, default=1.0, metavar="S", help="--cut drops pieces shorter (default 1)")
+    p.add_argument("--range", nargs=2, type=float, default=None, metavar=("START", "END"),
+                   help="one motion: export only this time range (seconds)")
+    p.add_argument("--formats", default="npz", help="npz (default), csv (x y z qx qy qz qw + joints), pkl (GMR); comma")
+    p.add_argument("--no-labels", action="store_true", help="without the motions' labels")
     p = sub.add_parser("summary", help="데이터셋 요약: length, label time and objects of motions (no retargeting)")
     p.add_argument("inputs", nargs="+", help="motion files or folders (searched below)")
     p.add_argument("--rules", default=None, help="자동 라벨 by this rule file instead of the label files next to the motions")

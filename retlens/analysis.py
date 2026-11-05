@@ -119,24 +119,38 @@ def _sustained(mask: np.ndarray, n: int) -> np.ndarray:
 
 
 class FootKinematics:
-    """MuJoCo FK of GMR's robot model: per-frame sole heights and foot positions."""
+    """MuJoCo FK of the robot's model: per-frame sole heights and foot positions. ``robot``: a
+    registry key or a model path (retlens.robot_profile); the feet and their soles come from it."""
 
-    def __init__(self, robot: str = "unitree_g1", foot_bodies=("left_ankle_roll_link", "right_ankle_roll_link")):
+    def __init__(self, robot: str = "unitree_g1", foot_bodies=None):
         import mujoco as mj
 
-        from .retarget import robot_joint_names, robot_model
+        from .retarget import profile, robot_joint_names
+        from .robot_profile import SIDES, _sole_points, _zero_data
 
         self.mj = mj
-        self.model = robot_model(robot)
+        self.robot = robot
+        self.profile = prof = profile(robot)
+        self.model = prof.model()
         self.data = mj.MjData(self.model)
         self.joint_names = robot_joint_names(self.model)
-        self.feet = [mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, b) for b in foot_bodies]
-        self.soles = [[g for g in range(self.model.ngeom) if self.model.geom_bodyid[g] == b
-                       and (self.model.geom_contype[g] or self.model.geom_conaffinity[g])] for b in self.feet]
+        parts = prof.parts
+        if foot_bodies is None:
+            self.feet = [parts.legs[s].end_body for s in SIDES]
+            self.soles = [list(parts.sole_points[s]) for s in SIDES]  # (geom, point, radius)
+        else:  # these bodies' colliding geoms, all of their points
+            self.feet = [mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, b) for b in foot_bodies]
+            zero = _zero_data(self.model)
+            self.soles = [_sole_points(self.model, zero, [g for g in range(self.model.ngeom) if self.model.geom_bodyid[g] == b
+                                                          and (self.model.geom_contype[g] or self.model.geom_conaffinity[g])],
+                                       np.inf) for b in self.feet]
 
     def run(self, m: RobotMotion) -> dict:
         """{"sole": (T,2) lowest contact point, "flat": (T,2) highest contact point, "foot": (T,2,3),
-        "points": (T,2,G,3) bottom of every sole contact sphere, "com": (T,3) whole-body CoM}."""
+        "points": (T,2,G,3) bottom of every sole point (robot_profile.sole_world), "com": (T,3)
+        whole-body CoM}."""
+        from .robot_profile import sole_world
+
         mj, model, data = self.mj, self.model, self.data
         col = {n: i for i, n in enumerate(m.joint_names)}
         idx = [col.get(n) for n in self.joint_names]
@@ -154,7 +168,7 @@ class FootKinematics:
             com[t] = data.subtree_com[0]  # the world body's subtree = the whole robot
             for k, (b, geoms) in enumerate(zip(self.feet, self.soles)):
                 foot[t, k] = data.xpos[b]
-                pts = [data.geom_xpos[g] - [0.0, 0.0, model.geom_size[g][0]] for g in geoms] or [data.xpos[b]]
+                pts = list(sole_world(data, geoms)) or [data.xpos[b]]
                 points[t, k] = pts + [pts[-1]] * (G - len(pts))
                 sole[t, k], flat[t, k] = min(p[2] for p in pts), max(p[2] for p in pts)
         return {"sole": sole, "flat": flat, "foot": foot, "points": points, "com": com}

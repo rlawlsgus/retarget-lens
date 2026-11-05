@@ -203,12 +203,12 @@ def test_bend_axes_come_from_the_clip():
 
     found = _human_bend_axes("unitree_g1", clip(np.linspace(0, 110, T), np.stack([0 * wander, np.sin(wander),
                                                                                     np.cos(wander)], 1)))
-    axis, info = found["left_shoulder_yaw_joint"]
+    axis, info = found["left"]
     assert np.degrees(np.arccos(np.clip(axis @ (ref_R @ hinge), -1, 1))) < 0.5 and info["consistency"] > 0.99
-    assert found["right_shoulder_yaw_joint"][0] is None and found["right_shoulder_yaw_joint"][1]["consistency"] < 0.7
+    assert found["right"][0] is None and found["right"][1]["consistency"] < 0.7
     straight = _human_bend_axes("unitree_g1", clip(np.linspace(0, 10, T), np.tile(hinge, (T, 1))))
-    assert straight["left_shoulder_yaw_joint"][0] is None and straight["left_shoulder_yaw_joint"][1]["bent_frames"] < 10
-    assert straight["right_shoulder_yaw_joint"][0] is not None
+    assert straight["left"][0] is None and straight["left"][1]["bent_frames"] < 10
+    assert straight["right"][0] is not None
 
 
 def test_feet_level_as_the_clip_stands_not_as_the_reference():
@@ -311,7 +311,7 @@ def test_cmu_elbows_bend_like_the_human():
 
     m, info = retarget_file(CMU_02_03, fps=30.0, smooth_hz=6.0, log=None)
     residual = info["robot_tpose"]["segment_residual_deg"]
-    assert residual["left_shoulder_yaw_joint bend axis"] < 2 and residual["right_shoulder_yaw_joint bend axis"] < 2
+    assert residual["left elbow bend axis"] < 2 and residual["right elbow bend axis"] < 2
     assert all(v["consistency"] > 0.9 for v in info["bend_axes"].values())
     seg = retarget_quality.measure(load_bvh(CMU_02_03), m, "unitree_g1", robot_model("unitree_g1"))["_segments_deg"]
     assert seg["왼 아래팔"] < 15 and seg["오른 아래팔"] < 15

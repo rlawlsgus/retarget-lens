@@ -49,6 +49,10 @@ def _names_for(n_dof: int, joint_names: list[str] | None) -> list[str]:
 def load_robot_npz(path: str) -> RobotMotion:
     """The project's canonical robot-motion file (see RobotMotion.save_npz)."""
     d = np.load(path, allow_pickle=False)
+    meta = {"format": "robot_npz"}
+    ident = {k: str(d[f"robot_{k}"]) for k in ("name", "digest") if f"robot_{k}" in d.files}
+    if ident:  # which robot the motion is for (files written before 0.9 do not say)
+        meta["robot_ident"] = ident
     return RobotMotion(
         name=os.path.splitext(os.path.basename(path))[0],
         joint_names=[str(n) for n in d["joint_names"]],
@@ -57,7 +61,7 @@ def load_robot_npz(path: str) -> RobotMotion:
         dof_pos=d["dof_pos"].astype(np.float64),
         fps=float(d["fps"]),
         source=os.path.abspath(path),
-        meta={"format": "robot_npz"},
+        meta=meta,
     )
 
 

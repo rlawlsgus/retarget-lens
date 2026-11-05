@@ -316,4 +316,6 @@ def test_swing_clearance_on_fbx_walk():
     before, after = analysis.foot_metrics(m, fk), analysis.foot_metrics(out, fk)
     assert after["swing_low_pct"] < before["swing_low_pct"] / 1.5
     assert after["penetration_pct"] <= before["penetration_pct"] and after["planted_slip_pct"] <= before["planted_slip_pct"]
-    assert info["leg_joint_change_deg"]["rmse"] < 3.0 and info["leg_joint_change_deg"]["max"] <= 20.0 + 1e-6
+    # the retarget follows the source's low toe-off closely (feet within 0.4 cm of their targets, the toe 4 cm
+    # under the floor before): the legs change more than when the targets were out of reach (2.6 deg)
+    assert info["leg_joint_change_deg"]["rmse"] < 4.5 and info["leg_joint_change_deg"]["max"] <= 20.0 + 1e-6

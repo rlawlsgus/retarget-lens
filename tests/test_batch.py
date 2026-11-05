@@ -44,6 +44,9 @@ def test_batch_rows_cache_and_errors(session, tmp_path):
     assert walk["retarget_score"] is not None and walk["qc"] in ("PASS", "WARN", "FAIL") and walk["folder"] == "session1"
     assert walk["labels"] == "file" and walk["label_segments"] == 1 and walk["label_seconds"] == {"걷기": 1.0}
     assert walk["duration_s"] > 1.0 and isinstance(walk["problem_seconds"], dict) and walk["objects"] == 0
+    # where, for 데이터셋 내보내기 to cut out: spans per problem kind (seconds as in problem_seconds), QC's bad frames
+    assert set(walk["problem_spans"]) == {k for k, s in walk["problem_seconds"].items() if s > 0}
+    assert isinstance(walk["qc_bad_spans"], list) and "phys_fall_times_s" not in walk  # physics off
     assert by["robot"]["retarget_score"] is None and by["robot"]["labels"] is None  # a robot motion: nothing to score
     again = b.run(files)
     assert [r["cached"] for r in again] == [False, True, True]  # done rows come back at once; failures are tried again

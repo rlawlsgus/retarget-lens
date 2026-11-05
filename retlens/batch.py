@@ -29,7 +29,8 @@ from typing import Callable
 
 from . import paths
 
-BATCH_VERSION = 1  # bump when a row's meaning changes (old cached rows are then computed again)
+BATCH_VERSION = 2  # bump when a row's meaning changes (old cached rows are then computed again)
+# 2: rows keep where the problems are (problem_spans, qc_bad_spans, phys_fall_times_s) for retlens.dataset
 
 # (key, column title, format) of the table and the CSV, in order
 COLUMNS = [
@@ -85,6 +86,7 @@ class Batch:
         self._fk, self._limits = fk, limits
         self.log = log or (lambda *_: None)
         self._sim = None  # the MuJoCo harness sim, made once
+        self._last = None  # (path, item, labels) of the motion measured last (retlens.dataset writes it next)
 
     # ------------------------------------------------------------ cache
     def key(self, path: str) -> str:
@@ -97,7 +99,14 @@ class Batch:
 
             o["physics"] = RESULT_VERSION
         rule_id = [os.path.abspath(rules), os.path.getmtime(rules)] if rules and os.path.isfile(rules) else rules
-        raw = json.dumps([BATCH_VERSION, os.path.abspath(path), st.st_size, st.st_mtime_ns, o, rule_id], sort_keys=True)
+        # the retargeting pipeline and the robot model's content: a row made by another pipeline or an
+        # edited model is made again (as the retarget cache would retarget)
+        from .compare import PIPELINE_VERSION
+        from .robot_profile import load as load_robot
+
+        o["robot"] = load_robot(self.opts.robot).digest
+        raw = json.dumps([BATCH_VERSION, PIPELINE_VERSION, os.path.abspath(path), st.st_size, st.st_mtime_ns, o, rule_id],
+                         sort_keys=True)
         return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
     def _cache_file(self, path: str) -> str:
@@ -117,10 +126,10 @@ class Batch:
             from .analysis import FootKinematics
 
             self._fk = FootKinematics(self.opts.robot)
-        if self._limits is None:
-            from .io import urdf_joint_limits
+        if self._limits is None:  # the robot's own limits (its URDF's where it has one, as the window's)
+            from .robot_profile import load as load_robot
 
-            self._limits = urdf_joint_limits(paths.robot_urdf())
+            self._limits = load_robot(self.opts.robot).limits()
         return self._fk, self._limits
 
     def process(self, path: str) -> dict:
@@ -142,17 +151,48 @@ class Batch:
                 json.dump(row, f, ensure_ascii=False)
         return {**row, "cached": False}
 
-    def _measure(self, path: str) -> dict:
+    def load_item(self, path: str):
+        """The motion as the options make it (a human one retargeted with their corrections; cached)."""
+        from .compare import load_item
+
+        o = self.opts
+        return load_item(path, robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps, smpl_model_dir=o.smpl_model_dir,
+                         swing_clearance=o.swing_clearance_cm / 100.0, foot_flat=o.foot_flat,
+                         self_collision=o.self_collision, log=None)
+
+    def labels(self, path: str, item):
+        """(labels, "file" | "auto" | None): the label file next to the motion, else 자동 라벨 by the options'
+        rule file (a human skeleton only)."""
         from . import motion_labels
-        from .compare import compute_metrics, load_item
+
+        solved = item.info.get("solved_motion")
+        lab = motion_labels.load_for(path, item.robot.fps, item.robot.duration, also=[solved] if solved else ())
+        if lab is not None and not lab.error:
+            return lab, "file"
+        if self.opts.rules and item.human is not None and item.human.kind == "skeleton":
+            from . import autolabel
+
+            lab = autolabel.label_motion(item.human, self.opts.rules, item.robot.duration)
+            if not lab.error:
+                return lab, "auto"
+        return None, None
+
+    def item_and_labels(self, path: str):
+        """(motion, labels) of a file: the ones just measured when it was the last, else loaded (cached)."""
+        last = self._last
+        if last is not None and os.path.normcase(last[0]) == os.path.normcase(os.path.abspath(path)):
+            return last[1], last[2]
+        item = self.load_item(path)
+        return item, self.labels(path, item)[0]
+
+    def _measure(self, path: str) -> dict:
+        from .compare import compute_metrics
+        from .dataset import qc_bad_spans
         from .problems import KINDS
         from .retarget_quality import SCORE_LABELS
 
-        o = self.opts
         fk, limits = self._tools()
-        item = load_item(path, robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps, smpl_model_dir=o.smpl_model_dir,
-                         swing_clearance=o.swing_clearance_cm / 100.0, foot_flat=o.foot_flat,
-                         self_collision=o.self_collision, log=None)
+        item = self.load_item(path)
         compute_metrics(item, fk, limits)
         m = item.metrics
         lost = (m.get("_quality") or {}).get("score_lost") or {}
@@ -161,6 +201,9 @@ class Batch:
         longest = max(probs.items(), key=lambda kv: kv[1])[0] if probs else None
         objs = item.human.objects if item.human is not None else []
         row = {"kind": item.kind, "duration_s": round(item.robot.duration, 3), "fps": item.robot.fps,
+               # where (retlens.dataset cuts these out): problem spans by kind, QC frames it cannot use
+               "problem_spans": {k: [list(s) for s in sp] for k, sp in (m.get("_problems") or {}).items()},
+               "qc_bad_spans": [list(s) for s in qc_bad_spans(item.robot, limits)],
                "retarget_score": m.get("retarget_score"), "grade": m.get("retarget_grade"),
                "qc": m.get("qc"), "qc_notes": m.get("qc_notes") or "",
                "main_loss": SCORE_LABELS.get(worst, worst) if worst else None, "score_lost": lost,
@@ -172,14 +215,7 @@ class Batch:
                   "hand_obj_contact_s"):
             v = m.get(k)
             row[k] = None if v is None or v != v else round(float(v), 3)  # NaN -> None (JSON)
-        solved = item.info.get("solved_motion")
-        lab = motion_labels.load_for(path, item.robot.fps, item.robot.duration, also=[solved] if solved else ())
-        source = "file" if lab is not None and not lab.error else None
-        if source is None and o.rules and item.human is not None and item.human.kind == "skeleton":
-            from . import autolabel
-
-            lab = autolabel.label_motion(item.human, o.rules, item.robot.duration)
-            source = "auto" if not lab.error else None
+        lab, source = self.labels(path, item)
         row["labels"], row["label_segments"] = source, len(lab.segments) if source else None
         if source:
             secs: dict[str, float] = {}
@@ -187,18 +223,22 @@ class Batch:
                 key = f"{s.track}: {s.label}" if s.track else s.label
                 secs[key] = round(secs.get(key, 0.0) + max(0.0, min(s.end, item.robot.duration) - s.start), 3)
             row["label_seconds"] = secs
-        if o.physics:
+        if self.opts.physics:
             row.update(self._physics(item.robot))
+        self._last = (os.path.abspath(path), item, lab)
         return row
 
     def _physics(self, robot) -> dict:
         """The MuJoCo harness check (retlens.policy_replay "harness") of the retarget."""
         from . import policy_replay as pr
+        from .robot_profile import load as load_robot
 
+        g1 = load_robot(self.opts.robot).builtin
         try:
-            if self._sim is None:
-                self._sim = pr.G1Sim(pr.gmt_paths()["model"], "harness")
-            m = pr.run(self._sim, pr.Reference.from_motion(robot), hold_s=1.0).metrics
+            if self._sim is None:  # the G1 on GMT's model; another robot on its own (policy_replay.RobotSim)
+                self._sim = pr.G1Sim(pr.gmt_paths()["model"], "harness") if g1 else pr.RobotSim(self.opts.robot, "harness")
+            ref = pr.Reference.from_motion(robot, joints=None if g1 else self._sim.joint_names)
+            m = pr.run(self._sim, ref, hold_s=1.0).metrics
         except Exception as e:
             return {"phys_error": f"{type(e).__name__}: {e}"}
         from .compare import _issue_ko
@@ -208,7 +248,8 @@ class Batch:
             self.log(f"MuJoCo fall diagnosis failed: {m['fall_diagnosis_error']}")
         pull = (m.get("harness_force_per_body_weight") or {}).get("mean")
         first = m.get("first_fall_cause")
-        return {"phys_falls": m["falls"], "phys_harness_pct": None if pull is None else round(100 * pull, 1),
+        return {"phys_falls": m["falls"], "phys_fall_times_s": list(m.get("fall_times_s") or []),
+                "phys_harness_pct": None if pull is None else round(100 * pull, 1),
                 "phys_saturated_pct": round(100 * m["torque_saturated_ratio"], 1),
                 "phys_ok": "통과" if m.get("consistent") else "; ".join(map(_issue_ko, m.get("issues", []))),
                 # the falls inside the clip: the first one's cause, and how many per cause

@@ -22,6 +22,14 @@ All use GMT's G1 model (the 29-DoF G1 with the wrists fixed: 23 DoF; 4 contact s
 height, drop below the clip; not the 0.5 m root distance, which a tracker drifting along its own path
 would trip). After a fall the robot restarts in the clip's pose at that time.
 
+Another robot (retlens.robot_profile: any MJCF / URDF) runs "pd" and "harness" on its own model
+(RobotSim; GMT is trained for the G1): one position servo per hinge joint with the G1's gains of the
+same role (hip / knee, ankle, waist, shoulder / elbow, wrist; configs/physics.yaml) times its mass over
+the G1's, its own torque limits, the harness's rotation spring as stiff against its tipping (m g h) as
+the G1's, and the fall heights scaled with its standing pelvis height. On a 2.2x heavier 30-DoF
+humanoid this tracked CMU clips as closely as the G1 (key bodies 11 % of their reach vs 11.6 %); the
+G1's gains as they were let its stance legs sag (18 %).
+
 Each fall (in the clip and in the hold after it) also gets its first cause, with the conditions and
 thresholds of the Isaac replay (retlens/diagnosis.py, configs/physics.yaml "diagnosis"). FallProbe
 samples once per 50 Hz tick, before the fall check (so a fall's tick holds the fallen state, as the
@@ -55,6 +63,7 @@ import numpy as np
 
 from . import paths, settings
 from .motion import RobotMotion
+from .robot_profile import sole_world
 
 # ---------------------------------------------------------------------------------- GMT constants
 GMT_DOFS = ["left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint", "left_knee_joint",
@@ -93,6 +102,14 @@ RESULT_VERSION = 2  # bump when run()'s metrics change meaning (cached results a
 # fall diagnosis (retlens/diagnosis.py) at the 50 Hz control rate
 FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
 KNEES = ["left_knee_link", "right_knee_link"]
+# another robot (RobotSim) borrows the G1's gains and sizes: GMT's G1 model's mass, its whole-body CoM
+# and pelvis above the soles at the zero pose
+G1_MASS = 33.34  # kg
+G1_COM_HEIGHT = 0.703  # m
+G1_PELVIS_HEIGHT = 0.792  # m
+# a joint's role -> a G1 joint of that role, whose configs/physics.yaml gains it gets
+ROLE_JOINT = {"hip": "left_hip_pitch_joint", "ankle": "left_ankle_pitch_joint", "waist": "waist_yaw_joint",
+              "arm": "left_shoulder_pitch_joint", "wrist": "left_wrist_roll_joint", "other": "other"}
 DIAG_SETTLE = 5  # ticks after a restart while the robot settles (0.1 s, as the Isaac replay's 3 frames at 30 fps)
 DIAG_CONFIG_FPS = 30.0  # configs/physics.yaml "diagnosis" min_frames counts frames of a 30 fps retarget (Isaac)
 
@@ -240,12 +257,15 @@ class Reference:
         self.root_ang_vel_fd = ang
 
     @classmethod
-    def from_motion(cls, m: RobotMotion, loop: bool = False) -> "Reference":
+    def from_motion(cls, m: RobotMotion, loop: bool = False, joints: list | None = None) -> "Reference":
+        """The clip for a simulator whose joints are `joints` (default GMT's 23; RobotSim.joint_names)."""
+        joints = list(joints) if joints is not None else GMT_DOFS
         col = {n: i for i, n in enumerate(m.joint_names)}
-        missing = [n for n in GMT_DOFS if n not in col]
+        missing = [n for n in joints if n not in col]
         if missing:
-            raise ValueError(f"{m.name}: the motion lacks {', '.join(missing)} (GMT needs the G1 joints)")
-        dof = m.dof_pos[:, [col[n] for n in GMT_DOFS]]
+            raise ValueError(f"{m.name}: the motion lacks {', '.join(missing[:5])}"
+                             + (" (GMT needs the G1 joints)" if joints is GMT_DOFS else " (a motion for another robot?)"))
+        dof = m.dof_pos[:, [col[n] for n in joints]]
         xyzw = np.concatenate([m.root_quat[:, 1:4], m.root_quat[:, :1]], axis=1)
         return cls(m.root_pos, xyzw, dof, m.fps, loop=loop)
 
@@ -306,15 +326,20 @@ def load_config(config_path: str | None = None) -> dict:
         return yaml.safe_load(f)
 
 
+def _gain(cfg: dict, name: str) -> tuple[float, float]:
+    """(stiffness, damping) of the first configs/physics.yaml "pd" pattern matching a joint name."""
+    for rule in cfg["pd"]:
+        if re.fullmatch(rule["pattern"], name):
+            return float(rule["stiffness"]), float(rule["damping"])
+    return 0.0, 0.0
+
+
 def pd_gains(config_path: str | None = None):
     """configs/physics.yaml's stiff drive gains (first matching pattern) for GMT's 23 joints."""
     cfg = load_config(config_path)
     kp, kd = np.zeros(len(GMT_DOFS)), np.zeros(len(GMT_DOFS))
     for i, n in enumerate(GMT_DOFS):
-        for rule in cfg["pd"]:
-            if re.fullmatch(rule["pattern"], n):
-                kp[i], kd[i] = rule["stiffness"], rule["damping"]
-                break
+        kp[i], kd[i] = _gain(cfg, n)
     return kp, kd, cfg.get("fall", {})
 
 
@@ -324,13 +349,21 @@ class Result:
     times: np.ndarray  # (N,) s, 50 Hz
     root_pos: np.ndarray  # (N, 3)
     root_quat: np.ndarray  # (N, 4) wxyz
-    dof_pos: np.ndarray  # (N, 23)
+    dof_pos: np.ndarray  # (N, joints): GMT's 23 (G1Sim) or the robot's (RobotSim)
     metrics: dict = field(default_factory=dict)
+    joint_names: list = field(default_factory=lambda: list(GMT_DOFS))  # dof_pos's columns
 
 
 class G1Sim:
     """GMT's G1 model in MuJoCo, driven either by GMT or by open-loop stiff PD (with or without the
     pelvis harness)."""
+
+    # what run() and FallProbe read about the robot (RobotSim has its own)
+    joint_names = GMT_DOFS
+    leg_cols = list(range(12))  # GMT_DOFS: the legs first
+    foot_names = FEET
+    knee_names = KNEES
+    tau_lim = TORQUE_LIMIT
 
     def __init__(self, model_path: str, controller: str, policy_path: str | None = None,
                  physics_config: str | None = None):
@@ -372,6 +405,9 @@ class G1Sim:
         self.feet = [g for g in range(self.model.ngeom)
                      if self.model.body(self.model.geom_bodyid[g]).name.endswith("ankle_roll_link")
                      and self.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_SPHERE]
+        # per foot of foot_names: its sole points (geom, point in the geom, radius): the sphere centres
+        self.sole_sets = [[(g, np.zeros(3), float(self.model.geom_size[g][0])) for g in self.feet
+                           if self.model.geom_bodyid[g] == self.model.body(n).id] for n in FEET]
         self.mass = float(self.model.body_mass.sum())
         self.weight = self.mass * float(-self.model.opt.gravity[2])
         self.tau_ratio = np.zeros(len(GMT_DOFS))  # |torque demand| / limit of the last apply()
@@ -409,7 +445,7 @@ class G1Sim:
             data.qvel[self.dof_v] = dof_vel
         mj.mj_forward(self.model, data)
         if lift:  # start with the soles on the floor, not in it (as the Isaac replay does)
-            low = min(data.geom_xpos[g][2] - self.model.geom_size[g][0] for g in self.feet)
+            low = min(float(sole_world(data, pts)[:, 2].min()) for pts in self.sole_sets)
             if low < 0.0:
                 data.qpos[2] -= low - 0.001
                 mj.mj_forward(self.model, data)
@@ -458,8 +494,8 @@ class G1Sim:
             d.ctrl[:] = target + self.pd_kd / self.pd_kp * ref_dof_vel
             tau = self.pd_kp * (target - q) + self.pd_kd * (ref_dof_vel - qd)
         demand = np.abs(tau)
-        self.tau_ratio = demand / TORQUE_LIMIT
-        return bool(np.any(demand > TORQUE_LIMIT))
+        self.tau_ratio = demand / self.tau_lim
+        return bool(np.any(demand > self.tau_lim))
 
     def pull(self, pos, rot_xyzw, vel, ang_vel) -> tuple[float, float]:
         """The pelvis harness for one 1 ms step, toward the clip's root pose and velocities (world
@@ -499,6 +535,102 @@ class G1Sim:
         return None
 
 
+class RobotSim(G1Sim):
+    """Any robot (retlens.robot_profile) in MuJoCo with open-loop stiff PD ("pd") and the pelvis harness
+    ("harness"); see the module docstring. Its own model (equality constraints off, a floor added when it
+    has none), one position servo per hinge joint in qpos order."""
+
+    def __init__(self, robot: str, controller: str, physics_config: str | None = None):
+        import mujoco
+
+        from .robot_profile import SIDES, _geom_low, _zero_data, load
+
+        if controller not in ("pd", "harness"):
+            raise ValueError("GMT's tracking policy is trained for the G1; another robot runs pd or harness")
+        self.mj, self.controller = mujoco, controller
+        prof = load(robot)
+        parts = prof.parts
+        spec = prof.spec()
+        if not any(g.type == mujoco.mjtGeom.mjGEOM_PLANE for g in spec.worldbody.geoms):
+            spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 1])
+        for a in list(spec.actuators):  # the model's own (motors, servos) give way to the PD servos
+            spec.delete(a)
+        names = prof.joint_names()
+        for n in names:
+            spec.add_actuator(name=f"retlens_pd_{n}", target=n, trntype=mujoco.mjtTrn.mjTRN_JOINT)
+        self.model = m = spec.compile()
+        m.opt.timestep = SIM_DT
+        m.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+        cfg = load_config(physics_config)
+        self.mass = float(m.body_mass.sum())
+        self.gain_scale = self.mass / G1_MASS
+        role = {}
+        for limbs, prox, dist in ((parts.legs, "hip", "ankle"), (parts.arms, "arm", "wrist")):
+            for s in SIDES:
+                limb = limbs[s]
+                role.update({j: prox for j in [*limb.proximal, limb.bend]})
+                role.update({j: dist for j in limb.distal})
+        role.update({j: "waist" for j in parts.waist})
+        jid = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n) for n in names]
+        kp, kd, lim = np.zeros(len(names)), np.zeros(len(names)), np.zeros(len(names))
+        for i, j in enumerate(jid):
+            kp[i], kd[i] = _gain(cfg, ROLE_JOINT[role.get(j, "other")])
+            lim[i] = float(m.jnt_actfrcrange[j][1]) if m.jnt_actfrclimited[j] else 1000.0
+        kp, kd = kp * self.gain_scale, kd * self.gain_scale
+        for a in range(m.nu):  # position servos, as G1Sim's pd / harness
+            m.actuator_gaintype[a] = mujoco.mjtGain.mjGAIN_FIXED
+            m.actuator_gainprm[a, 0] = kp[a]
+            m.actuator_biastype[a] = mujoco.mjtBias.mjBIAS_AFFINE
+            m.actuator_biasprm[a, :3] = [0.0, -kp[a], -kd[a]]
+            m.actuator_forcelimited[a] = 1
+            m.actuator_forcerange[a] = [-lim[a], lim[a]]
+            m.actuator_ctrllimited[a] = 0
+        if controller == "harness":
+            self.self_collision_off()
+        self.pd_kp, self.pd_kd, self.tau_lim = kp, kd, lim
+        self.joint_names = names
+        self.leg_cols = [i for i, j in enumerate(jid) if j in {x for s in SIDES for x in parts.legs[s].joints}]
+        self.foot_names = [prof.body(parts.legs[s].end_body) for s in SIDES]
+        self.knee_names = [prof.body(parts.legs[s].lower_body) for s in SIDES]
+        self.sole_sets = [list(parts.sole_points[s]) for s in SIDES]
+        self.feet = [g for s in SIDES for g in parts.sole_geoms[s]]
+        # fall heights in the G1's metres, scaled with this robot's standing pelvis height
+        k_h = parts.standing_height / G1_PELVIS_HEIGHT
+        fall = dict(cfg.get("fall", {}))
+        for key, default in (("min_pelvis_height_m", 0.3), ("drop_m", 0.25)):
+            fall[key] = float(fall.get(key, default)) * k_h
+        self.fall_cfg = fall
+        self.diag_cfg = cfg.get("diagnosis") or {}
+        self.data = mujoco.MjData(m)
+        self.ref_data = mujoco.MjData(m)
+        self.dof_q, self.dof_v = m.jnt_qposadr[jid], m.jnt_dofadr[jid]
+        self.key_bodies = [parts.chest] + [b for s in SIDES for b in (parts.legs[s].lower_body, parts.legs[s].end_body,
+                                                                     parts.arms[s].lower_body, parts.arms[s].tip_body)]
+        self.pelvis = parts.root
+        self.weight = self.mass * float(-m.opt.gravity[2])
+        self.tau_ratio = np.zeros(len(names))
+        self.report_cfg = {}
+        if controller == "harness":
+            self.report_cfg = cfg.get("report", {})
+            a = cfg.get("assist", {})
+            wn = 2 * np.pi * float(a.get("pos_hz", 2.0))
+            self.h_kp, self.h_kd = self.mass * wn ** 2, 2 * self.mass * wn
+            d0 = _zero_data(m)
+            mujoco.mj_comPos(m, d0)
+            h = float(d0.subtree_com[0][2] - min(_geom_low(m, d0, g) for g in self.feet))
+            k_rot = (self.mass * h) / (G1_MASS * G1_COM_HEIGHT)  # as stiff against its tipping as the G1's
+            self.h_kp_rot = float(a.get("rot_stiffness", 300.0)) * k_rot
+            self.h_kd_rot = float(a.get("rot_damping", 30.0)) * k_rot
+            self.h_axes = np.array([1.0, 1.0, 1.0 if a.get("vertical", False) else 0.0])
+        self.policy = None
+        self.robot_name = prof.name
+
+    def model_text(self) -> str:
+        """What a result's json says the model was."""
+        return (f"{self.robot_name} ({len(self.joint_names)} DoF), MuJoCo 1 kHz, the G1's PD gains x {self.gain_scale:.2f} "
+                f"(mass {self.mass:.1f} kg / {G1_MASS} kg)")
+
+
 class FallProbe:
     """What the fall diagnosis (retlens/diagnosis.py) needs from a run, sampled once per control tick:
     sole points (contact sphere centre minus its radius) of the robot and of the clip's pose, the normal
@@ -508,12 +640,12 @@ class FallProbe:
     def __init__(self, sim: G1Sim):
         m = sim.model
         self.sim = sim
-        self.foot_bodies = [m.body(n).id for n in FEET]
-        self.knees = [m.body(n).id for n in KNEES]
-        self.geoms = np.array([[g for g in sim.feet if m.geom_bodyid[g] == b] for b in self.foot_bodies])  # (2, C)
-        self.geom_foot = {int(g): k for k, gs in enumerate(self.geoms) for g in gs}
-        self.drop = np.zeros(self.geoms.shape + (3,))
-        self.drop[..., 2] = m.geom_size[self.geoms, 0]
+        self.foot_bodies = [m.body(n).id for n in sim.foot_names]
+        self.knees = [m.body(n).id for n in sim.knee_names]
+        # per foot its sole points, padded to one count by repeating the last (they only count by position)
+        n = max(len(s) for s in sim.sole_sets)
+        self.points = [list(s) + [s[-1]] * (n - len(s)) for s in sim.sole_sets]
+        self.geom_foot = {int(g): k for k, s in enumerate(sim.sole_sets) for g, _, _ in s}
         self.rec = {k: [] for k in ("soles", "ref_soles", "com", "ref_com", "force", "feet_m", "knees_m", "tau",
                                     "harness")}
         self._f6 = np.zeros(6)
@@ -523,8 +655,8 @@ class FallProbe:
         harness force per body weight since the previous tick."""
         sim, d, m = self.sim, self.sim.data, self.sim.model
         r = self.rec
-        r["soles"].append(d.geom_xpos[self.geoms] - self.drop)
-        r["ref_soles"].append(ref_data.geom_xpos[self.geoms] - self.drop)
+        r["soles"].append(np.stack([sole_world(d, p) for p in self.points]))
+        r["ref_soles"].append(np.stack([sole_world(ref_data, p) for p in self.points]))
         r["com"].append(d.subtree_com[sim.pelvis].copy())
         r["ref_com"].append(ref_data.subtree_com[sim.pelvis].copy())
         force = np.zeros(len(self.foot_bodies))
@@ -560,8 +692,9 @@ class FallProbe:
         ref_floor = floor_track(ref_low, slowest_sole_speed(r["ref_soles"], fps), fps)  # retargets drift
         ref_track = stability.balance_track(r["ref_com"], r["ref_soles"], fps, ref_floor, contact_h)
         harness = self.sim.controller == "harness"
-        return FallSignals(fps=fps, feet=list(FEET), ref_soles=r["ref_soles"], soles=r["soles"], foot_force=r["force"],
-                           weight=self.sim.weight, tau_ratio=r["tau"], joint_names=list(GMT_DOFS), sim_track=sim_track,
+        return FallSignals(fps=fps, feet=list(self.sim.foot_names), ref_soles=r["ref_soles"], soles=r["soles"],
+                           foot_force=r["force"], weight=self.sim.weight, tau_ratio=r["tau"],
+                           joint_names=list(self.sim.joint_names), sim_track=sim_track,
                            distances={"feet": r["feet_m"], "knees": r["knees_m"]},
                            harness=r["harness"] if harness else None, assist=1.0 if harness else 0.0,
                            ref_track=ref_track)
@@ -662,8 +795,8 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
                 pull_t.append(torques.mean())
         if progress and k % 25 == 0:  # every 0.5 s simulated (RetLens's runner cancels from here)
             progress(k, n_ctrl)
-    je = np.degrees(np.array(joint_err)) if joint_err else np.zeros((0, len(GMT_DOFS)))
-    legs = slice(0, 12)
+    je = np.degrees(np.array(joint_err)) if joint_err else np.zeros((0, len(sim.joint_names)))
+    legs = list(sim.leg_cols)
     end_pos = ref.frame([min(total, ref.length)])[0][0]
     final_drift = float(np.linalg.norm(sim.data.qpos[:2] - end_pos[:2]))
     metrics = {
@@ -693,7 +826,8 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         metrics.update(harness_metrics(sim, np.array(pull_f), np.array(pull_f_max), np.array(pull_t),
                                        len(falls), metrics["torque_saturated_ratio"]))
     metrics.update(fall_diagnosis(sim, probe, fall_ticks, hold_ticks, causes, hold_causes, probe_error))
-    return Result(sim.controller, np.array(times), np.array(roots), np.array(quats), np.array(dofs), metrics)
+    return Result(sim.controller, np.array(times), np.array(roots), np.array(quats), np.array(dofs), metrics,
+                  list(sim.joint_names))
 
 
 def _plain(x):
@@ -774,10 +908,10 @@ def harness_metrics(sim: G1Sim, force: np.ndarray, force_max: np.ndarray, torque
 
 
 def result_motion(res: Result, name: str, joint_names: list[str]) -> RobotMotion:
-    """The simulated motion in the project's robot npz layout (joints GMT does not drive stay 0)."""
+    """The simulated motion in the project's robot npz layout (joints the simulation does not drive stay 0)."""
     col = {n: i for i, n in enumerate(joint_names)}
     dof = np.zeros((len(res.times), len(joint_names)))
-    for j, n in enumerate(GMT_DOFS):
+    for j, n in enumerate(res.joint_names):
         if n in col:
             dof[:, col[n]] = res.dof_pos[:, j]
     return RobotMotion(name=name, joint_names=list(joint_names), root_pos=res.root_pos, root_quat=res.root_quat,

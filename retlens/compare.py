@@ -30,8 +30,9 @@ HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
 MARKER_EXT = (".c3d",)  # raw optical markers: shown on the same take's retargeted robot
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
-PIPELINE_VERSION = 5  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
-# 5: feet levelled from the clip's stance, foot-flat through legs and pelvis height
+PIPELINE_VERSION = 8  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
+# 5: feet levelled from the clip's stance, foot-flat through legs and pelvis height; 6: the robot's
+# parts from its model (robot_profile: joint centres, flex signs), any robot
 MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",) + MARKER_EXT
 # folders the viewer lists motions from (dev: data/raw, data/samples, data/retargeted,
 # data/uploads, reports; installed: see retlens.paths); uploads land in UPLOADS
@@ -125,10 +126,13 @@ def human_format(path: str) -> str | None:
 
 def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance: float = 0.0,
                foot_flat: bool = False, self_collision: bool = False) -> str:
-    from .retarget import ROBOT_TAGS
+    """Where the retarget of `path` to `robot` (registry key or model path) with these settings
+    is cached: keyed by the robot model's digest too, so an edited model retargets again."""
+    from .robot_profile import load
 
+    prof = load(robot)
     st = os.stat(path)
-    key = [os.path.abspath(path), st.st_size, int(st.st_mtime), robot, smooth, fps, PIPELINE_VERSION]
+    key = [os.path.abspath(path), st.st_size, int(st.st_mtime), prof.digest, smooth, fps, PIPELINE_VERSION]
     if swing_clearance:  # appended only when on, so earlier cache entries stay valid
         key.append(["swing_clearance", swing_clearance])
     if foot_flat:
@@ -138,7 +142,7 @@ def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance
     key = json.dumps(key)
     h = hashlib.sha1(key.encode()).hexdigest()[:10]
     stem = os.path.splitext(os.path.basename(path))[0]
-    return os.path.join(CACHE, f"{stem}_{h}_{ROBOT_TAGS.get(robot, robot)}.npz")
+    return os.path.join(CACHE, f"{stem}_{h}_{prof.tag}.npz")
 
 
 def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: float = 30.0,
@@ -323,7 +327,7 @@ def _retarget_quality(item: Item, fk: analysis.FootKinematics, metrics: dict) ->
     from . import retarget_quality as rq
 
     try:
-        q = rq.measure(item.human, item.robot, item.info.get("robot", "unitree_g1"), fk.model)
+        q = rq.measure(item.human, item.robot, fk.robot, fk.model)
     except Exception as e:  # a skeleton without the limbs to match: no score, the rest still works
         return {"_quality": {"error": f"{type(e).__name__}: {e}"}}
     if not q:

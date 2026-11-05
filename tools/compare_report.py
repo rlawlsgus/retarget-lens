@@ -70,9 +70,8 @@ def main() -> int:
     ap.add_argument("inputs", nargs="*", help="one group of motion files (the first is the reference)")
     ap.add_argument("-g", "--group", nargs="+", action="append", default=[], help="another group (repeatable)")
     ap.add_argument("--out", default=None, help="write the markdown here (default: print only)")
-    ap.add_argument("--robot", default="unitree_g1")
-    ap.add_argument("--urdf", default=os.path.join(os.path.dirname(ROOT), "GMR", "assets", "unitree_g1",
-                                                   "g1_custom_collision_29dof.urdf"))
+    ap.add_argument("--robot", default="unitree_g1", help="unitree_g1 or a robot's MJCF / URDF path")
+    ap.add_argument("--urdf", default=None, help="joint limits from this URDF (default: the robot's own)")
     ap.add_argument("--smooth", type=float, default=6.0, help="smoothing for retargeted inputs (Hz, 0 = off)")
     ap.add_argument("--swing-clearance", type=float, default=0.0, metavar="CM",
                     help="lift swing feet of retargeted inputs to at least CM off the floor (0 = off)")
@@ -90,7 +89,12 @@ def main() -> int:
         fk = analysis.FootKinematics(args.robot)
     except Exception as e:
         print(f"foot metrics disabled ({type(e).__name__}: {e})")
-    limits = urdf_joint_limits(args.urdf) if os.path.isfile(args.urdf) else None
+    try:
+        from retlens.robot_profile import load as load_robot
+
+        limits = load_robot(args.robot).limits(args.urdf)
+    except Exception:  # MuJoCo missing: the URDF's limits alone
+        limits = urdf_joint_limits(args.urdf) if args.urdf and os.path.isfile(args.urdf) else None
     clearance = f", 스윙 발 높이 >= {args.swing_clearance:g} cm" if args.swing_clearance else ""
     lines = [f"# 모션 비교 ({dt.datetime.now():%Y-%m-%d %H:%M}, 로봇 {args.robot}, 사람 입력 평활화 {args.smooth:g} Hz"
              f"{clearance})", "",

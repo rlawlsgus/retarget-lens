@@ -12,8 +12,8 @@ Robot-independent by construction:
 - the robot's own limits: joints pinned at their range limits, body parts going through
   each other (MuJoCo collision of the robot model's collision geoms).
 
-A robot takes part through the tables retlens/retarget.py already needs to retarget to it
-(TPOSE_LIMBS: robot segment <-> human segment, TPOSE_FEET). score() folds these and the
+A robot takes part through the parts retargeting finds in its model (retlens.robot_profile:
+limb segments between joint centres <-> human segments, the feet). score() folds these and the
 existing foot / balance metrics into 0-100 (SCORE_RULES).
 """
 
@@ -49,15 +49,21 @@ SCORE_LABELS = {"pose_err_deg": "자세 재현", "contact_mismatch_pct": "발 �
                 "penetration_pct": "바닥 관통"}
 
 
-def segments(robot: str) -> list[tuple[str, tuple[str, str], tuple[str, str]]]:
-    """(name, robot (from body, to body), human (from role, to role)) of the robot's limbs."""
-    from .retarget import TPOSE_LIMBS
+def segments(robot: str) -> list:
+    """(name, robot (from point, to point), human (from role, to role)) of the robot's limbs;
+    robot points are joint centres (robot_profile.Point). Empty when the robot's parts cannot
+    be found."""
+    from .retarget import limb_segments, profile
+    from .robot_profile import RobotError
 
+    try:
+        segs = limb_segments(profile(robot))
+    except RobotError:
+        return []
     out = []
-    for _, pairs in TPOSE_LIMBS.get(robot, []):
-        for rseg, hseg in pairs:
-            side = "왼" if hseg[0].startswith("Left") else "오른"
-            out.append((f"{side} {SEGMENT_KO.get(hseg[0][4:] if side == '왼' else hseg[0][5:], hseg[0])}", rseg, hseg))
+    for _, rseg, hseg in segs:
+        side = "왼" if hseg[0].startswith("Left") else "오른"
+        out.append((f"{side} {SEGMENT_KO.get(hseg[0][4:] if side == '왼' else hseg[0][5:], hseg[0])}", rseg, hseg))
     return out
 
 
@@ -67,9 +73,10 @@ def supported(robot: str) -> bool:
 
 def foot_bodies(robot: str) -> tuple[str, ...]:
     """The robot's foot bodies (left, right), for analysis.FootKinematics."""
-    from .retarget import TPOSE_FEET
+    from .retarget import profile
 
-    return tuple(body for _, body in TPOSE_FEET.get(robot, []))
+    feet = profile(robot).feet()
+    return (feet["left"], feet["right"])
 
 
 def model_limits(model) -> dict[str, tuple[float, float, float]]:
@@ -117,19 +124,22 @@ class _RobotFK:
                 q[:, 7 + k] = m.dof_pos[:, i]
         return q
 
-    def run(self, m: RobotMotion, bodies: list[int]) -> tuple[np.ndarray, np.ndarray, list[set]]:
-        """Positions (T, B, 3) and frames (T, B, 3, 3) of the bodies, and per frame the
-        colliding body pairs (not parent / child or siblings: those touch by design)."""
+    def run(self, m: RobotMotion, points: list) -> tuple[np.ndarray, np.ndarray, list[set]]:
+        """Positions (T, P, 3) of the points (robot_profile.Point) and frames (T, P, 3, 3) of
+        their bodies, and per frame the colliding body pairs (not parent / child or siblings:
+        those touch by design)."""
         mj, model, data, cm, cd = self.mj, self.model, self.data, self.cmodel, self.cdata
         Q = self.qpos(m)
         T = len(Q)
-        pos, rot = np.zeros((T, len(bodies), 3)), np.zeros((T, len(bodies), 3, 3))
+        bodies = [p.body for p in points]
+        local = np.array([p.local for p in points]).reshape(-1, 3)
+        pos, rot = np.zeros((T, len(points), 3)), np.zeros((T, len(points), 3, 3))
         hits = []
         for t in range(T):
             data.qpos[:] = Q[t]
             mj.mj_kinematics(model, data)
-            pos[t] = data.xpos[bodies]
             rot[t] = data.xmat[bodies].reshape(-1, 3, 3)
+            pos[t] = data.xpos[bodies] + np.einsum("pij,pj->pi", rot[t], local)
             cd.qpos[:] = Q[t]
             mj.mj_kinematics(cm, cd)
             mj.mj_collision(cm, cd)
@@ -188,18 +198,28 @@ def contacts(ankles: np.ndarray, leg: float, fps: float) -> np.ndarray:
 def measure(human: SkeletonMotion, m: RobotMotion, robot: str, model) -> dict:
     """Quality numbers of one retarget: human skeleton (as loaded; the robot follows it frame
     for frame) against the robot motion. Keys without a leading underscore are metrics."""
-    from .retarget import _resolve_bvh_bodies
+    from .retarget import _resolve_bvh_bodies, profile
+    from .robot_profile import Point
 
     segs = segments(robot)
     if not segs or human.kind != "skeleton" or m.num_frames < 4:
         return {}
     roles = _resolve_bvh_bodies(human.joint_names, human.parents)
     fk = _RobotFK(model)
-    names = sorted({b for _, rseg, _ in segs for b in rseg})
-    bodies = [fk.body(n) for n in names] + [fk.body(fk.name(1))]  # + the root (pelvis)
-    pos, _, hits = fk.run(m, bodies)
+
+    def key(p):  # robot points are compared by value: the same joint centre in two segments
+        return (p.body, tuple(np.round(p.local, 9)))
+
+    points, col = [], {}
+    for _, rseg, _ in segs:
+        for p in rseg:
+            if key(p) not in col:
+                col[key(p)] = len(points)
+                points.append(p)
+    segs = [(name, (key(a), key(b)), hseg) for name, (a, b), hseg in segs]
+    root = profile(robot).parts.root
+    pos, _, hits = fk.run(m, points + [Point(root, np.zeros(3))])  # + the root body's origin
     T = m.num_frames
-    col = {n: i for i, n in enumerate(names)}
     role_names = sorted({r for _, _, hseg in segs for r in hseg} | {"Hips"})
     H = _human_at(human, [roles[r] for r in role_names], T, m.fps)
     hcol = {r: i for i, r in enumerate(role_names)}

@@ -38,17 +38,19 @@ import io
 import json
 import os
 import pickle
-import tempfile
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import robot_profile
 from .motion import RobotMotion
+from .robot_profile import HUMAN_SIDE, SIDES, RobotError, sole_world
 from .rotations import matrix_to_quat, quat_normalize, quat_to_matrix
 
-# File-name tag of each GMR robot in our outputs (<clip>_<tag>.npz).
-ROBOT_TAGS = {"unitree_g1": "g1", "unitree_g1_with_hands": "g1_hands", "unitree_h1": "h1", "unitree_h1_2": "h1_2"}
+# GMR's own tuned configs (formats lafan1 / nokov / smplx-gmr) exist for the built-in G1 only;
+# every other robot goes through the configs derived from its model (robot_profile).
+FIXED_CONFIG_FORMATS = ("lafan1", "nokov", "smplx-gmr")
 
 # Human bodies of GMR's LAFAN1 configs. The T-pose path fills the same names.
 TPOSE_BODIES = (
@@ -90,66 +92,82 @@ def _strip_common_prefix(names: list[str]) -> list[str]:
     return list(names)
 _HIPS_ALIASES = ("Hips", "Hip", "Pelvis", "hip", "pelvis")
 
-# T-pose of the robot, matched to the human's reference frame one joint at a
-# time: (joint to set, robot segment (from body, to body), human segment).
-# Parents come first. Robots without an entry keep their zero pose.
-_G1_TPOSE_CHAINS = [
-    (f"{s}_{joint}", (f"{s}_{a}", f"{s}_{b}"), (f"{S}{c}", f"{S}{d}"))
-    for s, S in (("left", "Left"), ("right", "Right"))
-    for joint, a, b, c, d in (
-        ("hip_roll_joint", "hip_roll_link", "knee_link", "UpLeg", "Leg"),
-        ("knee_joint", "knee_link", "ankle_pitch_link", "Leg", "Foot"),
-        ("shoulder_roll_joint", "shoulder_roll_link", "elbow_link", "Arm", "ForeArm"),
-        ("elbow_joint", "elbow_link", "wrist_roll_link", "ForeArm", "Hand"),
-    )
-]
-TPOSE_CHAINS = {"unitree_g1": _G1_TPOSE_CHAINS, "unitree_g1_with_hands": _G1_TPOSE_CHAINS}
-
-# Then each limb is refined with its swing joints together: (joints, [(robot segment, human segment)]).
-# Twist joints (hip / shoulder yaw) stay out: matching a few degrees of kink in the
-# reference skeleton with them gave 75 deg twists that then skewed every frame.
-_G1_TPOSE_LIMBS = [
-    limb
-    for s, S in (("left", "Left"), ("right", "Right"))
-    for limb in (
-        ([f"{s}_hip_pitch_joint", f"{s}_hip_roll_joint", f"{s}_knee_joint"],
-         [((f"{s}_hip_roll_link", f"{s}_knee_link"), (f"{S}UpLeg", f"{S}Leg")),
-          ((f"{s}_knee_link", f"{s}_ankle_pitch_link"), (f"{S}Leg", f"{S}Foot"))]),
-        ([f"{s}_shoulder_pitch_joint", f"{s}_shoulder_roll_joint", f"{s}_elbow_joint"],
-         [((f"{s}_shoulder_roll_link", f"{s}_elbow_link"), (f"{S}Arm", f"{S}ForeArm")),
-          ((f"{s}_elbow_link", f"{s}_wrist_roll_link"), (f"{S}ForeArm", f"{S}Hand"))]),
-    )
-]
-TPOSE_LIMBS = {"unitree_g1": _G1_TPOSE_LIMBS, "unitree_g1_with_hands": _G1_TPOSE_LIMBS}
-# ...and the feet are levelled with the ankles: (ankle joints, foot body)
-_G1_TPOSE_FEET = [([f"{s}_ankle_pitch_joint", f"{s}_ankle_roll_joint"], f"{s}_ankle_roll_link") for s in ("left", "right")]
-TPOSE_FEET = {"unitree_g1": _G1_TPOSE_FEET, "unitree_g1_with_hands": _G1_TPOSE_FEET}
-# ...and each elbow is turned to bend in the human's plane: the shoulder's twist joint puts the
-# robot's bend axis on the human's. A straight arm in the reference pose shows no twist, so the
-# human axis comes from the clip's own bends (_human_bend_axes); left at 0, CMU BVH elbows bent
-# in a plane 38 deg off the human's and the hands went through the hips (retarget_quality found
-# it). Knees are left out: their axes already matched in the reference (CMU BVH, 0.2 deg), and
-# twisting the hips for SMPL-X pinned the ankle roll without bending the knees any truer.
-# (twist joint, bend joint, robot (upper, middle, lower) bodies, human (upper, middle, lower)).
-_G1_TPOSE_TWISTS = [
-    (f"{s}_shoulder_yaw_joint", f"{s}_elbow_joint", (f"{s}_shoulder_roll_link", f"{s}_elbow_link", f"{s}_wrist_roll_link"),
-     (f"{S}Arm", f"{S}ForeArm", f"{S}Hand"))
-    for s, S in (("left", "Left"), ("right", "Right"))
-]
-TPOSE_TWISTS = {"unitree_g1": _G1_TPOSE_TWISTS, "unitree_g1_with_hands": _G1_TPOSE_TWISTS}
+# The robot's T-pose is built from its parts (robot_profile), matched to the human's reference
+# frame: first one joint at a time, parents first (the hip / shoulder abduction joint points the
+# thigh / upper arm, the knee / elbow the shank / forearm; segments run between joint centres);
+# then each limb is refined with its swing joints together. Twist joints (hip / shoulder yaw)
+# stay out: matching a few degrees of kink in the reference skeleton with them gave 75 deg
+# twists that then skewed every frame. The feet are levelled with the ankle joints.
+# Each elbow is then turned to bend in the human's plane: the shoulder's twist joint puts the
+# robot's bend axis (the elbow axis, in its flexing sense) on the human's. A straight arm in the
+# reference pose shows no twist, so the human axis comes from the clip's own bends
+# (_human_bend_axes); left at 0, CMU BVH elbows bent in a plane 38 deg off the human's and the
+# hands went through the hips (retarget_quality found it). Knees are left out: their axes
+# already matched in the reference (CMU BVH, 0.2 deg), and twisting the hips for SMPL-X pinned
+# the ankle roll without bending the knees any truer.
+TPOSE_SEGMENTS = (("UpLeg", "Leg"), ("Leg", "Foot"), ("Arm", "ForeArm"), ("ForeArm", "Hand"))
 BEND_AXIS_MIN_DEG = 20.0  # frames bent at least this much show the bend axis
 BEND_AXIS_MIN_FRAMES = 10
 BEND_AXIS_CONSISTENCY = 0.7  # mean resultant length of the per-frame axes: lower = no steady hinge
 
-# Robot body that sits at the human joint centre, where the IK body's origin does
-# not (G1 hip_yaw_link is mid-thigh, shoulder_yaw_link mid-upper-arm). The
-# difference becomes GMR's per-body position offset.
-_G1_JOINT_CENTERS = {
-    f"{S}{part}": f"{s}_{body}"
-    for s, S in (("left", "Left"), ("right", "Right"))
-    for part, body in (("UpLeg", "hip_roll_link"), ("Arm", "shoulder_roll_link"), ("Hand", "wrist_pitch_link"))
+# Human body whose position is the robot's joint centre (robot_profile: where the joint axes
+# meet), where the IK body's origin need not be (G1 hip_yaw_link is mid-thigh,
+# shoulder_yaw_link mid-upper-arm): the difference becomes GMR's per-body position offset.
+CENTRE_OF = {"UpLeg": ("leg", "proximal"), "Leg": ("leg", "bend"), "FootMod": ("leg", "distal"),
+             "Arm": ("arm", "proximal"), "ForeArm": ("arm", "bend"), "Hand": ("arm", "distal")}
+
+# Segment-wise rescale of the human (derive_tpose_config): body -> the body its segment starts
+# from, parents first. The hips and shoulders hang from the pelvis: their place is the robot's
+# own (its offset from the root turned with the human pelvis / chest, the girdle), the limbs'
+# segments keep the human's direction at the robot's length.
+SEGMENT_PARENT = {
+    **{f"{S}{b}": f"{S}{p}" if p != "Hips" else "Hips" for S in ("Left", "Right")
+       for b, p in (("UpLeg", "Hips"), ("Leg", "UpLeg"), ("FootMod", "Leg"),
+                    ("Arm", "Hips"), ("ForeArm", "Arm"), ("Hand", "ForeArm"))},
+    "Spine2": "Hips",
 }
-JOINT_CENTERS = {"unitree_g1": _G1_JOINT_CENTERS, "unitree_g1_with_hands": _G1_JOINT_CENTERS}
+
+
+def rescale_frame(fr: dict, ratios: dict, girdle: dict | None = None) -> dict:
+    """One GMR human frame resized to the robot (SEGMENT_PARENT, parents first): a body in
+    ``girdle`` {body: (human body whose rotation carries it, offset in that body's frame)} goes
+    to the root + that offset turned with the body; any other moves to its parent's new
+    position + ratio x (its position - its parent's) (ratio 1 when it has none). Rotations
+    stay; the input is not changed. GMR then scales only the root's path."""
+    out = dict(fr)
+    new = {"Hips": np.asarray(fr["Hips"][0], dtype=np.float64)}
+    for b, parent in SEGMENT_PARENT.items():
+        if b not in fr or parent not in new:
+            continue
+        g = (girdle or {}).get(b)
+        if g is not None and g[0] in fr:
+            p = new["Hips"] + quat_to_matrix(np.asarray(fr[g[0]][1], dtype=np.float64)) @ np.asarray(g[1], dtype=np.float64)
+        else:
+            p = new[parent] + ratios.get(b, 1.0) * (np.asarray(fr[b][0], dtype=np.float64)
+                                                    - np.asarray(fr[parent][0], dtype=np.float64))
+        new[b] = p
+        out[b] = [p, fr[b][1]]
+    return out
+
+
+def profile(robot: str) -> robot_profile.RobotProfile:
+    """The robot (registry key or model path) with its parts."""
+    return robot_profile.load(robot)
+
+
+def limb_segments(prof: robot_profile.RobotProfile):
+    """(name, robot (from point, to point), human (from body, to body)) of each limb segment:
+    thigh, shank, upper arm, forearm per side; robot points are robot_profile.Point."""
+    out = []
+    p = prof.parts
+    for side in SIDES:
+        S = HUMAN_SIDE[side]
+        for kind, limb, (h0, h1, h2) in (("leg", p.legs[side], ("UpLeg", "Leg", "Foot")),
+                                         ("arm", p.arms[side], ("Arm", "ForeArm", "Hand"))):
+            c = limb.centres
+            out.append((f"{side} {kind} upper", (c["proximal"], c["bend"]), (f"{S}{h0}", f"{S}{h1}")))
+            out.append((f"{side} {kind} lower", (c["bend"], c["distal"]), (f"{S}{h1}", f"{S}{h2}")))
+    return out
 
 
 @contextlib.contextmanager
@@ -170,15 +188,19 @@ def _gmr():
 
 
 def unavailable(robot: str = "unitree_g1") -> str | None:
-    """Why retargeting cannot run here (mink / mujoco missing, no robot model), or None."""
+    """Why retargeting cannot run here (mink / mujoco missing, no robot model, a model whose
+    legs / arms cannot be found), or None."""
     import importlib.util
 
     missing = [m for m in ("mink", "mujoco", "scipy") if importlib.util.find_spec(m) is None]
     if missing:
         return f"retargeting needs {', '.join(missing)}"
-    xml = _gmr().ROBOT_XML_DICT.get(robot)
-    if xml is None or not os.path.isfile(xml):
-        return f"no robot model for {robot} ({xml}; scripts\\install_gmr.ps1 puts it next to the repository)"
+    try:
+        profile(robot).parts
+    except RobotError as e:
+        return str(e)
+    except Exception as e:  # a model MuJoCo cannot compile
+        return f"robot model {robot}: {type(e).__name__}: {e}"
     return None
 
 
@@ -190,9 +212,8 @@ def gmr_version() -> str:
 
 
 def robot_model(robot: str):
-    import mujoco as mj
-
-    return mj.MjModel.from_xml_path(str(_gmr().ROBOT_XML_DICT[robot]))
+    """The robot's kinematic MuJoCo model (shared: make your own MjData; copy it to change it)."""
+    return profile(robot).model()
 
 
 def robot_joint_names(model) -> list[str]:
@@ -555,15 +576,16 @@ def _angle(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _human_bend_axes(robot: str, clip: HumanClip) -> dict[str, tuple[np.ndarray | None, dict]]:
-    """Bend axis of each elbow / knee (TPOSE_TWISTS) in the reference pose, world coordinates.
+    """Bend axis of each elbow in the reference pose, world coordinates.
 
     For a hinge, upper x lower segment stays fixed in the upper segment's own frame, so the
     clip's bent frames (>= BEND_AXIS_MIN_DEG) give it: their axes in that frame, averaged
-    weighted by sin(bend), then carried into the reference pose. {twist joint: (axis, info)};
-    axis None when the clip hardly bends the limb or the axis wanders (no steady hinge)."""
+    weighted by sin(bend), then carried into the reference pose. {side: (axis, info)};
+    axis None when the clip hardly bends the limb or the axis wanders (no steady hinge).
+    (`robot` is unused: the human side does not depend on it.)"""
     ref = clip.info["_ref_pose"]
     out = {}
-    for twist, _, _, (a, b, c) in TPOSE_TWISTS.get(robot, []):
+    for twist, (a, b, c) in ((s, tuple(f"{HUMAN_SIDE[s]}{n}" for n in ("Arm", "ForeArm", "Hand"))) for s in SIDES):
         key = [n + "Mod" if n.endswith("Foot") else n for n in (a, b, c)]  # a leg's: clip frames carry <Side>FootMod
         P = np.array([[fr[k][0] for k in key] for fr in clip.frames], dtype=np.float64)
         Ra = quat_to_matrix(np.array([fr[a][1] for fr in clip.frames], dtype=np.float64))
@@ -587,86 +609,89 @@ def _human_bend_axes(robot: str, clip: HumanClip) -> dict[str, tuple[np.ndarray 
     return out
 
 
-def _robot_bend_axis(model, data, q: np.ndarray, bend_joint: int, bodies: tuple[int, int, int]) -> np.ndarray:
-    """The robot limb's bend axis (upper x lower segment) with the bend joint flexed 1 rad from
-    q: towards the farther end of its range (elbows and knees bend much further than they
-    overextend), so the axis has the human's sense."""
-    import mujoco as mj
-
-    adr = model.jnt_qposadr[bend_joint]
-    lo, hi = model.jnt_range[bend_joint] if model.jnt_limited[bend_joint] else (-np.pi, np.pi)
-    q0 = q[adr]
-    q[adr] = np.clip(q0 + (1.0 if hi - q0 >= q0 - lo else -1.0), lo, hi)
-    data.qpos[:] = q
-    mj.mj_kinematics(model, data)
-    x0, x1, x2 = (data.xpos[b].copy() for b in bodies)
-    q[adr] = q0
-    return np.cross(x1 - x0, x2 - x1)
+def _robot_bend_axis(data, limb) -> np.ndarray:
+    """The robot limb's bend axis in the human's sense (upper x lower segment while flexing):
+    the bend joint's world axis times its flex sign (robot_profile), whatever the joint angle."""
+    return limb.flex_sign * data.xaxis[limb.bend].copy()
 
 
-def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray, bend_axes: dict | None = None):
+def _jrange(model, j: int) -> tuple[float, float]:
+    return tuple(model.jnt_range[j]) if model.jnt_limited[j] else (-np.pi, np.pi)
+
+
+def _robot_tpose(model, prof, ref_pose: dict, face: np.ndarray, bend_axes: dict | None = None):
     """Robot qpos (root at origin, identity) whose limbs point like the human's and whose
-    elbows / knees bend about the human's axes (bend_axes: twist joint -> world axis)."""
+    elbows bend about the human's axes (bend_axes: side -> world axis)."""
     import mujoco as mj
 
+    parts = prof.parts
     data = mj.MjData(model)
     q = model.qpos0.copy()
     q[:3], q[3:7] = 0.0, [1.0, 0.0, 0.0, 0.0]
     chosen = {}
-    for joint, (rb0, rb1), (h0, h1) in TPOSE_CHAINS.get(robot, []):
-        j = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, joint)
-        b0 = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, rb0)
-        b1 = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, rb1)
-        target = face.T @ (ref_pose[h1][0] - ref_pose[h0][0])
-        lo, hi = model.jnt_range[j] if model.jnt_limited[j] else (-np.pi, np.pi)
-        best = (np.inf, 0.0)
-        for v in np.linspace(lo, hi, 721):
-            q[model.jnt_qposadr[j]] = v
-            data.qpos[:] = q
-            mj.mj_kinematics(model, data)
-            best = min(best, (_angle(data.xpos[b1] - data.xpos[b0], target), v))
-        q[model.jnt_qposadr[j]] = best[1]
-        chosen[joint] = {"rad": round(float(best[1]), 4), "residual_deg": round(float(np.degrees(best[0])), 1)}
 
-    # Twist each limb about itself so its bend axis matches the human's (the limb directions
-    # stay: the twist joint turns about the upper segment). Limbs the clip hardly bends keep 0.
+    def seg_target(h0, h1):
+        return face.T @ (ref_pose[h1][0] - ref_pose[h0][0])
+
+    limbs = []  # (limb, [(point 0, point 1, human 0, human 1)] upper and lower segment)
+    for side in SIDES:
+        S = HUMAN_SIDE[side]
+        for limb, names in ((parts.legs[side], ("UpLeg", "Leg", "Foot")), (parts.arms[side], ("Arm", "ForeArm", "Hand"))):
+            c = limb.centres
+            limbs.append((limb, [(c["proximal"], c["bend"], S + names[0], S + names[1]),
+                                 (c["bend"], c["distal"], S + names[1], S + names[2])]))
+    # one joint at a time, parents first: the abduction joint points the upper segment, the
+    # bend joint the lower one
+    for limb, segs in limbs:
+        for j, (p0, p1, h0, h1) in ((limb.abduction, segs[0]), (limb.bend, segs[1])):
+            if j is None:
+                continue
+            target = seg_target(h0, h1)
+            lo, hi = _jrange(model, j)
+            best = (np.inf, 0.0)
+            for v in np.linspace(lo, hi, 721):
+                q[model.jnt_qposadr[j]] = v
+                data.qpos[:] = q
+                mj.mj_kinematics(model, data)
+                best = min(best, (_angle(p1.world(data) - p0.world(data), target), v))
+            q[model.jnt_qposadr[j]] = best[1]
+            chosen[prof.joint(j)] = {"rad": round(float(best[1]), 4), "residual_deg": round(float(np.degrees(best[0])), 1)}
+
+    # Twist each arm about itself so its bend axis matches the human's (the limb directions
+    # stay: the twist joint turns about the upper segment). Arms the clip hardly bends keep 0.
     twists = []
-    for twist, bend, rbodies, _ in TPOSE_TWISTS.get(robot, []):
-        axis = (bend_axes or {}).get(twist)
-        if axis is None:
+    for side in SIDES:
+        limb = parts.arms[side]
+        axis = (bend_axes or {}).get(side)
+        if axis is None or limb.twist_joint is None:
             continue
-        jt = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, twist)
-        jb = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, bend)
-        bodies = tuple(mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, n) for n in rbodies)
+        jt = limb.twist_joint
         target = face.T @ axis
-        lo, hi = model.jnt_range[jt] if model.jnt_limited[jt] else (-np.pi, np.pi)
+        lo, hi = _jrange(model, jt)
         best = (np.inf, 0.0)
         for v in np.linspace(lo, hi, 721):
             q[model.jnt_qposadr[jt]] = v
-            best = min(best, (_angle(_robot_bend_axis(model, data, q, jb, bodies), target), v))
+            data.qpos[:] = q
+            mj.mj_kinematics(model, data)
+            best = min(best, (_angle(_robot_bend_axis(data, limb), target), v))
         q[model.jnt_qposadr[jt]] = best[1]
-        chosen[twist] = {"rad": round(float(best[1]), 4)}
-        twists.append((twist, jb, bodies, target))
+        chosen[prof.joint(jt)] = {"rad": round(float(best[1]), 4)}
+        twists.append((limb, target))
 
-    # Refine each limb with all its joints at once: one axis per joint cannot follow a
+    # Refine each limb with all its swing joints at once: one axis per joint cannot follow a
     # limb that also points forward (SMPL-X zero pose: arms forward and down, knees
     # slightly bent). A small pull towards the 1-D solution keeps the free twist at 0,
     # unless the limb's bend axis is known: then its twist joint joins in and the axis is
     # matched too (on its own the twist cannot reach an axis tilted off the robot's limb).
     from scipy.optimize import minimize
 
-    def body(name):
-        return mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
-
     refined = {}
-    for joints, segments in TPOSE_LIMBS.get(robot, []):
-        hinge = next(((t, jb, bodies, target) for t, jb, bodies, target in twists
-                      if mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, jb) in joints), None)
-        names = list(joints) + ([hinge[0]] if hinge else [])
-        ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in names]
+    for limb, segs in limbs:
+        hinge = next((t for t in twists if t[0] is limb), None)
+        ids = [j for j in limb.proximal if not limb.twist[j]] + [limb.bend] + ([limb.twist_joint] if hinge else [])
         adr = [model.jnt_qposadr[j] for j in ids]
-        bounds = [tuple(model.jnt_range[j]) if model.jnt_limited[j] else (-np.pi, np.pi) for j in ids]
-        segs = [(body(r0), body(r1), face.T @ (ref_pose[h1][0] - ref_pose[h0][0])) for (r0, r1), (h0, h1) in segments]
+        bounds = [_jrange(model, j) for j in ids]
+        targets = [(p0, p1, seg_target(h0, h1)) for p0, p1, h0, h1 in segs]
         x0 = q[adr].copy()
 
         def cost(x):
@@ -674,67 +699,65 @@ def _robot_tpose(model, robot: str, ref_pose: dict, face: np.ndarray, bend_axes:
             data.qpos[:] = q
             mj.mj_kinematics(model, data)
             c = 0.0
-            for b0, b1, target in segs:
-                v = data.xpos[b1] - data.xpos[b0]
+            for p0, p1, target in targets:
+                v = p1.world(data) - p0.world(data)
                 c += 1.0 - np.dot(v, target) / max(np.linalg.norm(v) * np.linalg.norm(target), 1e-12)
             if hinge:
-                n = _robot_bend_axis(model, data, q, hinge[1], hinge[2])
-                c += 1.0 - np.dot(n, hinge[3]) / max(np.linalg.norm(n) * np.linalg.norm(hinge[3]), 1e-12)
+                n = _robot_bend_axis(data, limb)
+                c += 1.0 - np.dot(n, hinge[1]) / max(np.linalg.norm(n) * np.linalg.norm(hinge[1]), 1e-12)
             return c + 0.02 * float(np.sum((x - x0) ** 2))
 
         res = minimize(cost, x0, method="L-BFGS-B", bounds=bounds)
         q[adr] = res.x
         cost(res.x)
-        data.qpos[:] = q  # the bend-axis term left data at the flexed pose
-        mj.mj_kinematics(model, data)
-        for (r0, r1), (h0, h1) in segments:
-            target = face.T @ (ref_pose[h1][0] - ref_pose[h0][0])
-            refined[f"{r0}->{r1}"] = round(float(np.degrees(_angle(data.xpos[body(r1)] - data.xpos[body(r0)], target))), 1)
-        for n, v in zip(names, res.x):
-            chosen[n] = {"rad": round(float(v), 4)}
+        for (p0, p1, h0, h1), (_, _, target) in zip(segs, targets):
+            refined[f"{h0}->{h1}"] = round(float(np.degrees(_angle(p1.world(data) - p0.world(data), target))), 1)
+        for j, v in zip(ids, res.x):
+            chosen[prof.joint(j)] = {"rad": round(float(v), 4)}
 
     # The reference skeletons stand flat-footed (cgspeed T-pose frame, SMPL-X zero pose),
     # so level the robot's feet with the ankles; otherwise the foot would copy the
     # shin's tilt into every frame's foot target.
-    for joints, foot in TPOSE_FEET.get(robot, []):
-        ids = [mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in joints]
+    for side in SIDES:
+        leg = parts.legs[side]
+        ids = list(leg.distal)
+        if not ids:
+            continue
         adr = [model.jnt_qposadr[j] for j in ids]
-        bounds = [tuple(model.jnt_range[j]) if model.jnt_limited[j] else (-np.pi, np.pi) for j in ids]
-        fb = body(foot)
+        bounds = [_jrange(model, j) for j in ids]
+        fb, up = leg.end_body, parts.foot_up[side]
 
         def tilt(x):
             q[adr] = x
             data.qpos[:] = q
             mj.mj_kinematics(model, data)
-            return 1.0 - float(data.xmat[fb].reshape(3, 3)[2, 2])
+            return 1.0 - float((data.xmat[fb].reshape(3, 3) @ up)[2])
 
         res = minimize(tilt, q[adr].copy(), method="L-BFGS-B", bounds=bounds)
         q[adr] = res.x
-        refined[f"{foot} tilt"] = round(float(np.degrees(np.arccos(np.clip(1.0 - tilt(res.x), -1, 1)))), 1)
-        for n, v in zip(joints, res.x):
-            chosen[n] = {"rad": round(float(v), 4)}
-    for twist, jb, bodies, target in twists:  # after the refinement moved the limbs a little
-        refined[f"{twist} bend axis"] = round(float(np.degrees(_angle(_robot_bend_axis(model, data, q, jb, bodies), target))), 1)
-    if refined:
-        chosen["segment_residual_deg"] = refined
+        refined[f"{side} foot tilt"] = round(float(np.degrees(np.arccos(np.clip(1.0 - tilt(res.x), -1, 1)))), 1)
+        for j, v in zip(ids, res.x):
+            chosen[prof.joint(j)] = {"rad": round(float(v), 4)}
     data.qpos[:] = q
     mj.mj_kinematics(model, data)
+    for limb, target in twists:  # after the refinement moved the limbs a little
+        refined[f"{limb.side} elbow bend axis"] = round(float(np.degrees(_angle(_robot_bend_axis(data, limb), target))), 1)
+    if refined:
+        chosen["segment_residual_deg"] = refined
     return data, chosen
 
 
-def _sole_height(model, data, body: str) -> float:
-    """Height of the body origin above its lowest collision geometry (ankle above sole)."""
-    import mujoco as mj
+def _ankle_height(model, data, prof) -> float:
+    """Height of the ankle centres above the lowest sole geometry, both feet (the posed robot)."""
+    from .robot_profile import _geom_low
 
-    b = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body)
-    lows = []
-    for g in range(model.ngeom):
-        if model.geom_bodyid[g] != b or (model.geom_contype[g] == 0 and model.geom_conaffinity[g] == 0):
-            continue
-        c, h = model.geom_aabb[g, :3], model.geom_aabb[g, 3:]
-        corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * h + c
-        lows.append(float((corners @ data.geom_xmat[g].reshape(3, 3).T + data.geom_xpos[g])[:, 2].min()))
-    return float(data.xpos[b][2] - min(lows)) if lows else 0.0
+    parts = prof.parts
+    h = []
+    for side in SIDES:
+        geoms = parts.sole_geoms[side]
+        if geoms:
+            h.append(float(parts.legs[side].centres["distal"].world(data)[2]) - min(_geom_low(model, data, g) for g in geoms))
+    return float(np.mean(h)) if h else 0.0
 
 
 # Human feet standing flat (_canonical_feet): ankle slower than this, the foot's up direction
@@ -857,31 +880,36 @@ def _canonical_feet(clip: HumanClip, robot_up: dict | None = None) -> tuple[dict
 
 
 def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]:
-    """GMR IK config for a T-pose BVH clip: (config, ground offset, info).
+    """GMR IK config for a clip with a T-pose reference (BVH, FBX, SMPL-X): (config, ground
+    offset, info).
 
-    Starts from GMR's LAFAN1 config of the robot (task list + weights) and replaces
+    The task list is GMR's LAFAN1 one (bodies and weights of its G1 config) on the robot's own
+    parts (robot_profile.RobotProfile.task_tables), and
     - rotation offsets: human frame at the reference T-pose -> robot body frame in
-      the robot posed the same way (limb directions matched joint by joint, each limb
-      twisted so its elbow / knee bends about the human's axis, from the clip's bends);
+      the robot posed the same way (limb directions matched joint by joint, each arm
+      twisted so its elbow bends about the human's axis, from the clip's bends);
       the feet are levelled as the human feet stand flat in the clip (_canonical_feet),
       not as they happen to be in the reference pose;
-    - scale table: robot / human root-to-ankle distance for the legs and root,
-      root-to-wrist distance for the torso and arms, in those poses;
+    - position offsets: the human joint goes to the robot's joint centre (where its joint
+      axes meet), not to the IK body's origin;
+    - sizes: each limb segment of the human keeps its direction at the robot's length, the hips
+      and shoulders go to the robot's place (``retlens_segment_ratios`` / ``retlens_girdle``,
+      applied by run_gmr through rescale_frame); GMR's scale table scales only the root's path,
+      by the robot / human root-to-ankle distance;
     - ground: a constant shift so the scaled feet stand at the robot's ankle
       height in the lowest 5 % of frames.
     """
-    gmr = _gmr()
-    try:
-        base_path = gmr.IK_CONFIG_DICT["bvh_lafan1"][robot]
-    except KeyError:
-        raise ValueError(f"GMR has no LAFAN1 task list for {robot!r}; T-pose BVH needs one") from None
-    with open(base_path, encoding="utf-8") as f:
-        cfg = json.load(f)
-    model = robot_model(robot)
+    prof = profile(robot)
+    parts = prof.parts
+    t1, t2 = prof.task_tables()
+    cfg = {"robot_root_name": prof.body(parts.root), "human_root_name": "Hips", "ground_height": 0.0,
+           "human_height_assumption": 1.8, "use_ik_match_table1": True, "use_ik_match_table2": True,
+           "human_scale_table": {}, "ik_match_table1": t1, "ik_match_table2": t2}
+    model = prof.model()
     ref = clip.info["_ref_pose"]
     face = _facing_frame(ref)
     bend_axes = _human_bend_axes(robot, clip)
-    data, chosen = _robot_tpose(model, robot, ref, face, {k: a for k, (a, _) in bend_axes.items() if a is not None})
+    data, chosen = _robot_tpose(model, prof, ref, face, {k: a for k, (a, _) in bend_axes.items() if a is not None})
 
     import mujoco as mj
 
@@ -889,11 +917,11 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
         b = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
         return data.xpos[b].copy(), data.xmat[b].reshape(3, 3).copy()
 
-    robot_of = {e[0]: frame for frame, e in cfg["ik_match_table1"].items()}  # human body -> robot body
+    robot_of = {e[0]: frame for frame, e in t1.items()}  # human body -> robot body
     # the reference feet as the clip's feet stand, onto the robot T-pose feet (_robot_tpose and the
     # bend axes read no foot rotation, so only the foot offsets below change)
-    feet, foot_report = _canonical_feet(clip, {s: face @ body_pose(robot_of[f"{s}FootMod"])[1][:, 2]
-                                               for s in ("Left", "Right")})
+    feet, foot_report = _canonical_feet(clip, {
+        HUMAN_SIDE[s]: face @ (data.xmat[parts.legs[s].end_body].reshape(3, 3) @ parts.foot_up[s]) for s in SIDES})
     ref = {**ref, **{b: (ref[b][0], R) for b, R in feet.items()}}
     root_r = body_pose(cfg["robot_root_name"])[0]
     root_h = ref["Hips"][0]
@@ -901,49 +929,68 @@ def derive_tpose_config(robot: str, clip: HumanClip) -> tuple[dict, float, dict]
     def ref_human(b):
         return ref[b.replace("FootMod", "Foot")]
 
+    def centre(hb):  # the robot joint centre at the human body hb, or None
+        part = hb[4:] if hb.startswith("Left") else hb[5:]
+        if part not in CENTRE_OF:
+            return None
+        kind, which = CENTRE_OF[part]
+        side = "left" if hb.startswith("Left") else "right"
+        return (parts.legs if kind == "leg" else parts.arms)[side].centres[which].world(data)
+
     offsets, pos_offsets = {}, {}
-    centers = JOINT_CENTERS.get(robot, {})
-    for hb in TPOSE_BODIES:
-        if hb not in robot_of:
-            raise ValueError(f"{base_path}: no robot body for human body {hb}")
-        pr, Rr = body_pose(robot_of[hb])
+    for hb, rb in robot_of.items():
+        pr, Rr = body_pose(rb)
         offsets[hb] = matrix_to_quat(ref_human(hb)[1].T @ face @ Rr)
         # GMR adds R_target @ offset to the human joint position: body origin relative to the joint centre
-        pos_offsets[hb] = Rr.T @ (pr - body_pose(centers[hb])[0]) if hb in centers else np.zeros(3)
+        c = centre(hb)
+        pos_offsets[hb] = Rr.T @ (pr - c) if c is not None else np.zeros(3)
 
-    # One scale per region, like GMR's own tables: robot body origins are not at
-    # the human joints (G1 hip_yaw_link sits mid-thigh), so per-body ratios would
-    # distort the pose. Legs: root-to-ankle ratio; arms: root-to-wrist ratio.
-    def region_scale(end: str) -> float:
-        r = [np.linalg.norm(body_pose(robot_of[f"{s}{end}"])[0] - root_r)
-             / max(np.linalg.norm(ref_human(f"{s}{end}")[0] - root_h), 1e-6) for s in ("Left", "Right")]
-        return float(np.clip(np.mean(r), 0.3, 1.5))
+    # Sizes: each segment of the human (pelvis -> hip, thigh, shank; pelvis -> shoulder, upper
+    # arm, forearm) is stretched to the robot's between its joint centres (segment_ratios,
+    # applied to every frame before GMR, which then scales nothing but the root's path: by the
+    # root-to-ankle ratio, so steps are as long as the legs). One scale per region (GMR's own
+    # tables) put the arms' targets out of reach on a robot whose trunk is long for its arms
+    # (hands 26 cm off, arms stretched straight) and its feet under the hips of a robot wider at
+    # the hips than the scaled human (legs pressed against the hip roll limit, feet sunk).
+    ratios, girdle = {}, {}
+    for hb, parent in SEGMENT_PARENT.items():
+        if hb not in robot_of or parent not in robot_of or hb == "Spine2":
+            continue
+        if parent == "Hips":  # hip / shoulder: the robot's place, carried by the pelvis / chest
+            carrier = "Spine2" if hb[4 if hb.startswith("Left") else 5:] == "Arm" and "Spine2" in robot_of else "Hips"
+            girdle[hb] = (carrier, ref_human(carrier)[1].T @ face @ (centre(hb) - root_r))
+            continue
+        lh = np.linalg.norm(ref_human(hb)[0] - ref_human(parent)[0])
+        lr = np.linalg.norm(centre(hb) - centre(parent))
+        ratios[hb] = float(np.clip(lr / max(lh, 1e-6), 0.2, 5.0))
+    s_root = float(np.clip(np.mean([np.linalg.norm(centre(f"{S}FootMod") - root_r)
+                                    / max(np.linalg.norm(ref_human(f"{S}FootMod")[0] - root_h), 1e-6)
+                                    for S in ("Left", "Right")]), 0.3, 1.5))
+    scales = {hb: (s_root if hb == "Hips" else 1.0) for hb in robot_of}
 
-    s_leg, s_arm = region_scale("FootMod"), region_scale("Hand")
-    lower = {"Hips", "LeftUpLeg", "RightUpLeg", "LeftLeg", "RightLeg", "LeftFootMod", "RightFootMod"}
-    scales = {hb: s_leg if hb in lower else s_arm for hb in TPOSE_BODIES}
-
-    for table in ("ik_match_table1", "ik_match_table2"):
-        for frame, e in cfg[table].items():
+    for table in (t1, t2):
+        for frame, e in table.items():
             e[3] = [round(float(v), 4) for v in pos_offsets[e[0]]]
             e[4] = [round(float(v), 6) for v in offsets[e[0]]]
-    cfg["human_root_name"] = "Hips"
-    cfg["ground_height"] = 0.0
     cfg["human_scale_table"] = {k: round(v, 4) for k, v in scales.items()}
+    cfg["retlens_segment_ratios"] = {k: round(v, 4) for k, v in ratios.items()}
+    cfg["retlens_girdle"] = {k: [c, [round(float(v), 5) for v in off]] for k, (c, off) in girdle.items()}
 
-    # ground: GMR scales positions about the root -> scaled foot height per frame
-    hips_z, feet = clip.info["_hips_z"], clip.info["_feet"]
-    s_root, s_feet = scales["Hips"], np.array([scales["LeftFootMod"], scales["RightFootMod"]])
-    foot_z = s_root * hips_z[:, None] + s_feet[None] * (feet[..., 2] - hips_z[:, None])
+    # ground: the feet as GMR will get them (rescaled, root path scaled) -> foot height per frame
+    hips_z = clip.info["_hips_z"]
+    foot_z = np.array([[rescale_frame(fr, ratios, girdle)[f"{S}FootMod"][0][2] for S in ("Left", "Right")]
+                       for fr in clip.frames]) - hips_z[:, None] + s_root * hips_z[:, None]
     stance = float(np.percentile(foot_z.min(axis=1), 5))
-    ankle_h = _sole_height(model, data, robot_of["LeftFootMod"])
+    ankle_h = _ankle_height(model, data, prof)
     ground = stance - ankle_h
     info = {
-        "base_config": os.path.basename(str(base_path)),
+        "robot_parts": {"tasks": prof.task_bodies(), "waist_pitch": parts.waist_pitch,
+                        "elbow_flex_sign": {s: int(parts.arms[s].flex_sign) for s in SIDES}},
         "robot_tpose": chosen,
-        "bend_axes": {k: info for k, (_, info) in bend_axes.items()},  # human elbow / knee axes from the clip
+        "bend_axes": {k: info for k, (_, info) in bend_axes.items()},  # human elbow axes from the clip, per side
         "foot_reference": foot_report,  # foot levelling from the clip's stance (_canonical_feet)
         "scales": cfg["human_scale_table"],
+        "segment_ratios": cfg["retlens_segment_ratios"],
         "ground_offset_m": round(ground, 4),
         "robot_ankle_height_m": round(ankle_h, 4),
     }
@@ -956,28 +1003,27 @@ def run_gmr(clip: HumanClip, robot: str, src_human: str, config: dict | None = N
             log=print) -> tuple[np.ndarray, dict]:
     """Retarget every frame. Returns qpos (T, 7 + D) and the position targets of the
     bodies GMR tracks by position ({"bodies": [(human, robot body)], "targets": (T, B, 3)}),
-    for :func:`position_residuals`."""
+    for :func:`position_residuals`. ``config`` None: GMR's own config of the format (G1 only)."""
     gmr = _gmr()
-    tmp = None
-    if config is not None:  # GMR reads its config from IK_CONFIG_DICT[src][robot]
-        fd, tmp = tempfile.mkstemp(suffix=".json", prefix="gmr_cfg_")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(config, f)
-        gmr.IK_CONFIG_DICT.setdefault(src_human, {})[robot] = tmp
-    try:
-        with _quiet():
-            ret = gmr.GeneralMotionRetargeting(
-                src_human=src_human, tgt_robot=robot,
-                actual_human_height=None if config is not None else clip.height_m,
-                verbose=False, use_velocity_limit=velocity_limit)
-    finally:
-        if tmp:
-            os.remove(tmp)
-            del gmr.IK_CONFIG_DICT[src_human][robot]
+    prof = profile(robot)
+    if config is None:
+        if not prof.builtin:
+            raise ValueError(f"GMR's {src_human} config exists only for the Unitree G1; {prof.name} retargets "
+                             "BVH / FBX / SMPL-X through its derived config (formats tpose / fbx / smplx)")
+        with open(gmr.IK_CONFIG_DICT[src_human][prof.key], encoding="utf-8") as f:
+            config, height = json.load(f), clip.height_m
+    else:
+        height = None
+    with _quiet():
+        ret = gmr.GeneralMotionRetargeting(
+            src_human=src_human, tgt_robot=prof.key, actual_human_height=height, verbose=False,
+            use_velocity_limit=velocity_limit, model=prof.model(), ik_config=config)
     ret.set_ground_offset(ground_offset)
     bodies = [(h, frame) for frame, (h, pw, *_rest) in ret.ik_match_table2.items() if pw > 0]
+    ratios, girdle = config.get("retlens_segment_ratios") or {}, config.get("retlens_girdle") or {}
 
     def copy_frame(fr):
+        fr = rescale_frame(fr, ratios, girdle) if ratios or girdle else fr
         return {k: [np.array(v[0], dtype=np.float64), np.array(v[1], dtype=np.float64)] for k, v in fr.items()}
 
     # Start from the first frame's root target: differential IK cannot swing the
@@ -1071,39 +1117,37 @@ def smooth_motion(m: RobotMotion, cutoff_hz: float, order: int = 4, limits=None)
     )
 
 
-# Legs for the foot post-processing (ensure_swing_clearance, flatten_stance_feet):
-# (foot body, leg joints hip -> ankle, the last two being ankle pitch and roll).
-_G1_LEGS = [(f"{s}_ankle_roll_link",
-             [f"{s}_{j}_joint" for j in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")])
-            for s in ("left", "right")]
-SWING_LEGS = {"unitree_g1": _G1_LEGS, "unitree_g1_with_hands": _G1_LEGS}
-
-
 class _FeetFK:
-    """GMR's robot model posed at the frames of a motion, for the foot post-processing.
-    ``feet``: (body id, sole contact geoms, leg joints) per leg of SWING_LEGS; empty when the
-    robot model or the motion lacks one of them."""
+    """The robot model posed at the frames of a motion, for the foot post-processing.
+    ``feet``: (body id, sole points, leg joints hip -> ankle) per leg (robot_profile: a sole
+    point is (geom, point in its frame, radius), robot_profile.sole_world gives its bottom);
+    empty when the motion lacks one of the leg joints."""
 
     def __init__(self, m: RobotMotion, robot: str):
         import mujoco as mj
 
         self.mj, self.m = mj, m
-        self.model = model = robot_model(robot)
+        prof = profile(robot)
+        self.model = model = prof.model()
         self.data = mj.MjData(model)
         self.names = robot_joint_names(model)
         self.col = {n: i for i, n in enumerate(m.joint_names)}
         self.jid = {n: mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n) for n in self.names}
         lo, hi = robot_joint_ranges(model)
         self.rng = {n: (lo[i], hi[i]) for i, n in enumerate(self.names)}
+        self.sides = list(SIDES)
         self.feet = []
-        for body, joints in SWING_LEGS.get(robot, []):
-            b = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, body)
-            soles = [g for g in range(model.ngeom) if model.geom_bodyid[g] == b
-                     and (model.geom_contype[g] or model.geom_conaffinity[g])]
-            if b < 0 or not soles or any(j not in self.col for j in joints):
+        parts = prof.parts
+        for side in SIDES:
+            leg = parts.legs[side]
+            soles = list(parts.sole_points[side])
+            joints = prof.leg_joints(side)
+            if not soles or any(j not in self.col for j in joints):
                 self.feet = []
                 break
-            self.feet.append((b, soles, joints))
+            self.feet.append((leg.end_body, soles, joints))
+        self.sole_local = [parts.sole_local[s] for s in SIDES] if self.feet else []
+        self.rolls = {prof.joint(parts.legs[s].distal_roll) for s in SIDES if parts.legs[s].distal_roll is not None}
         self.G = max((len(f[1]) for f in self.feet), default=0)
 
     def set_pose(self, dof_row: np.ndarray, t: int) -> None:
@@ -1116,8 +1160,8 @@ class _FeetFK:
         self.data.qpos[:] = q
 
     def poses(self, dof: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Bottom of every sole contact sphere (T, feet, G, 3; inf-padded) and foot body
-        rotations (T, feet, 3, 3) with the joints ``dof``."""
+        """Bottom of every sole point (T, feet, G, 3; inf-padded) and foot body rotations
+        (T, feet, 3, 3) with the joints ``dof``."""
         model, data = self.model, self.data
         T = self.m.num_frames
         P = np.full((T, len(self.feet), self.G, 3), np.inf)
@@ -1126,7 +1170,7 @@ class _FeetFK:
             self.set_pose(dof[t], t)
             self.mj.mj_kinematics(model, data)
             for k, (b, soles, _) in enumerate(self.feet):
-                P[t, k, :len(soles)] = [data.geom_xpos[g] - [0.0, 0.0, model.geom_size[g][0]] for g in soles]
+                P[t, k, :len(soles)] = sole_world(data, soles)
                 R[t, k] = data.xmat[b].reshape(3, 3)
         return P, R
 
@@ -1169,7 +1213,7 @@ def ensure_swing_clearance(m: RobotMotion, robot: str = "unitree_g1", clearance:
     from .analysis import floor_track, slowest_sole_speed
 
     T = m.num_frames
-    if not SWING_LEGS.get(robot) or clearance <= 0 or T < 4:
+    if clearance <= 0 or T < 4:
         return m, {}
     fk = _FeetFK(m, robot)
     if not fk.feet:
@@ -1208,10 +1252,11 @@ def ensure_swing_clearance(m: RobotMotion, robot: str = "unitree_g1", clearance:
                 mj.mj_comPos(model, data)
                 rows, errs, w = [], [], []
                 jacp, jacr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
-                for g in soles:
-                    z = data.geom_xpos[g][2] - model.geom_size[g][0]
+                for g, p, r in soles:
+                    c = data.geom_xpos[g] + data.geom_xmat[g].reshape(3, 3) @ p
+                    z = c[2] - r
                     if z < need[t, k] - 1e-4:
-                        mj.mj_jac(model, data, jacp, jacr, data.geom_xpos[g], body)
+                        mj.mj_jac(model, data, jacp, jacr, c, int(model.geom_bodyid[g]))
                         rows.append(jacp[2, dofs].copy())
                         errs.append(need[t, k] - z)
                         w.append(1.0)
@@ -1314,7 +1359,7 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
     from .qc import _sustained
 
     T = m.num_frames
-    if not SWING_LEGS.get(robot) or T < 4:
+    if T < 4:
         return m, {}
     fk = _FeetFK(m, robot)
     if not fk.feet or any(len(soles) < 3 for _, soles, _ in fk.feet):
@@ -1323,14 +1368,13 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
     F = len(feet)
     # sole plane in the foot body frame: normal pointing into the foot, forward axis heel -> toe
     axes = []
-    for _, soles, _ in feet:
-        c = model.geom_pos[soles]
+    for c in fk.sole_local:
         vt = np.linalg.svd(c - c.mean(0))[2]
         normal = vt[2] if vt[2] @ c.mean(0) < 0 else -vt[2]
         fwd = vt[0] if (c @ vt[0]).max() > -(c @ vt[0]).min() else -vt[0]
         axes.append((normal, fwd))
-    sole_pos = [model.geom_pos[soles].copy() for _, soles, _ in feet]
-    sole_rad = [model.geom_size[soles, 0].copy() for _, soles, _ in feet]
+    sole_pos = [c.copy() for c in fk.sole_local]
+    sole_rad = [np.array([r for _, _, r in soles]) for _, soles, _ in feet]
 
     def angles(R: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(T, feet) sole tilt from horizontal and pitch (+ toe up), degrees."""
@@ -1371,7 +1415,7 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
     margin = np.radians(1.5)
     sigma = np.concatenate([np.full(nJ, np.radians(joint_sigma_deg)), [root_sigma]])
     s_pos, s_rot, s_sole, s_yaw = 1e-3, np.radians(0.5), 2e-3, np.radians(1.0)  # task tolerances
-    rolls = [i for i, j in enumerate(leg_joints) if j.endswith("ankle_roll_joint")]
+    rolls = [i for i, j in enumerate(leg_joints) if j in fk.rolls]
     comfort, s_comfort = np.radians(roll_comfort_deg), np.radians(1.0)
     up = np.array([0.0, 0.0, 1.0])
 
@@ -1465,7 +1509,7 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
     change = np.degrees(np.abs(dof[:, cols] - m.dof_pos[:, cols]))
     lift = (low1 - low)[w > 0]
     both = stance.all(1)
-    sides = [mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, body).split("_")[0] for body, _, _ in feet]
+    sides = fk.sides
 
     def dist(x: np.ndarray) -> dict | None:
         return {"median": round(float(np.median(x)), 2), "p95": round(float(np.percentile(x, 95)), 2),
@@ -1501,30 +1545,46 @@ def flatten_stance_feet(m: RobotMotion, robot: str = "unitree_g1", still: float 
     return out, info
 
 
-# Self-collision repair (separate_self_collisions): bodies whose visual mesh collides there too.
-# The G1 model's hands collide with nothing and its feet only through four 5 mm sole spheres,
-# so a hand inside a thigh or feet through each other went unseen.
-SELF_MESHES = {robot: ("left_rubber_hand", "right_rubber_hand", "left_ankle_roll_link", "right_ankle_roll_link")
-               for robot in ("unitree_g1", "unitree_g1_with_hands")}
-SELF_HANDS = {robot: names[:2] for robot, names in SELF_MESHES.items()}
+# Self-collision repair (separate_self_collisions): the hands and feet whose collision geometry
+# is only soles or nothing collide through their visual meshes there too. The G1 model's hands
+# collide with nothing and its feet only through four 5 mm sole spheres, so a hand inside a
+# thigh or feet through each other went unseen.
+SELF_MESH_MAX_PRIMITIVES = 1  # a hand / foot with more non-sole collision geoms than this keeps its own
 # The trunk and a shoulder link: their hulls overlap up to ~2.3 cm in ordinary poses, so an
 # upper arm in the torso counts only deeper than this.
 SELF_SHOULDER_DEPTH = 0.025
 
 
+def _self_mesh_bodies(prof) -> list[int]:
+    """Hand and foot bodies (robot_profile) whose visual meshes stand in for missing collision
+    geometry in the self-collision repair."""
+    model, parts = prof.model(), prof.parts
+    soles = {g for s in SIDES for g in parts.sole_geoms[s]}
+    out = []
+    for b in [parts.arms[s].tip_body for s in SIDES] + [parts.legs[s].end_body for s in SIDES]:
+        own = [g for g in range(model.ngeom) if model.geom_bodyid[g] == b
+               and (model.geom_contype[g] or model.geom_conaffinity[g]) and g not in soles]
+        if len(own) <= SELF_MESH_MAX_PRIMITIVES:
+            out.append(b)
+    return out
+
+
 class _SelfCollisionModel:
-    """GMR's robot model where every robot collision geom collides with every other, the hand and
-    foot meshes (SELF_MESHES) included (MuJoCo collides their convex hulls), posed at the frames
-    of a motion."""
+    """The robot model where every robot collision geom collides with every other, the hand and
+    foot meshes (_self_mesh_bodies) included (MuJoCo collides their convex hulls), posed at the
+    frames of a motion."""
 
     def __init__(self, m: RobotMotion, robot: str):
         import mujoco as mj
 
         self.mj = mj
+        prof = profile(robot)
+        self.parts = prof.parts
         # compiled with those meshes colliding: MuJoCo builds the convex hull of a mesh only
         # for geoms that collide when the model is compiled
-        spec = mj.MjSpec.from_file(str(_gmr().ROBOT_XML_DICT[robot]))
-        for name in SELF_MESHES.get(robot, ()):
+        spec = prof.spec()
+        names = {prof.body(b) for b in _self_mesh_bodies(prof)}
+        for name in names:
             body = spec.body(name)
             for g in body.geoms if body is not None else ():
                 if g.type == mj.mjtGeom.mjGEOM_MESH:
@@ -1583,17 +1643,22 @@ class _SelfCollisionModel:
                 top, low = (b1, b2) if b1 in self.ancestors[b2] else (b2, b1)
                 if self.part(top) != "trunk":
                     continue
-                if not any(k in self.body[low] for k in ("elbow", "wrist", "hand", "knee", "ankle")) and (
-                        "shoulder" not in self.body[low] or c.dist > -max(depth, SELF_SHOULDER_DEPTH)):
+                reg = self.parts.region.get(low)
+                if reg is None:  # trunk against trunk (waist, neck, head)
                     continue
+                if reg[2] == "upper" and (reg[1] == "leg" or c.dist > -max(depth, SELF_SHOULDER_DEPTH)):
+                    continue  # a hip link always, a shoulder / upper arm link unless deep
             out.append((b1, b2, c.pos.copy(), c.frame[:3].copy(), float(c.dist)))
         return out
 
     def part(self, b: int) -> str:
-        n = self.body[b]
-        if any(k in n for k in ("shoulder", "elbow", "wrist", "hand")):
-            return "arm"
-        return "leg" if any(k in n for k in ("hip", "knee", "ankle")) else "trunk"
+        """"arm" / "leg" / "trunk" (robot_profile: the limb subtrees)."""
+        reg = self.parts.region.get(b)
+        return reg[1] if reg else "trunk"
+
+    def side(self, b: int) -> str | None:
+        reg = self.parts.region.get(b)
+        return reg[0] if reg else None
 
 
 def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: float = 0.015,
@@ -1640,8 +1705,18 @@ def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: 
     t0 = time.perf_counter()
     S = _SelfCollisionModel(m, robot)
     mj = S.mj
-    legs = [joints for _, joints in SWING_LEGS.get(robot, [])]
-    sides = [joints[0].split("_")[0] for joints in legs]
+    prof = profile(robot)
+    parts = prof.parts
+    legs = [prof.leg_joints(s) for s in SIDES]
+    sides = list(SIDES)
+    # joints the repair may move: an arm's shoulder and elbow joints (not the wrists); between
+    # two legs, a free leg's hip abduction and twist, and the ankle roll for foot against foot
+    arm_joints = {prof.joint(j) for s in SIDES for j in [*parts.arms[s].proximal, parts.arms[s].bend]}
+    leg_free = {s: {prof.joint(j) for j in (parts.legs[s].abduction, parts.legs[s].twist_joint) if j is not None}
+                for s in SIDES}
+    leg_roll = {s: prof.joint(parts.legs[s].distal_roll) for s in SIDES if parts.legs[s].distal_roll is not None}
+    foot_bodies = {parts.legs[s].end_body for s in SIDES}
+    leg_names = {n for js in legs for n in js}
     standing = np.zeros((T, len(legs)), dtype=bool)
     fk = _FeetFK(m, robot)
     if fk.feet:
@@ -1654,8 +1729,7 @@ def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: 
     leg_w = np.stack([np.clip(distance_transform_edt(~standing[:, k]) / nfade, 0, 1) if standing[:, k].any()
                       else np.ones(T) for k in range(len(legs))], 1)
     leg_cols = [[S.col[j] for j in joints if j in S.col] for joints in legs]
-    cap = np.array([np.radians(leg_cap_deg if any(k in n for k in ("hip", "knee", "ankle")) else arm_cap_deg)
-                    for n in m.joint_names])
+    cap = np.array([np.radians(leg_cap_deg if n in leg_names else arm_cap_deg) for n in m.joint_names])
     lo = np.array([S.rng.get(n, (-np.inf, np.inf))[0] for n in m.joint_names])
     hi = np.array([S.rng.get(n, (-np.inf, np.inf))[1] for n in m.joint_names])
     q0, dof = m.dof_pos, m.dof_pos.copy()
@@ -1663,16 +1737,22 @@ def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: 
     spread = int(round(spread_s * m.fps))
     deep = -target - 5e-4  # deeper than the target (by more than the solver's 0.5 mm landing)
 
+    def foot(b: int) -> bool:  # the foot body or a body fixed below it
+        while b > 0 and b not in foot_bodies and not S.model.body_jntnum[b]:
+            b = int(S.model.body_parentid[b])
+        return b in foot_bodies
+
     def allowed(b1: int, b2: int, free: list[str]) -> list[str]:
-        both, out = S.body[b1] + S.body[b2], []
+        out = []
         for j in S.chain[b1] ^ S.chain[b2]:  # the joints that move one body against the other
             if j not in S.col:
                 continue
-            if any(k in j for k in ("shoulder", "elbow")):
+            if j in arm_joints:
                 out.append(j)
-            elif S.part(b1) == S.part(b2) == "leg" and j.split("_")[0] in free and (
-                    "hip_roll" in j or "hip_yaw" in j or ("ankle_roll" in j and both.count("ankle") == 2)):
-                out.append(j)
+            elif S.part(b1) == S.part(b2) == "leg":
+                s = next((x for x in free if j in leg_free[x] or j == leg_roll.get(x)), None)
+                if s is not None and (j in leg_free[s] or (foot(b1) and foot(b2))):
+                    out.append(j)
         return out
 
     def deepest(d: np.ndarray) -> np.ndarray:
@@ -1688,7 +1768,7 @@ def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: 
             fk.set_pose(d[t], t)
             mj.mj_kinematics(fk.model, fk.data)
             for k, (_, soles, _) in enumerate(fk.feet):
-                out[i, k] = min(fk.data.geom_xpos[g][2] - fk.model.geom_size[g][0] for g in soles)
+                out[i, k] = sole_world(fk.data, soles)[:, 2].min()
         return out
 
     worst = before = deepest(dof)
@@ -1810,7 +1890,14 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
     until 2026-10-28: the vendored GMR passed its limits to mink in the wrong argument.
     """
     log = log or (lambda *_: None)
+    prof = profile(robot)
+    notes = []
     fmt = detect_format(path) if fmt == "auto" else fmt
+    if fmt in FIXED_CONFIG_FORMATS and not prof.builtin:
+        # their skeletons have no T-pose to derive a config from (LAFAN1's rest pose has every bone
+        # along one axis), and GMR's tuned configs are the G1's
+        raise ValueError(f"{fmt} input retargets only to the Unitree G1 (GMR's tuned config; its reference pose "
+                         f"is not a T-pose); for {prof.name} use a BVH / FBX with a T-pose, or AMASS SMPL-X")
     config, ground, cfg_info = None, 0.0, {}
     if fmt in ("tpose", "fbx", "smplx"):
         if fmt == "tpose":
@@ -1829,13 +1916,13 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
         src_human = "smplx"
     else:
         raise ValueError(f"unknown format {fmt!r}")
-    log(f"{os.path.basename(path)}: {fmt}, {len(clip.frames)} frames @ {clip.fps:g} fps -> {robot}")
+    log(f"{os.path.basename(path)}: {fmt}, {len(clip.frames)} frames @ {clip.fps:g} fps -> {prof.name}")
     t0 = time.perf_counter()
     qpos, track = run_gmr(clip, robot, src_human, config, ground, velocity_limit, log=log)
     elapsed = time.perf_counter() - t0
 
     name = os.path.splitext(os.path.basename(path))[0]
-    model = robot_model(robot)
+    model = prof.model()
     joints = robot_joint_names(model)
     motion = qpos_to_motion(qpos, joints, clip.fps, name, os.path.abspath(path))
     resid = position_residuals(model, qpos, track)
@@ -1868,7 +1955,8 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
     info = {
         "source": os.path.abspath(path),
         "source_format": fmt,
-        "robot": robot,
+        "robot": prof.key if prof.builtin else prof.name,
+        "robot_ident": prof.ident,
         "retargeter": gmr_version(),
         "fps": clip.fps,
         "frames": len(qpos),
@@ -1883,6 +1971,8 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
         "ik_seconds": round(elapsed, 1),
         "root_quat": "wxyz",
     }
+    if notes:
+        info["notes"] = notes
     if config is not None:
         info["ik_config"] = config
     motion.meta = {"format": "retarget", **info}

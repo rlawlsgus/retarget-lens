@@ -12,9 +12,12 @@ MuJoCo at 1 kHz is quick (CMU 143_11, 10.9 s: about 2 s open loop, 4 s with the 
 the Isaac runs nothing starts a process: one worker thread runs one clip at a time, and a cancel
 stops it within 0.5 s of simulated time.
 
+Another robot than the G1 (robot: a model path, retlens.robot_profile) runs "pd" and "harness" on its
+own model (policy_replay.RobotSim: the G1's gains scaled by mass); GMT stays the G1's.
+
 Results are keyed by the motion's arrays, the controller, configs/physics.yaml (PD gains, fall
-rules, diagnosis thresholds), the GMT files, the hold after the clip, CACHE_VERSION and
-policy_replay.RESULT_VERSION, and saved as tools/policy_replay.py saves them, so compare.load_item
+rules, diagnosis thresholds), the GMT files (or the robot's model digest), the hold after the clip,
+CACHE_VERSION and policy_replay.RESULT_VERSION, and saved as tools/policy_replay.py saves them, so compare.load_item
 opens both (kind "MuJoCo 재생 · ...", info["policy_replay"], with each fall's first cause in
 fall_diagnosis / first_fall_cause; a diagnosis that failed is logged and leaves fall_diagnosis_error).
 The policy runs in numpy (retlens/gmt_policy.py), so the installed program runs it too once GMT's
@@ -51,6 +54,12 @@ class Cancelled(Exception):
     pass
 
 
+def _is_g1(robot: str | None) -> bool:
+    from .robot_profile import is_builtin
+
+    return is_builtin(robot)
+
+
 def _complete(npz: str) -> bool:
     """A finished result: the json is written after the npz. One whose fall diagnosis failed is made again next time
     (it is shown meanwhile, with its fall rules and why)."""
@@ -63,12 +72,15 @@ def _complete(npz: str) -> bool:
         return False
 
 
-def problem(controller: str, gmt_root: str | None = None) -> str:
-    """'' when this controller can run here, else why not (menus show it, request() raises it)."""
+def problem(controller: str, gmt_root: str | None = None, robot: str | None = None) -> str:
+    """'' when this controller can run here, else why not (menus show it, request() raises it).
+    robot: another robot's model path (None / unitree_g1: the G1 on GMT's model)."""
     if controller not in pr.CONTROLLERS:
         return f"알 수 없는 제어기: {controller}"
     if importlib.util.find_spec("mujoco") is None:
         return "MuJoCo(mujoco 패키지)가 없습니다"
+    if not _is_g1(robot):  # the robot's own model: nothing to install
+        return "추적 정책(GMT)은 G1용으로 학습되어 이 로봇에는 쓸 수 없습니다" if controller == "gmt" else ""
     root = gmt_root or settings.gmt_dir()
     files = pr.gmt_paths(root)
     get = ("'파일 > 설치 도우미'에서 GMT를 받으세요(연구용 라이선스 동의 필요)" if paths.INSTALLED else
@@ -113,12 +125,14 @@ class PolicyJob:
 class PolicyRunner:
     def __init__(self, cache_dir: str, physics_config: str = PHYSICS_CONFIG, hold_s: float = HOLD_S,
                  gmt_root: str | None = None, log: Callable | None = None,
-                 simulate: Callable | None = None):
+                 simulate: Callable | None = None, robot: str | None = None):
         """gmt_root: the GMT folder (None: settings.gmt_dir() at each request). simulate(motion,
         controller, progress) -> policy_replay.Result runs one clip (tests pass a stand-in);
-        progress(k, n) raises Cancelled once the job is cancelled."""
+        progress(k, n) raises Cancelled once the job is cancelled. robot: another robot's model
+        (retlens.robot_profile; None = the G1)."""
         self.cache_dir, self.physics_config, self.hold_s = cache_dir, physics_config, float(hold_s)
         self.gmt_root = gmt_root
+        self.robot = None if _is_g1(robot) else robot
         self.log = log or (lambda *_: None)
         self._simulate = simulate or self._simulate_mujoco
         self.jobs: dict[str, PolicyJob] = {}
@@ -132,7 +146,7 @@ class PolicyRunner:
 
     # ------------------------------------------------------------ public
     def problem(self, controller: str) -> str:
-        return problem(controller, self.gmt_root)
+        return problem(controller, self.gmt_root, self.robot)
 
     def files(self) -> dict:
         return pr.gmt_paths(self.gmt_root)
@@ -146,8 +160,13 @@ class PolicyRunner:
         except OSError:
             config = ""
         h = hashlib.sha1()
-        ids = [_file_id(files["model"]) if os.path.isfile(files["model"]) else None,
-               _file_id(files["policy"]) if controller == "gmt" and os.path.isfile(files["policy"]) else None]
+        if self.robot is not None:  # the robot's own model, by its content
+            from .robot_profile import load
+
+            ids = ["robot", load(self.robot).digest]
+        else:
+            ids = [_file_id(files["model"]) if os.path.isfile(files["model"]) else None,
+                   _file_id(files["policy"]) if controller == "gmt" and os.path.isfile(files["policy"]) else None]
         h.update(json.dumps([CACHE_VERSION, pr.RESULT_VERSION, controller, list(motion.joint_names), float(motion.fps),
                              self.hold_s, ids]).encode())
         for a in (motion.root_pos, motion.root_quat, motion.dof_pos):
@@ -269,22 +288,37 @@ class PolicyRunner:
             self.log(f"MuJoCo fall diagnosis failed: {job.name} ({job.controller}): {why}")
         job.stage, job.progress = "결과 저장", 0.96
         files = self.files()
+        sim = self._sims.get(self._sim_key(job.controller))
+        model = sim.model_text() if isinstance(sim, pr.RobotSim) else MODEL_TEXT
         pr.save_result(res, job.out_npz, motion.joint_names, {
             **job.info, "controller_label": pr.LABELS[job.controller],
-            "model": MODEL_TEXT + (", robot self-collision off" if job.controller == "harness" else ""),
-            "gmt_files": {"model": files["model"], **({"policy": files["policy"]} if job.controller == "gmt" else {})},
+            "model": model + (", robot self-collision off" if job.controller == "harness" else ""),
+            **({} if self.robot is not None else {"gmt_files": {"model": files["model"], **(
+                {"policy": files["policy"]} if job.controller == "gmt" else {})}}),
             "physics_config": self.physics_config, "made_by": "RetLens 물리 모드 (retlens/policy_runner.py)"})
         job.result = job.out_npz
         self._finish(job, "done", "완료")
 
-    def _simulate_mujoco(self, motion: RobotMotion, controller: str, progress) -> pr.Result:
+    def _sim_key(self, controller: str) -> tuple:
+        if self.robot is not None:
+            from .robot_profile import load
+
+            return (controller, "robot", self.robot, load(self.robot).digest, self.physics_config)
         files = self.files()
-        k = (controller, files["model"], files["policy"] if controller == "gmt" else "", self.physics_config)
+        return (controller, files["model"], files["policy"] if controller == "gmt" else "", self.physics_config)
+
+    def _simulate_mujoco(self, motion: RobotMotion, controller: str, progress) -> pr.Result:
+        k = self._sim_key(controller)
         sim = self._sims.get(k)
         if sim is None:
-            sim = self._sims[k] = pr.G1Sim(files["model"], controller, policy_path=files["policy"],
-                                           physics_config=self.physics_config)
-        return pr.run(sim, pr.Reference.from_motion(motion), hold_s=self.hold_s, progress=progress)
+            if self.robot is not None:
+                sim = pr.RobotSim(self.robot, controller, physics_config=self.physics_config)
+            else:
+                files = self.files()
+                sim = pr.G1Sim(files["model"], controller, policy_path=files["policy"], physics_config=self.physics_config)
+            self._sims[k] = sim
+        ref = pr.Reference.from_motion(motion, joints=sim.joint_names if self.robot is not None else None)
+        return pr.run(sim, ref, hold_s=self.hold_s, progress=progress)
 
     def _finish(self, job: PolicyJob, state: str, message: str) -> None:
         with self._lock:

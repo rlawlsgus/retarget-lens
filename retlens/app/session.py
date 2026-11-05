@@ -428,7 +428,9 @@ def capture(scene: MotionScene, base_dir: str | None, carry=()) -> dict:
     pair = _pair(scene, items)
     if pair is not None:
         compare["a"], compare["b"] = pair
-    data = {"format": FORMAT, "version": VERSION, "app_version": __version__, "robot": scene.opts.robot,
+    prof = scene.robot_profile
+    data = {"format": FORMAT, "version": VERSION, "app_version": __version__,
+            "robot": prof.key if prof.builtin else prof.name, "robot_ident": prof.ident,
             "motions": [item_state(it, base_dir, solo.get(id(it), it.visible)) for it in items]
             + [rebase_entry(e, None, base_dir) for e in carry],
             "compare": compare, "view": asdict(scene.view), "time_s": float(scene.t),
@@ -520,7 +522,9 @@ def parse(raw, name: str = "") -> dict:
     motions = [_entry(m, notes) for m in (raw.get("motions") if isinstance(raw.get("motions"), list) else ())]
     n = len(motions)
     out = {"format": FORMAT, "version": version, "app_version": app_version, "saved_at": _str(raw.get("saved_at")),
-           "robot": _str(raw.get("robot")), "motions": motions, "selected": _index(raw.get("selected"), n),
+           "robot": _str(raw.get("robot")),
+           "robot_ident": raw.get("robot_ident") if isinstance(raw.get("robot_ident"), dict) else None,
+           "motions": motions, "selected": _index(raw.get("selected"), n),
            "compare": _compare_read(raw.get("compare"), n), "view": _view_read(raw.get("view")),
            "time_s": _float(raw.get("time_s"), 0.0), "camera": _camera_read(raw.get("camera")),
            "physics": _physics_read(raw.get("physics"), notes),
@@ -869,9 +873,13 @@ class Restore:
             if cancelled():  # stopped before it began: the scene stays as it is
                 self.cancelled = True
                 return self
-            robot = self.data.get("robot")
-            if robot and robot != scene.opts.robot:
-                self.notes.append(f"다른 로봇({robot})으로 저장한 작업 세션입니다. 지금 로봇({scene.opts.robot})으로 엽니다")
+            robot, ident, prof = self.data.get("robot"), self.data.get("robot_ident"), scene.robot_profile
+            from ..robot_profile import same_robot
+
+            other = not same_robot(ident, prof.ident) if ident else bool(robot) and robot != (
+                prof.key if prof.builtin else prof.name)
+            if other:
+                self.notes.append(f"다른 로봇({robot})으로 저장한 작업 세션입니다. 지금 로봇({prof.name})으로 엽니다")
             if self.mode == "replace":
                 clear(scene)
                 self.notes += apply_before(scene, self.data, physics_ready)

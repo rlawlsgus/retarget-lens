@@ -27,7 +27,6 @@ import numpy as np
 from .. import analysis, motion_labels, objects, paths, policy_runner, problems, settings
 from ..compare import Item, compute_metrics, load_item, load_skeleton
 from ..diagnosis import CAUSE_KO, cause_counts_text, evidence_text
-from ..io import urdf_joint_limits
 from ..physics_runner import PHYSICS_CONFIG, PhysicsJob, PhysicsRunner
 from ..rotations import matrix_to_quat, quat_mul, quat_to_matrix
 from .robots import REGIONS, OverlayBatch, RobotBatch, align_on_pelvis, set_props
@@ -207,12 +206,35 @@ def decimate(mesh, cell: float):
     return trimesh.Trimesh(nv, nf[np.sort(first)], process=False)
 
 
+G1_HEIGHT = 1.325  # m: the built-in G1's height, the size the view's distances were set for
+
+
 def load_robot_urdf(path: str, cell: float = 0.004, log: Callable = print):
     """The robot URDF with meshes simplified on a cell-sized grid (0 = full detail)."""
     import yourdfpy
 
     urdf = yourdfpy.URDF.load(path, build_scene_graph=True, load_meshes=True, build_collision_scene_graph=False,
                               load_collision_meshes=False)
+    return _simplified(urdf, cell, log)
+
+
+def load_robot_drawing(robot: str | None, urdf: str | None = None, cell: float = 0.004, log: Callable = print):
+    """What the window draws the robot with: ``urdf`` when given, else the robot's own URDF
+    (the G1's, or the user's model when it is one), else its MJCF (retlens.app.mjcf_draw), so
+    any robot RetLens retargets to can be shown."""
+    from ..robot_profile import load as load_robot
+
+    if urdf:
+        return load_robot_urdf(urdf, cell, log)
+    prof = load_robot(robot)
+    if prof.urdf:
+        return load_robot_urdf(prof.urdf, cell, log)
+    from .mjcf_draw import MjcfDrawing
+
+    return _simplified(MjcfDrawing(prof.model()), cell, log)
+
+
+def _simplified(urdf, cell: float, log: Callable):
     if cell > 0:
         geo = urdf.scene.geometry
         before = sum(len(g.faces) for g in geo.values())
@@ -226,8 +248,8 @@ def load_robot_urdf(path: str, cell: float = 0.004, log: Callable = print):
 @dataclass
 class SceneOptions:
     """How motions are loaded and where jobs write (the viewers' command-line options)."""
-    robot: str = "unitree_g1"
-    urdf: str = DEFAULT_URDF
+    robot: str = "unitree_g1"  # registry key or the robot's MJCF / URDF path (retlens.robot_profile)
+    urdf: str | None = None  # a URDF to draw it with instead of its own model
     smooth: float = 6.0
     foot_flat: bool = False
     swing_clearance_cm: float = 0.0
@@ -246,8 +268,10 @@ class SceneOptions:
 def add_scene_arguments(ap) -> None:
     """Command-line options shared by the browser viewer and the desktop editor."""
     ap.add_argument("inputs", nargs="*", help="motion files (human ones are retargeted)")
-    ap.add_argument("--robot", default="unitree_g1", help="GMR robot for retargeting (default unitree_g1)")
-    ap.add_argument("--urdf", default=DEFAULT_URDF, help="robot URDF for display")
+    ap.add_argument("--robot", default=None,
+                    help="the robot: unitree_g1 or the path of any humanoid's MJCF / URDF (default: 환경 설정, "
+                         "else unitree_g1)")
+    ap.add_argument("--urdf", default=None, help="draw the robot with this URDF instead of its own model")
     ap.add_argument("--smooth", type=float, default=6.0, help="smoothing for retargeted inputs (Hz, 0 = off)")
     ap.add_argument("--foot-flat", action="store_true",
                     help="retargeted inputs: stand feet that stand still flat on the floor with the legs and "
@@ -283,7 +307,8 @@ def scene_options(args) -> SceneOptions:
     """Options from the command line; what it leaves out comes from 환경 설정 (retlens.settings)."""
     s = settings.load()
     smpl = args.smpl_model_dir or settings.find_smpl(s).path or paths.smpl_model_dir()
-    return SceneOptions(robot=args.robot, urdf=args.urdf, smooth=args.smooth, foot_flat=getattr(args, "foot_flat", False),
+    return SceneOptions(robot=args.robot or settings.robot_spec(s), urdf=args.urdf, smooth=args.smooth,
+                        foot_flat=getattr(args, "foot_flat", False),
                         swing_clearance_cm=args.swing_clearance, self_collision=getattr(args, "self_collision", False),
                         fps=args.fps, csv_fps=args.csv_fps, smpl_model_dir=smpl, max_shift=args.max_shift,
                         physics_config=args.physics_config, isaac_accept_eula=args.isaac_accept_eula,
@@ -371,16 +396,28 @@ class MotionScene:
         self._version = 0  # bumped by every event; with the time and settings it decides redraws
         self._drawn_key, self._drawn_at = None, 0.0
         self._listeners: list[Callable[[str, object], None]] = []
+        from ..robot_profile import load as load_robot
+
+        self.robot_profile = load_robot(self.opts.robot)  # registry key or model path; parts on first use
         self.fk = None
         try:
             self.fk = analysis.FootKinematics(self.opts.robot)
         except Exception as e:  # GMR missing: foot metrics off, everything else works
             self.log(f"foot metrics disabled ({type(e).__name__}: {e})")
-        self.limits = urdf_joint_limits(self.opts.urdf)
+        try:
+            self.limits = self.robot_profile.limits(self.opts.urdf)
+        except Exception as e:  # MuJoCo missing: the URDF's limits alone
+            from ..io import urdf_joint_limits
+
+            urdf = self.opts.urdf or self.robot_profile.urdf
+            self.limits = urdf_joint_limits(urdf) if urdf else {}
+            self.log(f"joint limits from the URDF only ({type(e).__name__}: {e})")
         self.runner = PhysicsRunner(PHYSICS_CACHE, physics_config=self.opts.physics_config,
                                     accept_eula=self.opts.isaac_accept_eula, log=self.log)
-        self.policy = policy_runner.PolicyRunner(POLICY_CACHE, physics_config=self.opts.physics_config, log=self.log)
+        self.policy = policy_runner.PolicyRunner(POLICY_CACHE, physics_config=self.opts.physics_config, log=self.log,
+                                                 robot=self.opts.robot)
         self.robots = RobotBatch(server, urdf)  # every robot's meshes, posed together each tick
+        self._robot_regions()
         self.overlays = OverlayBatch(server)  # skeletons, support polygons, CoM / ZMP of all motions
         self.compare = CompareSettings()
         self.compare_now: dict | None = None  # the drawn frame's difference (set by tick)
@@ -422,6 +459,7 @@ class MotionScene:
                          smpl_model_dir=o.smpl_model_dir, swing_clearance=swing / 100.0,
                          foot_flat=bool(r.get("foot_flat", o.foot_flat)),
                          self_collision=bool(r.get("self_collision", o.self_collision)), log=self.log)
+        self._check_robot(item)
         compute_metrics(item, self.fk, self.limits)
         if prepare is None:
             self._find_labels(item)
@@ -445,6 +483,61 @@ class MotionScene:
         self.emit("items")
         self._request_physics(item)
         return item
+
+    def _robot_regions(self) -> None:
+        """Body regions of the drawn parts (겹쳐 비교 per region) from the robot's limbs
+        (robot_profile), so a robot whose link names say nothing of left / right still has them;
+        names the model does not know keep the guess from the name."""
+        try:
+            prof = self.robot_profile
+            region, model = prof.parts.region, prof.model()
+        except Exception:  # MuJoCo missing / parts not found: the names' guess stays
+            return
+        import mujoco as mj
+
+        out = []
+        for name, guess in zip(self.robots.part_names, self.robots.part_regions):
+            b = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name)
+            if b < 0 and "__" in name:  # a virtual link of the MJCF drawing: <body>__<joint>
+                b = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, name.split("__")[0])
+            if b < 0:
+                out.append(guess)
+            elif b in region:
+                side, kind, _ = region[b]
+                out.append(("왼" if side == "left" else "오른") + ("다리" if kind == "leg" else "팔"))
+            else:
+                out.append(REGIONS[0])
+        self.robots.part_regions = out
+
+    def _check_robot(self, item: Item) -> None:
+        """A robot motion made for another robot (its file says so, or few of its joints are this
+        robot's): item.info["robot_mismatch"] says what is wrong and the log warns. It is still
+        shown, its joints matched by name (the rest held at 0). Unnamed csv / pkl columns take
+        this robot's joint names when the count matches."""
+        from ..robot_profile import same_robot
+
+        prof, m = self.robot_profile, item.robot
+        try:
+            names = prof.joint_names()
+        except Exception:  # MuJoCo missing: nothing to check against
+            return
+        from ..io.robot import _DEFAULT_NAMES_BY_DOF
+
+        guessed = all(n.startswith("dof_") for n in m.joint_names) or (
+            m.meta.get("format") in ("unitree_csv", "gmr_pkl")  # names the reader guessed from the column count
+            and m.joint_names == _DEFAULT_NAMES_BY_DOF.get(len(m.joint_names)) and m.joint_names != names)
+        if guessed and len(m.joint_names) == len(names):
+            m.joint_names = list(names)  # a csv / pkl without names, as many columns as this robot has joints
+        why = []
+        ident = m.meta.get("robot_ident")
+        if not same_robot(ident, prof.ident):
+            why.append(f"{ident.get('name', '?')}의 모션 (지금 로봇: {prof.name})")
+        shared = len(set(m.joint_names) & set(names))
+        if shared < 0.8 * len(names):
+            why.append(f"관절 {len(names)}개 중 {shared}개만 이름이 맞음")
+        if why:
+            item.info["robot_mismatch"] = "; ".join(why)
+            self.log(f"{item.label}: 다른 로봇의 모션일 수 있습니다 - {item.info['robot_mismatch']}")
 
     def remove(self, item: Item) -> None:
         with self.lock:
@@ -1118,6 +1211,21 @@ class MotionScene:
                 self.compare_now = None
             self.overlays.update(humans, balance)
 
+    def robot_size(self) -> float:
+        """Height of the robot (m; its model at the zero pose), G1_HEIGHT when unknown."""
+        if getattr(self, "_robot_height", None) is None:
+            try:
+                p = self.robot_profile.parts
+                self._robot_height, self._tag_offset = p.top_height, p.top_height - p.standing_height + 0.32
+            except Exception:  # MuJoCo missing or a model whose parts cannot be found
+                self._robot_height, self._tag_offset = G1_HEIGHT, 0.85
+        return self._robot_height
+
+    def _tag_up(self) -> float:
+        """Name tag height above the root: ~0.3 m above the head."""
+        self.robot_size()
+        return self._tag_offset
+
     def fit_camera(self) -> None:
         """Look at all visible robots from the front-left, far enough for the whole row."""
         with self.lock:
@@ -1126,9 +1234,10 @@ class MotionScene:
             return
         cx, cy = pts[:, :2].mean(0)
         extent = float(np.ptp(pts[:, :2], axis=0).max()) if len(pts) > 1 else 0.0
-        d = 2.8 + 0.6 * extent
-        position = np.array([cx + 0.8 * d, cy - 0.8 * d, 1.2 + 0.2 * d])
-        look_at = np.array([cx, cy, 0.75])
+        k = self.robot_size() / G1_HEIGHT  # the view was set for the G1; a taller robot is seen from further
+        d = (2.8 + 0.6 * extent) * max(k, 0.6)
+        position = np.array([cx + 0.8 * d, cy - 0.8 * d, (1.2 + 0.2 * d) * max(k, 0.6)])
+        look_at = np.array([cx, cy, 0.75 * k])
         self.server.initial_camera.position = tuple(position)
         self.server.initial_camera.look_at = tuple(look_at)
         for client in self.server.get_clients().values():
@@ -1189,7 +1298,7 @@ class MotionScene:
         T_base[:3, 3] = p
         jmap = src.handles.get("map", h["map"])
         cfg = np.array([dof[i] if i is not None else 0.0 for i in jmap])
-        tag = p + np.array([0.0, 0.0, 0.85])
+        tag = p + np.array([0.0, 0.0, self._tag_up()])
         h["label"].position = tag
         text = item.label if inside else f"{item.label} (범위 밖)"
         if self.is_physics_result(item):
@@ -1331,7 +1440,23 @@ class MotionScene:
 
     def balance_problem(self, mode: str) -> str:
         """'' when this 균형 제어 can run here, else why not (Isaac: checked when a run starts)."""
-        return "" if mode == "isaac" else self.policy.problem(mode)
+        return self.robot_physics_problem(mode) or ("" if mode == "isaac" else self.policy.problem(mode))
+
+    def robot_physics_problem(self, mode: str) -> str:
+        """'' when physics in this mode can simulate the robot in use, else why not: another robot
+        runs the MuJoCo harness / no-controller modes on its own model (policy_replay.RobotSim), GMT's
+        policy is trained for the G1, Isaac loads the robot USD of 환경 설정 (empty = NVIDIA's G1)."""
+        prof = self.robot_profile
+        if prof.builtin or mode in ("harness", "pd"):
+            return ""
+        if mode == "isaac":  # the robot of this scene (a --robot start too), not the saved setting's
+            usd = settings.load().robot_usd.strip().strip('"')
+            if not usd:
+                return (f"Isaac은 로봇 USD가 비어 있으면 NVIDIA의 G1을 씁니다. {prof.name}의 USD를 "
+                        "환경 설정 > 로봇 USD에 지정하세요")
+            found = settings.find_robot_usd()
+            return "" if found.path else found.problem
+        return f"추적 정책(GMT)은 G1용으로 학습되어 {prof.name}에는 쓸 수 없습니다. 보조 힘 (MuJoCo)나 없음 (MuJoCo)를 쓰세요"
 
     def _physics_changed(self) -> None:
         for it in list(self.items):
@@ -1349,6 +1474,12 @@ class MotionScene:
                                                             ("failed", "cancelled")):
             return
         done = lambda j, it=item, k=key: self._physics_done(it, j, k)  # noqa: E731
+        why = self.robot_physics_problem(self.balance)
+        if why:  # never another robot's model in place of this one
+            self._phys_errors[key] = why
+            self.log(f"physics unavailable ({self.key_label(key)}): {why}")
+            self.emit("status")
+            return
         try:
             if self.balance == "isaac":
                 jobs[key] = self.runner.request(item.robot, key, on_done=done)
@@ -1765,6 +1896,9 @@ class MotionScene:
         """Queue an Isaac recording of this motion (its physics result in physics mode; with a
         MuJoCo 균형 제어, Isaac replays the MuJoCo result as it is); raises when Isaac Sim is not
         found, or when the MuJoCo result is not there yet."""
+        why = self.robot_physics_problem("isaac")
+        if why:  # Isaac would record NVIDIA's G1 in this robot's place
+            raise RuntimeError(why)
         physics = self.physics_on and not self.is_sim_result(item)
         robot, mode, what = item.robot, "kinematic", "kinematic"
         if physics and self.balance != "isaac":

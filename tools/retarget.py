@@ -45,7 +45,7 @@ import traceback
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, ROOT)
 
-from retlens.retarget import ROBOT_TAGS, retarget_file, save_gmr_pkl  # noqa: E402
+from retlens.retarget import profile, retarget_file, save_gmr_pkl  # noqa: E402
 
 INPUT_EXTENSIONS = (".bvh", ".fbx", ".npz")
 
@@ -76,7 +76,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="+", help="BVH / FBX / AMASS SMPL-X npz files or folders (searched recursively)")
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "data", "retargeted"))
-    ap.add_argument("--robot", default="unitree_g1", help="GMR robot name (default unitree_g1, 29 DoF)")
+    ap.add_argument("--robot", default="unitree_g1",
+                    help="the robot: unitree_g1 (default, 29 DoF) or the path of any humanoid's MJCF / URDF")
     ap.add_argument("--format", default="auto", choices=["auto", "tpose", "fbx", "lafan1", "nokov", "smplx", "smplx-gmr"])
     ap.add_argument("--fps", type=float, default=30.0, help="output frame rate (0 = keep the source rate)")
     ap.add_argument("--ref", default="auto", help="T-pose reference for --format tpose / fbx: auto | rest | <frame>")
@@ -99,7 +100,7 @@ def main() -> int:
     args = ap.parse_args()
 
     ref = args.ref if args.ref in ("auto", "rest") else int(args.ref)
-    tag = ROBOT_TAGS.get(args.robot, args.robot)
+    tag = profile(args.robot).tag  # skips existing outputs of this model only (the tag carries its digest)
     os.makedirs(args.out_dir, exist_ok=True)
     files = list(iter_inputs(args.inputs))
     if not files:
