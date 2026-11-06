@@ -138,15 +138,50 @@ def install_error_hooks() -> None:
 def main(argv=None) -> int:
     """Entry point of RetLens (packaged exe and tools/editor.py)."""
     setup_logging()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    code = 1
     try:
-        from .editor import run
+        if "--uninstall" in argv:  # Windows "설치된 앱" > 제거: before the editor (it may be what is broken)
+            from .update_ui import uninstall_main
 
-        return run(argv)
+            code = uninstall_main()
+        else:
+            from .editor import run
+
+            code = run(argv)
     except SystemExit:
         raise
     except BaseException as e:  # a failure before the window could show it
         details = traceback.format_exc()
         print(f"[{APP_NAME}] failed to start:\n{details}", file=sys.stderr, flush=True)
-        _message_box(f"{APP_NAME} 시작 실패", f"{APP_NAME}를 시작하지 못했습니다.\n\n{type(e).__name__}: {e}"
-                     + (f"\n\n자세한 내용은 로그 파일에 있습니다:\n{_log_path}" if _log_path else ""))
-        return 1
+        rolled_back = False
+        if paths.FROZEN:
+            try:  # without Qt (it may be what failed): a version that just came in by an update, the previous one back
+                from ..install import offer_rollback
+
+                rolled_back = offer_rollback()
+            except Exception:
+                pass
+        if not rolled_back:
+            _message_box(f"{APP_NAME} 시작 실패", f"{APP_NAME}를 시작하지 못했습니다.\n\n{type(e).__name__}: {e}"
+                         + (f"\n\n자세한 내용은 로그 파일에 있습니다:\n{_log_path}" if _log_path else ""))
+        code = 1
+    finally:
+        _after_exit(code)
+    return code
+
+
+def _after_exit(code: int) -> None:
+    """What waits for the window to close (start the installed copy), and a sure exit when a helper waits for it."""
+    install = sys.modules.get("retlens.install")
+    if install is None:
+        return
+    install.run_after_exit()
+    if install.HARD_EXIT:
+        print(f"[{APP_NAME}] exiting for the update helper", flush=True)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(code)

@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import autolabel, batch, cmu_labels, dataset, motion_labels, problems
-from . import export_dialogs
+from . import export_dialogs, update_ui
 from . import session as work
 from .. import paths as app_paths  # "paths" is a common local name here
 from .. import settings
@@ -93,7 +93,7 @@ def webengine_sandbox_workaround() -> bool:
         top = getattr(__import__("sys"), "_MEIPASS", "")
         proc = os.path.join(top, "QtWebEngineProcess.exe")
         if os.path.isfile(proc) and os.path.isfile(os.path.join(top, "Qt6WebEngineCore.dll")):
-            os.environ.setdefault("QTWEBENGINEPROCESS_PATH", proc)
+            os.environ["QTWEBENGINEPROCESS_PATH"] = proc  # never an inherited one (another RetLens's bundle)
             return False
     if os.environ.get("QTWEBENGINE_DISABLE_SANDBOX"):
         return True
@@ -3126,6 +3126,23 @@ class SettingsDialog(QDialog):
         open_data = QPushButton("열기")
         open_data.clicked.connect(lambda: self.win.open_path(app_paths.user_dir()))
         pf.addWidget(open_data, len(rows), 2)
+        from .. import __version__, install
+
+        r = len(rows) + 1
+        pf.addWidget(QLabel("<b>버전</b>"), r, 0)
+        where = ("설치됨: " + install.install_dir() if install.is_installed() else
+                 "설치하지 않고 실행 중: " + (install.program_dir() or "") if app_paths.FROZEN else "저장소에서 실행 중")
+        ver = QLabel(f"RetLens {escape(__version__)} <span style='color:gray'>({escape(where)})</span>")
+        ver.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        ver.setWordWrap(True)
+        pf.addWidget(ver, r, 1)
+        upd = QPushButton("업데이트 확인...")
+        upd.clicked.connect(lambda: self.win.updates.open_dialog(force=True))
+        pf.addWidget(upd, r, 2)
+        self.check_updates = QCheckBox("시작할 때 업데이트 확인 (하루 한 번, GitHub 릴리즈)")
+        self.check_updates.setChecked(s.check_updates)
+        self.check_updates.setToolTip("새 버전이 있으면 상태바에 '업데이트' 단추가 나옵니다. 아무것도 내려받지 않고, 버전만 봅니다")
+        pf.addWidget(self.check_updates, r + 1, 1, 1, 2)
         lay.addWidget(prog)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -3149,7 +3166,8 @@ class SettingsDialog(QDialog):
         vals = {f: self.edits[k].text().strip().strip('"') for k, _, _, f in self.ROWS}
         return settings.Settings(**vals, library_dirs=list(self._extra_libs), api_enabled=self.api_on.isChecked(),
                                  api_port=int(self.api_port.value()),
-                                 label_rules=settings.load().label_rules)  # picked in 인스펙터 > 라벨, kept as it is
+                                 label_rules=settings.load().label_rules,  # picked in 인스펙터 > 라벨, kept as it is
+                                 check_updates=self.check_updates.isChecked())
 
     def _schedule(self) -> None:
         self._timer.start(250)  # check once typing pauses
@@ -3694,6 +3712,13 @@ class EditorWindow(QMainWindow):
         self.a_settings = act("환경 설정...", lambda: self.open_settings(), "Ctrl+,", QStyle.SP_FileDialogDetailedView,
                               tip="Isaac Sim·Blender·SMPL-X 모델·모션 폴더·동영상 폴더 위치와 점검")
         self.a_about = act("정보", self._about)
+        self.updates = update_ui.UpdateController(self)
+        self.a_update = act("업데이트 확인...", lambda: self.updates.open_dialog(),
+                            tip="GitHub 릴리즈에 새 버전이 있는지 보고, 있으면 받아서 바꿉니다")
+        self.a_install = act("RetLens 설치...", lambda: self.updates.install_portable(),
+                             tip="이 RetLens를 이 PC에 설치합니다(시작 메뉴, 관리자 권한 필요 없음)")
+        self.a_uninstall = act("RetLens 제거...", lambda: self.updates.uninstall(),
+                               tip="설치한 RetLens를 이 PC에서 지웁니다")
         self.a_foot_flat = act("디딤발 평평 보정", lambda on: self.set_retarget(foot_flat=on), checkable=True,
                                tip=f"{RETARGET_TIPS['foot_flat']}. {RETARGET_NOTE}")
         self._swing_cm = sc.opts.swing_clearance_cm or SWING_CLEARANCE_CM  # the command line's height, if given
@@ -3774,8 +3799,14 @@ class EditorWindow(QMainWindow):
             self.a_assist[val] = a
         m.addAction(self.a_cancel)
         m = mb.addMenu("도움말(&H)")
-        for a in (self.a_readme, self.a_labels, self.a_about):
-            m.addAction(a)
+        m.setToolTipsVisible(True)
+        from .. import install
+
+        for a in (self.a_readme, self.a_labels, None, self.a_update, self.a_install, self.a_uninstall, None,
+                  self.a_about):
+            m.addSeparator() if a is None else m.addAction(a)
+        self.a_install.setVisible(install.is_portable())
+        self.a_uninstall.setVisible(install.is_installed())
 
         # the toolbar: what is used all the time; playback is the timeline's, the rest is in the menus
         self.physics_btn = QToolButton()  # 물리 모드, and its 균형 제어 from the ▾
@@ -3806,6 +3837,7 @@ class EditorWindow(QMainWindow):
                 w.setContentsMargins(8, 0, 8, 0)
             w.hide()
             sb.addPermanentWidget(w)
+        sb.addPermanentWidget(self.updates.button)  # "업데이트 0.9.1" (retlens/app/update_ui.py)
 
     # ---------------------------------------------------------------- 환경 설정
     auto_setup = True  # open 환경 설정 on the first start when something is missing (off for smoke tests)
@@ -3821,6 +3853,8 @@ class EditorWindow(QMainWindow):
         return checks
 
     def _startup_check(self) -> None:
+        if self.updates.startup(offer=self.auto_setup and self._restore is None, check=self.auto_setup):
+            return  # going on to install / opening the installed copy: that one does its own first start
         checks = self._refresh_env()
         for c in checks:
             if not c.ok:
@@ -5248,7 +5282,7 @@ class EditorWindow(QMainWindow):
         a.toggled.connect(lambda on: self.settings.setValue(layout_key("session/restore_on_start"), on))
         m.addAction("목록 지우기", lambda: self.settings.setValue(layout_key("session/recent"), []))
 
-    def open_startup(self, inputs: list[str], options: bool = False) -> None:
+    def open_startup(self, inputs: list[str], options: bool = False, resume: bool = False) -> None:
         """The command line's files: a session among them opens as it was saved, without questions (only that: other
         files are left out); none and 시작할 때 마지막 작업 열기 on: the last work (자동 저장), unless options
         (--physics, the corrections) were given, which it would replace."""
@@ -5259,8 +5293,8 @@ class EditorWindow(QMainWindow):
             if len(inputs) > 1:
                 self.scene.log(f"작업 세션 {os.path.basename(sessions[0])}만 엽니다 (함께 준 다른 파일은 열지 않음)")
             return
-        if not motions and not options and self.confirm_unsaved and \
-                self.settings.value(layout_key("session/restore_on_start"), False, type=bool):
+        if not motions and not options and (resume or self.confirm_unsaved and
+                                            self.settings.value(layout_key("session/restore_on_start"), False, type=bool)):
             info = work.autosave_info(0)
             if info is not None:
                 self.open_session(info["path"], mode="replace", interactive=False, autosave_of=info)
@@ -5273,7 +5307,11 @@ class EditorWindow(QMainWindow):
     def _about(self) -> None:
         from . import runtime
 
-        rows = [*app_paths.describe(), ("로그 파일", runtime.log_path() or "콘솔 (저장소에서 실행)")]
+        from .. import install
+
+        state = (f"설치됨 ({install.install_dir()})" if install.is_installed() else
+                 f"설치하지 않고 실행 중 ({install.program_dir()})" if app_paths.FROZEN else "저장소에서 실행 중")
+        rows = [("실행 위치", state), *app_paths.describe(), ("로그 파일", runtime.log_path() or "콘솔 (저장소에서 실행)")]
         where = "".join(f"<tr><td style='padding-right:10px'>{escape(k)}</td><td>{escape(v)}</td></tr>"
                         for k, v in rows)
         from .. import __version__
@@ -5296,6 +5334,9 @@ class EditorWindow(QMainWindow):
         # untitled work: unsaved label edits asked about (a session file holds its edits; 저장 안 함 let them go)
         if not self.session_path and self._restore is None and \
                 not self._confirm_discard_labels(list(self.scene.items), "종료하면"):
+            e.ignore()
+            return
+        if not self.updates.stop_for_close():  # an update downloading / installing (asked before anything stops)
             e.ignore()
             return
         setup = self._setup
@@ -5333,6 +5374,8 @@ def run(argv=None) -> int:
     ap.add_argument("--light", action="store_true", help="light theme (default: dark, like most editors)")
     ap.add_argument("--screenshot", default=None, help="save a window screenshot here after --quit-after seconds")
     ap.add_argument("--quit-after", type=float, default=0.0, help="close after N seconds (smoke tests)")
+    ap.add_argument("--resume-autosave", action="store_true",
+                    help="open the last work (자동 저장): RetLens restarting itself after an update or install")
     args = ap.parse_args(argv)
 
     from . import runtime
@@ -5399,10 +5442,11 @@ def run(argv=None) -> int:
     win.show()
     if args.physics:
         win.a_physics.setChecked(True)
+    win.startup_inputs = [os.path.abspath(p) for p in args.inputs]  # (an install hands them to the installed copy)
     win._session_clean = work.fingerprint(scene, [])  # an empty untitled window is not "changed"
     win._new_work()
     win.open_startup(args.inputs, options=bool(args.physics or args.foot_flat or args.swing_clearance
-                                               or args.self_collision or args.body_mesh))
+                                               or args.self_collision or args.body_mesh), resume=args.resume_autosave)
     win.view.loadFinished.connect(lambda ok: scene.log(
         f"scene view {'loaded' if ok else 'FAILED to load'}: {win.view.url().toString()}"))
     if args.quit_after > 0:

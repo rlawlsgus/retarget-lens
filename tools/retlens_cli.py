@@ -3,6 +3,8 @@ JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"
 autolabel / summary / batch: 1 = no motion done, 2 = some not (their rows say why).
 
     retlens-cli info                        # version, file locations, 환경 점검
+    retlens-cli version                     # just the version (fast: nothing else is loaded)
+    retlens-cli update                      # 업데이트 확인: the latest GitHub release vs this one (check only)
     retlens-cli robot [MODEL.xml|.urdf]     # the robot's parts as retargeting finds them (default: 환경 설정)
     retlens-cli library --query walk        # motion files (with CMU descriptions)
     retlens-cli inspect FILE [FILE ...]     # load (retarget if needed): QC, metrics, C3D QC
@@ -86,6 +88,13 @@ def run(args) -> dict:
         return {"app": "RetLens", "version": __version__, "api_version": api_core.API_VERSION,
                 "locations": dict(paths.describe()),
                 "isaac_eula_accepted": api_core.eula_accepted(), **api_core.checks()}
+    if c == "update":  # 업데이트 확인 only: installing happens in the window (도움말 > 업데이트 확인)
+        from retlens import install
+
+        chk = install.check_latest()
+        out = {**chk.to_dict(), "installed": install.is_installed(), "portable": install.is_portable(),
+               "install_dir": install.install_dir(), "releases_page": install.RELEASES_PAGE}
+        return _Exit(out, 1) if chk.error else out
     if c == "robot":  # what retargeting finds in a robot model (no motion needed)
         from retlens import settings
         from retlens.robot_profile import load as load_robot
@@ -468,6 +477,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--pretty", action="store_true", help="indented JSON")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="version, file locations, environment check")
+    sub.add_parser("version", help="the version only (fast)")
+    sub.add_parser("update", help="업데이트 확인: is there a newer release on GitHub (check only, installs nothing)")
     p = sub.add_parser("robot", help="the robot's parts as retargeting finds them (legs, arms, joint roles, size)")
     p.add_argument("model", nargs="?", default=None,
                    help="unitree_g1 or an MJCF / URDF path (default: 환경 설정 > 로봇 모델, else unitree_g1)")
@@ -569,6 +580,12 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    if [a for a in (sys.argv[1:] if argv is None else argv) if a != "--pretty"] == ["version"]:  # nothing heavy
+        from retlens import __version__
+
+        sys.stdout.buffer.write(json.dumps({"app": "RetLens", "version": __version__}).encode("utf-8") + b"\n")
+        sys.stdout.flush()
+        return 0
     args = parser().parse_args(argv)
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # stdout carries the JSON only: banners and prints (viser, GMR) go to stderr

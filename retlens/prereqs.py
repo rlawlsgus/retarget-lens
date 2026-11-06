@@ -698,10 +698,11 @@ def _check(path: str, sha256: str | None, md5: str | None, git_sha1: str | None,
 
 def download(url: str, dest: str, *, sha256: str | None = None, md5: str | None = None, git_sha1: str | None = None,
              progress: Progress | None = None, cancel: threading.Event | None = None, stage: str = "받는 중",
-             retries: int = 4) -> str:
+             retries: int = 4, opener: urllib.request.OpenerDirector | None = None) -> str:
     """url -> dest, resuming <dest>.part, verified before it gets its name. A file already at dest that
     passes the check is reused. Cancel keeps the .part for the next try. Retries back off and give up
-    after `retries` tries in a row that brought the file no further than it ever was."""
+    after `retries` tries in a row that brought the file no further than it ever was. opener: one that
+    checks where redirects go (retlens.install allows only GitHub's hosts)."""
     progress = progress or (lambda *_: None)
     part = dest + ".part"
     if os.path.isfile(dest) and _check(dest, sha256, md5, git_sha1, cancel):
@@ -721,7 +722,7 @@ def download(url: str, dest: str, *, sha256: str | None = None, md5: str | None 
         done = have
         try:
             req = _request(url, {"Range": f"bytes={have}-"} if have else None)
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with (opener.open if opener is not None else urllib.request.urlopen)(req, timeout=60) as r:
                 length = r.headers.get("Content-Length")
                 if have and r.status != 206:  # the server ignored the range
                     kind = (r.headers.get("Content-Type") or "").lower()

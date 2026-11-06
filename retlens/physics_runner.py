@@ -313,7 +313,7 @@ class PhysicsRunner:
             job.state, job.started = "running", time.time()
             job.stage, job.progress = STARTING[0], STARTING[1]
             job.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                        env=env, cwd=paths.isaac_root(), text=True, encoding="utf-8", errors="replace",
+                                        env=env, cwd=job.out_dir, text=True, encoding="utf-8", errors="replace",
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.log(f"{job.kind} running: {job.name}")
         with open(os.path.join(job.out_dir, "run.log"), "w", encoding="utf-8") as logf:

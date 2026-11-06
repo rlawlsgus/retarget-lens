@@ -96,3 +96,25 @@ cli_exe = EXE(  # noqa: F821
     upx=False,
 )
 coll = COLLECT(exe, a.binaries, a.datas, cli_exe, cli.binaries, cli.datas, name="RetLens", upx=False)  # noqa: F821
+
+# retlens-update.exe: finishes an update / uninstall after RetLens has exited (retlens/update_helper.py). One file,
+# standard library only (the script is analysed on its own, not as part of the retlens package), windowed. RetLens
+# runs a copy of it from %LOCALAPPDATA%\RetLens\updater, never from the program folder it replaces.
+# build_retlens.ps1 moves it from dist\ into dist\RetLens\.
+upd = Analysis(  # noqa: F821
+    [os.path.join(ROOT, "retlens", "update_helper.py")],
+    pathex=[],
+    excludes=["numpy", "PySide6", "retlens", "tkinter", "unittest", "pydoc", "email", "http", "xml", "asyncio"],
+    noarchive=False,
+)
+upd_exe = EXE(  # noqa: F821
+    PYZ(upd.pure),  # noqa: F821
+    upd.scripts,
+    upd.binaries,
+    upd.datas,
+    [],
+    name="retlens-update",
+    console=False,
+    icon=os.path.join(ROOT, "packaging", "retlens.ico"),
+    upx=False,
+)

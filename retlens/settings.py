@@ -65,6 +65,7 @@ class Settings:
     api_enabled: bool = True  # the window's local HTTP API for AI agents (127.0.0.1 + token, retlens/app/api_server.py)
     api_port: int = 8765
     label_rules: str = ""  # 자동 라벨 rule file (retlens.autolabel); empty = $RETLENS_LABEL_RULES
+    check_updates: bool = True  # 시작할 때 업데이트 확인 (retlens.install, the packaged program only)
 
 
 def settings_path() -> str:
@@ -96,8 +97,17 @@ def save(s: Settings) -> None:
     path = settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
+    data = {}
+    try:  # keys this version does not know (a newer RetLens wrote them) are kept, not dropped
+        with open(path, encoding="utf-8") as f:
+            old = json.load(f)
+        if isinstance(old, dict):
+            data = {k: v for k, v in old.items() if k not in {fl.name for fl in fields(Settings)}}
+    except (OSError, ValueError):
+        pass
+    data.update(asdict(s))
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(asdict(s), f, ensure_ascii=False, indent=1)
+        json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
     _current = s
 

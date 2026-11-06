@@ -40,6 +40,12 @@ $ErrorActionPreference = "Stop"
 if ($code -ne 0) { throw "retlens-cli.exe info failed (exit $code): the build does not run" }
 $built = ($info | ConvertFrom-Json).version
 if ($built -ne $version) { throw "the build reports version '$built' but retlens\__init__.py says ${version}: rebuild" }
+# what the in-app updater relies on: the helper and the manifest of this version (retlens/install.py)
+if (-not (Test-Path (Join-Path $Dist "retlens-update.exe"))) { throw "retlens-update.exe is missing: rebuild" }
+$manifest = Join-Path $Dist "_internal\retlens-build.json"
+if (-not (Test-Path $manifest)) { throw "$manifest is missing: rebuild" }
+$mv = (Get-Content $manifest -Raw | ConvertFrom-Json).version
+if ($mv -ne $version) { throw "the build manifest says '$mv', not ${version}: rebuild" }
 
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
