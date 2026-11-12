@@ -18,15 +18,18 @@ def _touch(path, data=b"x"):
 
 def test_motion_files_are_listed_by_folder(tmp_path, monkeypatch):
     monkeypatch.setattr(compare, "ROOT", str(tmp_path))
+    robot_row = (",".join(["0.1"] * 36) + "\n").encode()  # a Unitree csv: numbers only (root, quaternion, joints)
     keep = [_touch(tmp_path / "data/raw/cmu_bvh/02_01.bvh"), _touch(tmp_path / "data/raw/cmu_fbx/02_01.fbx"),
             _touch(tmp_path / "data/raw/amass/CMU/02/02_01_stageii.npz"),
-            _touch(tmp_path / "data/raw/unitree/walk.csv"), _touch(tmp_path / "data/retargeted/smooth6/02_01_g1.npz"),
+            _touch(tmp_path / "data/raw/unitree/walk.csv", robot_row),
+            _touch(tmp_path / "data/retargeted/smooth6/02_01_g1.npz"),
             _touch(tmp_path / "reports/physics/smooth6/02_01_g1_sim.npz")]
     skip = [_touch(tmp_path / "data/raw/amass/CMU/02/neutral_stagei.npz"),  # body shape, not a motion
             _touch(tmp_path / "data/raw/cmu_bvh/SOURCE.md"), _touch(tmp_path / "data/retargeted/smooth6/02_01_g1.json"),
             _touch(tmp_path / "data/retargeted/cache/old_g1.npz"), _touch(tmp_path / "reports/qc_real.csv"),
             _touch(tmp_path / "data/raw/cmu_bvh/02_01.labels.csv"),  # labels of 02_01, not a Unitree csv motion
-            _touch(tmp_path / "data/raw/unitree/walk_subtask.csv"), _touch(tmp_path / "data/raw/unitree/labels.csv")]
+            _touch(tmp_path / "data/raw/unitree/walk_subtask.csv"), _touch(tmp_path / "data/raw/unitree/labels.csv"),
+            _touch(tmp_path / "data/raw/cmu_fbx/metadata.csv", b"file_name,description\n02_01.fbx,walk\n")]  # a table
     for p in keep:
         assert is_motion_file(p), p
     for p in skip:

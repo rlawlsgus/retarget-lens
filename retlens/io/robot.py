@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import re
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -67,7 +68,27 @@ def load_robot_npz(path: str) -> RobotMotion:
 
 def load_unitree_csv(path: str, fps: float = 30.0, joint_names: list[str] | None = None) -> RobotMotion:
     """Unitree retargeted csv: x y z qx qy qz qw, then joint angles (no header)."""
-    a = np.loadtxt(path, delimiter=",", dtype=np.float64, ndmin=2)
+    import warnings
+
+    name = os.path.basename(path)
+    not_robot = f"{name}: Unitree 로봇 csv가 아닙니다 (줄마다 숫자만 8개 이상: 루트 x y z, 쿼터니언 x y z w, 관절각)"
+    try:
+        with warnings.catch_warnings():  # an empty file: numpy warns, then the shape check below says what is wrong
+            warnings.simplefilter("ignore", UserWarning)
+            a = np.loadtxt(path, delimiter=",", dtype=np.float64, ndmin=2)
+    except ValueError as e:
+        msg = str(e)
+        cut = re.search(r"number of columns changed from (\d+) to (\d+) at row (\d+)", msg)  # numpy: rows from 1
+        if cut:  # a robot csv whose later row is short: cut off while it was written or copied
+            raise ValueError(f"{name}: {_csv_line(path, int(cut[3]) - 1)}번째 줄의 열이 {cut[2]}개로 앞 줄들({cut[1]}개)과 "
+                             f"다릅니다. 파일이 중간에 잘렸을 수 있음") from e
+        bad = re.search(r"could not convert string (.*) to \S+ at row (\d+), column (\d+)", msg)  # rows from 0
+        if bad and int(bad[2]) > 0:  # the first row is numbers: a broken row further down, not another kind of table
+            raise ValueError(f"{name}: {_csv_line(path, int(bad[2]))}번째 줄 {bad[3]}번째 칸({bad[1]})을 숫자로 읽지 "
+                             f"못했습니다. 파일이 잘렸거나 손상되었을 수 있음") from e
+        raise ValueError(f"{not_robot}; 머리글이나 글자가 있음") from e  # a header or words: another kind of table
+    if a.ndim != 2 or a.shape[0] == 0 or a.shape[1] < 8:
+        raise ValueError(not_robot if a.size else f"{os.path.basename(path)}: 빈 csv입니다")
     q_xyzw = a[:, 3:7]
     return RobotMotion(
         name=os.path.splitext(os.path.basename(path))[0],
@@ -81,22 +102,48 @@ def load_unitree_csv(path: str, fps: float = 30.0, joint_names: list[str] | None
     )
 
 
+def _csv_line(path: str, row: int) -> int:
+    """The file's line number (from 1) of np.loadtxt's data row `row` (from 0): its rows skip empty lines and lines
+    that start with '#' (np.savetxt's header=); a line of spaces is a row."""
+    left = row
+    try:
+        with open(path, "rb") as f:
+            for n, line in enumerate(f, 1):
+                if line.rstrip(b"\r\n").split(b"#", 1)[0]:
+                    if left == 0:
+                        return n
+                    left -= 1
+    except OSError:
+        pass
+    return row + 1
+
+
 def load_gmr_pkl(path: str, joint_names: list[str] | None = None) -> RobotMotion:
     """GMR (General Motion Retargeting) output pickle.
 
     Only open pickles you produced yourselves: unpickling runs arbitrary code.
     """
     with open(path, "rb") as f:
-        d = pickle.load(f)
-    dof = np.asarray(d["dof_pos"], dtype=np.float64)
-    q_xyzw = np.asarray(d["root_rot"], dtype=np.float64)
+        try:  # anything else (text, an empty or cut file, another pickle): a clear ValueError, not the unpickler's
+            d = pickle.load(f)
+            dof = np.asarray(d["dof_pos"], dtype=np.float64)
+            q_xyzw = np.asarray(d["root_rot"], dtype=np.float64)
+            root_pos = np.asarray(d["root_pos"], dtype=np.float64)
+            fps = float(d.get("fps", 30.0))
+            if dof.ndim != 2 or q_xyzw.shape != (len(dof), 4) or root_pos.shape != (len(dof), 3):
+                raise ValueError(f"shapes dof_pos {dof.shape}, root_rot {q_xyzw.shape}, root_pos {root_pos.shape}")
+        except OSError:
+            raise
+        except Exception as e:
+            raise ValueError(f"{os.path.basename(path)}: GMR pkl 모션 파일이 아닙니다 (비었거나 잘렸거나 다른 형식: "
+                             f"dof_pos / root_rot / root_pos 배열이 필요)") from e
     return RobotMotion(
         name=os.path.splitext(os.path.basename(path))[0],
         joint_names=_names_for(dof.shape[1], joint_names),
-        root_pos=np.asarray(d["root_pos"], dtype=np.float64),
+        root_pos=root_pos,
         root_quat=quat_normalize(q_xyzw[:, [3, 0, 1, 2]]),
         dof_pos=dof,
-        fps=float(d.get("fps", 30.0)),
+        fps=fps,
         source=os.path.abspath(path),
         meta={"format": "gmr_pkl"},
     )

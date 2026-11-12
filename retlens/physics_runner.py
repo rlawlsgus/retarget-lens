@@ -238,8 +238,9 @@ class PhysicsRunner:
 
     def cancel(self, job: PhysicsJob) -> None:
         with self._lock:
-            if job.state == "queued":
-                self._queue.remove(job)
+            if job.state == "queued":  # still queued, or just taken by the worker (it checks the state again)
+                if job in self._queue:
+                    self._queue.remove(job)
                 self._finish(job, "cancelled", "취소됨")
             elif job.state == "running" and job.proc is not None:
                 job.state = "cancelled"  # the worker sees the exit and keeps this state
@@ -253,10 +254,8 @@ class PhysicsRunner:
         """Stop the worker and any running Isaac process (call on exit)."""
         with self._lock:
             self._closed = True
-            for job in list(self._queue):
-                self.cancel(job)
-            for job in self.jobs.values():
-                if job.state == "running":
+            for job in list(self.jobs.values()):  # also a job the worker took but has not started yet
+                if job.state in ("queued", "running"):
                     self.cancel(job)
         self._wake.set()
 
@@ -300,7 +299,10 @@ class PhysicsRunner:
                 try:
                     self._run(job)
                 except Exception as e:  # never let one clip kill the worker
-                    self._finish(job, "failed", f"{type(e).__name__}: {e}")
+                    if job.state == "cancelled":  # cancelled while it started (a job cancel() finished stays so)
+                        self._finish(job, "cancelled", "취소됨")
+                    else:
+                        self._finish(job, "failed", f"{type(e).__name__}: {e}")
 
     def _run(self, job: PhysicsJob) -> None:
         cmd = (self.command or isaac_command()) + [self.script] + job.args + ["--progress"]
@@ -309,6 +311,9 @@ class PhysicsRunner:
             env["OMNI_KIT_ACCEPT_EULA"] = "YES"
         with self._lock:
             if job.state != "queued":
+                return
+            if self._closed:
+                self._finish(job, "cancelled", "취소됨")
                 return
             job.state, job.started = "running", time.time()
             job.stage, job.progress = STARTING[0], STARTING[1]
@@ -348,6 +353,8 @@ class PhysicsRunner:
 
     def _finish(self, job: PhysicsJob, state: str, message: str) -> None:
         with self._lock:
+            if job.finished:  # ended once already (cancelled, then the worker failed on it): its callbacks have run
+                return
             job.state, job.message, job.finished, job.proc = state, message, time.time(), None
             if state == "done":
                 job.stage, job.progress = "완료", 1.0

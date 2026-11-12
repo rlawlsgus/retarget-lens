@@ -186,6 +186,24 @@ class _SceneUndoKeys(QObject):
         return False
 
 
+class _ListDeleteKey(QObject):
+    """Delete is 선택한 모션 제거 (a window-wide shortcut). In the panels that list other things (데이터셋 table,
+    프로젝트 files, 분석, 비교, 콘솔) it would close the motion picked elsewhere: there the key goes to the panel,
+    which does nothing with it. The menu entry still works from anywhere."""
+
+    def __init__(self, panels: list, parent: QObject | None = None):
+        super().__init__(parent)
+        self.panels = panels
+
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.ShortcutOverride and e.key() == Qt.Key_Delete and isinstance(obj, QWidget) and \
+                not e.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier) and \
+                any(p is obj or p.isAncestorOf(obj) for p in self.panels):
+            e.accept()
+            return True
+        return False
+
+
 _pass_filter: _PassShortcuts | None = None
 
 
@@ -283,7 +301,7 @@ class _GuiInvoker(QObject):
 class SceneBridge(QObject):
     """Scene events (any thread) -> the Qt main thread."""
     event = Signal(str, object)
-    added = Signal(object)  # Item, or an error text
+    added = Signal(object)  # (file, Item or why it did not open) from add_paths; an Item from the API
     labelled = Signal(object)  # (job, item, automatic labels) made off the GUI thread
     log = Signal(str)
     gui = Signal(object)  # a callable a worker thread hands to the GUI thread (EditorWindow._run_on_gui)
@@ -457,7 +475,8 @@ class InspectorPanel(QScrollArea):
     """The selected motion: a summary (what it is, its score, QC and problems), then sections that fold (세부 정보,
     보정, 지표; open or closed as last left), 라벨, and 물리 / 동영상 only when there is something to say."""
     SUMMARY = ("종류", "파일", "길이", "QC", "리타게팅 점수", "다시 리타게팅", "물체", "손–물체", "C3D 마커",
-               "마커 QC")  # item_facts rows
+               "마커 QC", "파일 주의", "주의")  # item_facts rows
+    WARN_ROWS = ("파일 주의", "주의")  # shown in the warning colour
 
     def __init__(self, win: "EditorWindow"):
         super().__init__()
@@ -538,7 +557,12 @@ class InspectorPanel(QScrollArea):
             if k == "QC" and notes and v != "PASS":  # why it is not PASS
                 lab.setTextFormat(Qt.RichText)
                 lab.setText(f"{escape(v)}<br><span style='color:gray'>{escape(notes)}</span>")
-            form.addRow(k, lab)
+            if k in self.WARN_ROWS:  # another take's solve, a person not read: seen without opening 세부 정보
+                key = QLabel(k)
+                key.setStyleSheet(f"color: {WARN_COLOR}")
+                form.addRow(key, lab)
+            else:
+                form.addRow(k, lab)
         self.problem_lab = self._value("")
         form.addRow("문제 구간", self.problem_lab)
         lay.addLayout(form)
@@ -581,6 +605,9 @@ class InspectorPanel(QScrollArea):
             rec.setToolTip("보정 조합 8가지로 이 모션을 리타게팅해 리타게팅 점수가 가장 높은 조합을 보여 주고, 고르면 "
                            "그 보정으로 바꿉니다. 처음에는 리타게팅 8번이라 몇 분 걸리고, 다음부터는 바로 나옵니다")
             rec.clicked.connect(lambda: self.win.recommend_retarget(item))
+            if item.metrics.get("retarget_score") is None:  # nothing to rank by: 8 retargets for nothing
+                rec.setEnabled(False)
+                rec.setToolTip("리타게팅 점수를 잴 수 없는 모션이라 추천할 수 없습니다")
             text = retarget_text(now[0], r.get("swing_clearance_cm", 0.0), now[2])
             fold = self._fold(f"보정: {'없음' if text == '보정 없음' else text}", "retarget", rec,
                               "이 모션만 다른 보정으로 다시 리타게팅합니다. 새로 여는 모션의 보정은 리타게팅 메뉴에서 정합니다")
@@ -2378,7 +2405,8 @@ LABEL_SOURCES = {"file": "파일", "auto": "자동"}  # where a row's labels cam
 # the header's right-click menu (the user's picks are kept)
 BATCH_SHOWN = ("name", "folder", "duration_s", "retarget_score", "qc", "main_loss", "problems_s", "worst_problem")
 BATCH_WHEN_FILLED = ("objects", "hand_obj_reach_pct", "labels", "label_segments", "phys_falls", "phys_first_cause",
-                     "phys_harness_pct", "phys_ok", "error")
+                     "phys_harness_pct", "phys_ok", "phys_error", "error", "props_error", "take_warning",
+                     "file_warnings")
 
 
 class BatchModel(QAbstractTableModel):
@@ -2409,7 +2437,7 @@ class BatchModel(QAbstractTableModel):
             return (1, 0.0, "") if v is None or v == "" else (0, float(v), "") if isinstance(v, (int, float)) else (0, 0.0, str(v))
         if role == Qt.ToolTipRole:
             return "\n".join(x for x in (r.get("file"), r.get("error"), r.get("qc_notes"), r.get("phys_ok"),
-                                         r.get("phys_error"),
+                                         r.get("phys_error"), r.get("props_error"),
                                          f"넘어짐 원인: {r['phys_fall_causes']}" if r.get("phys_fall_causes") else "") if x)
         if role == Qt.ForegroundRole:
             if r.get("error"):
@@ -2740,6 +2768,9 @@ class DatasetPanel(QWidget):
 
     def _export_done(self, m: dict | None, out: str) -> None:
         self._end()
+        err = (m or {}).get("error", "?") if not m or m.get("error") else ""
+        if self._close_after(f"데이터셋 내보내기 {f'못함 ({err})' if err else '멈춤' if m.get('stopped') else '끝'}: {out}"):
+            return
         if not m or m.get("error"):
             QMessageBox.warning(self, "데이터셋 내보내기", f"내보내지 못했습니다: {(m or {}).get('error', '?')}")
             return
@@ -2767,6 +2798,16 @@ class DatasetPanel(QWidget):
         self._show_totals()
         t = batch.totals(self.model.rows)
         self.win.status(f"일괄 처리 {'멈춤' if self._stop else '끝'}: 모션 {t['read']}개 · 오류 {t['errors']}개", 8000)
+        self._close_after("일괄 처리 멈춤")
+
+    def _close_after(self, what: str) -> bool:
+        """종료 was asked while this ran (EditorWindow.closeEvent): close the window now that it has stopped (the
+        result goes to the log, not a box). True when closing."""
+        if not getattr(self.win, "_close_pending", False):
+            return False
+        self.win.scene.log(f"{what} - 창을 닫습니다")
+        QTimer.singleShot(0, self.win.close)
+        return True
 
     _total = 0  # files of the last run
 
@@ -2784,7 +2825,7 @@ class DatasetPanel(QWidget):
         if self.physics.isChecked():
             parts.append(f"물리 넘어짐 있는 모션 {t['with_falls']}")
         parts += [f"{name} {t[k]}" for k, name in (("labelled", "라벨 있음"), ("with_objects", "물체 있음"),
-                                                   ("errors", "오류")) if t[k]]
+                                                   ("phys_errors", "물리 오류"), ("errors", "오류")) if t.get(k)]
         self.summary.setText(" · ".join(parts))
 
     def _row(self, index) -> dict:
@@ -2915,6 +2956,25 @@ def _path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
+def _score(item: Item) -> str:
+    """A motion's 리타게팅 점수 for messages; '-' when it has none (a robot motion, a C3D, a robot without limbs)."""
+    s = item.metrics.get("retarget_score")
+    return f"{s:.0f}" if isinstance(s, (int, float)) else "-"
+
+
+def _open_error(path: str, e: BaseException) -> str:
+    """'<file>: why' of a motion file that did not open (모션을 열지 못했습니다): a missing file said so; RetLens's own
+    (Korean) messages as they are, without the exception's name or the file name twice; Python's own (English) ones
+    with the exception's name, which tells what failed."""
+    name = os.path.basename(path)
+    if isinstance(e, FileNotFoundError) and e.filename and _path_key(str(e.filename)) == _path_key(path):
+        return f"{name}: 파일이 없습니다"
+    msg = str(e).strip()
+    if not any("가" <= ch <= "힣" for ch in msg):
+        msg = f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+    return msg if msg.startswith(name) else f"{name}: {msg}"
+
+
 def _pick_label_file(files: list[str], source: str) -> str:
     """Of the label files dropped with one motion, the one opening it would pick (its own names
     first, in motion_labels' order), else the first dropped."""
@@ -2966,11 +3026,15 @@ OK_COLOR, WARN_COLOR, BAD_COLOR = "#5cb85c", "#e0a030", "#e05050"
 
 
 def same_robot_spec(a: str, b: str) -> bool:
-    """Do two robot specs (registry key or model path) name the same model file?"""
-    def norm(s):
-        return s if not s or s in ("unitree_g1", "unitree_g1_with_hands") else os.path.normcase(os.path.abspath(s))
+    """Do two robot specs (registry key or model path) name the same model file? A path to a shipped G1 file is
+    that built-in model's key, and '' the built-in G1 (robot_profile.canonical), as loading them treats them."""
+    from ..robot_profile import BUILTIN_FILES, canonical
 
-    return norm(a or "unitree_g1") == norm(b or "unitree_g1")
+    def norm(s):
+        s = canonical(s)
+        return s if s in BUILTIN_FILES else os.path.normcase(os.path.abspath(s))
+
+    return norm(a) == norm(b)
 
 
 def check_html(c: settings.Check) -> str:
@@ -3001,7 +3065,8 @@ class SettingsDialog(QDialog):
         ("video", "동영상 저장 폴더", None, "video_dir"),
     ]
     TIPS = {"robot": "리타게팅하고 보여 주는 로봇입니다. 아무 휴머노이드의 MJCF(.xml)나 URDF(.urdf)를 고르면 다리·팔·발과 "
-                     "관절 역할을 모델에서 찾습니다(떠 있는 몸통, 다리 둘, 팔 둘이 있어야 함). 비우면 내장 Unitree G1. "
+                     "관절 역할을 모델에서 찾습니다(떠 있는 몸통, 다리 둘, 팔 둘이 있어야 함). 내장 로봇은 이름으로 적습니다: "
+                     "unitree_g1 (내장 Unitree G1, 비우면 이것), unitree_g1_with_hands (G1 + Dex3 손). "
                      "바꾸면 다시 시작할 때 적용됩니다.",
             "isaac": "동영상 저장과 물리 모드의 '보조 힘 (Isaac)'에 씁니다. 설치 폴더(python.bat이 있는 곳)나 python.bat을 "
                      "고르세요.",
@@ -3126,9 +3191,15 @@ class SettingsDialog(QDialog):
         open_data = QPushButton("열기")
         open_data.clicked.connect(lambda: self.win.open_path(app_paths.user_dir()))
         pf.addWidget(open_data, len(rows), 2)
+        # settings.json that could not be read as it is (settings.check_all adds the check only then)
+        self.settings_file_head = QLabel("<b>설정 파일</b>")
+        self.settings_file_status = QLabel()
+        self.settings_file_status.setWordWrap(True)
+        pf.addWidget(self.settings_file_head, len(rows) + 1, 0)
+        pf.addWidget(self.settings_file_status, len(rows) + 1, 1, 1, 2)
         from .. import __version__, install
 
-        r = len(rows) + 1
+        r = len(rows) + 2
         pf.addWidget(QLabel("<b>버전</b>"), r, 0)
         where = ("설치됨: " + install.install_dir() if install.is_installed() else
                  "설치하지 않고 실행 중: " + (install.program_dir() or "") if app_paths.FROZEN else "저장소에서 실행 중")
@@ -3181,7 +3252,7 @@ class SettingsDialog(QDialog):
                       "video": settings.video_dir(auto)}
         for key, _, _, _ in self.ROWS:
             if key == "robot":
-                self.edits[key].setPlaceholderText("비우면 내장 Unitree G1")
+                self.edits[key].setPlaceholderText("비우면 내장 Unitree G1 · 손 달린 G1: unitree_g1_with_hands")
             elif key == "robot_usd":
                 self.edits[key].setPlaceholderText("비우면 NVIDIA 에셋 서버의 Unitree G1 (인터넷 필요)")
             else:
@@ -3191,6 +3262,11 @@ class SettingsDialog(QDialog):
                 self.fetch[key].setVisible(not checks[key].ok)
         for key, st in self.prog_status.items():
             st.setText(check_html(checks[key]))
+        bad = checks.get("settings")
+        self.settings_file_head.setVisible(bad is not None)
+        self.settings_file_status.setVisible(bad is not None)
+        if bad is not None:
+            self.settings_file_status.setText(check_html(bad))
         self.libs.clear()
         defaults = app_paths.library_roots()
         for d in settings.library_dirs(s):
@@ -3516,6 +3592,8 @@ class EditorWindow(QMainWindow):
         self._eula = accept_eula or self.settings.value("isaac/eula_accepted", False, type=bool)
         scene.runner.accept_eula = self._eula
         self._loading = 0
+        self._load_done = self._load_total = self._load_cancelled = 0  # 열기 n/m in the status bar while files load
+        self._load_cancel = threading.Event()  # 작업 취소: the files not started yet are left (a new Event after)
         self._pending_labels: dict[str, list[str]] = {}  # label files dropped with their motion, by that file (_path_key)
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
@@ -3537,6 +3615,8 @@ class EditorWindow(QMainWindow):
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(5000)
         self.console.setFont(QFont("Consolas", 9))
+        QApplication.instance().installEventFilter(_ListDeleteKey(
+            [self.project, self.analysis, self.compare_panel, self.dataset, self.console], self))
         self.docks: dict[str, QDockWidget] = {}
         self._build_docks()
         self._build_actions()
@@ -3689,7 +3769,8 @@ class EditorWindow(QMainWindow):
         self.a_physics = act("물리 모드", self.set_physics, "P", checkable=True,
                              tip="로봇을 물리 시뮬레이션 결과로 그립니다 (P). ▾에서 균형 제어를 고릅니다")
         self.a_cancel = act("작업 취소", lambda: self.cancel_all(), icon=QStyle.SP_BrowserStop,
-                            tip="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화, 여는 중인 작업 세션을 멈춥니다")
+                            tip="대기 중이거나 돌고 있는 물리 계산(Isaac·MuJoCo)과 동영상 녹화, 여는 중인 작업 세션과 "
+                                "모션 파일(지금 여는 파일 다음부터)을 멈춥니다")
         self.a_session_open = act("작업 세션 열기...", self.open_session_dialog, "Ctrl+Shift+O")
         self.a_session_save = act("작업 세션 저장", lambda: self.save_session(), "Ctrl+S",
                                   tip="열린 모션(보정·시간 오프셋·보이기·라벨과 고친 라벨), 겹쳐 비교, 씬 설정, 물리 모드, "
@@ -4298,13 +4379,21 @@ class EditorWindow(QMainWindow):
         shown = sc.shown(it)
         falls = [t for t, _c in sc.falls(it) if t <= it.robot.duration] if shown is not it else None
         stem = os.path.splitext(os.path.basename(it.source))[0]
-        dlg = export_dialogs.MotionExportDialog(
-            self, self.settings, it.label, it.robot.duration,
-            (f"{seg.track}: {seg.label}" if seg.track else seg.label, seg.start, seg.end) if seg is not None else None,
-            None if falls is None else len(falls), os.path.dirname(it.source))
-        if dlg.exec() != QDialog.Accepted:
-            return
-        out = dlg.folder.path()
+        picked = None if seg is None else (f"{seg.track}: {seg.label}" if seg.track else seg.label, seg.start, seg.end)
+        while True:  # a folder where it would write over the motion's own files: said, and the dialog again
+            dlg = export_dialogs.MotionExportDialog(
+                self, self.settings, it.label, it.robot.duration, picked, None if falls is None else len(falls),
+                os.path.join(os.path.dirname(it.source), "retlens_export"))  # not beside the source: never over it
+            if dlg.exec() != QDialog.Accepted:
+                return
+            out = dlg.folder.path()
+            why = self._export_overwrites(it, out, stem, dlg)
+            if why is None:
+                return
+            if why:
+                QMessageBox.warning(self, "로봇 모션 내보내기", why)
+                continue
+            break
         if not export_dialogs.confirm_folder(self, out, "로봇 모션 내보내기"):
             return
         try:
@@ -4312,7 +4401,8 @@ class EditorWindow(QMainWindow):
                 it.robot, out, stem, labels=it.labels if dlg.labels.isChecked() else None, cut=dlg.cut.value(),
                 qc_bad=dataset.qc_bad_spans(it.robot, sc.limits), problems=it.metrics.get("_problems") or {},
                 falls=falls or [], range_s=dlg.range_s(), formats=dlg.formats.value(), limits=sc.limits,
-                info={"retarget": it.retarget or None, "kind": it.kind, "source_sha256": dataset.sha256(it.source)})
+                info={"retarget": it.retarget or None, "kind": it.kind, "source_sha256": dataset.sha256(it.source)},
+                source=it.source, fk=sc.fk)  # fk: each piece's QC with the balance check, as the window shows
         except Exception as e:
             QMessageBox.warning(self, "로봇 모션 내보내기", f"{type(e).__name__}: {e}")
             return
@@ -4326,6 +4416,42 @@ class EditorWindow(QMainWindow):
             text += f"\n외 {n - 12}개" if n > 12 else ""
         self.status(f"로봇 모션 내보내기: {it.label} → {out} ({n}개)", 8000)
         export_dialogs.report(self, "로봇 모션 내보내기", f"{out}\n\n{text}", out, self.open_path)
+
+    def _export_overwrites(self, it: Item, out: str, stem: str, dlg) -> str | None:
+        """Before 로봇 모션 내보내기 writes the whole motion into out as <stem>.<format>, <stem>.json and
+        <stem>.labels.csv: '' when it may; why not when one of them is the motion's own file (the source, a C3D's
+        solved motion) or a label file its labels must not go over; None when the user would not overwrite a label
+        file that would lose something (asked as 라벨 CSV로 저장 asks). A part of the motion has a name of its own."""
+        r, fps = dlg.range_s(), it.robot.fps
+        if r is not None and (r[0] > 1.0 / fps or r[1] < it.robot.duration - 1.0 / fps):
+            return ""  # <stem>_<start>-<end>s
+        solved = it.info.get("solved_motion")
+        # one file however spelled (8.3 short names too)
+        key = lambda p: os.path.normcase(os.path.realpath(p))  # noqa: E731
+        own = {key(p) for p in (it.source, solved) if p}
+        base = os.path.join(out, stem)
+        if any(key(p) in own for p in [f"{base}.{f}" for f in dlg.formats.value()] + [base + ".json"]):
+            return f"원본 파일을 덮어쓰게 됩니다:\n{it.source}\n\n다른 폴더를 고르세요."
+        lab, path = it.labels, base + ".labels.csv"
+        if not dlg.labels.isChecked() or lab is None or not lab.segments or not os.path.exists(path):
+            return ""
+        why = motion_labels.overwrite_problem(path, it.source, [solved] if solved else ())
+        if why:
+            return f"라벨을 이 파일에 쓰지 않습니다:\n{path}\n\n{why}\n\n다른 폴더를 고르거나 '라벨 함께'를 끄세요."
+        losses = motion_labels.overwrite_losses(path, lab)
+        loaded = bool(lab.path) and not lab.auto and key(path) == key(lab.path)
+        if not losses and not loaded:  # an earlier export's labels: replaced like its other files
+            return ""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("라벨 덮어쓰기")
+        box.setText(("이 모션이 불러온 라벨 파일입니다" if loaded else "이미 있는 라벨 파일입니다") + f":\n{path}\n\n"
+                    "내보내는 라벨로 덮어쓸까요? 원래 내용은 되돌릴 수 없습니다."
+                    + ("\n\n덮어쓰면 잃는 것:\n" + "\n".join(f"· {x}" for x in losses) if losses else ""))
+        yes = box.addButton("덮어쓰기", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.exec()
+        return "" if box.clickedButton() is yes else None
 
     # ---------------------------------------------------------------- labels (retlens.motion_labels)
     def add_label_actions(self, m: QMenu, it: Item) -> None:
@@ -4530,15 +4656,15 @@ class EditorWindow(QMainWindow):
         if item.handles.get("ui_busy"):
             return
         item.handles["ui_busy"] = True
+        was_ref = self.analysis.ref_item() is item  # the 분석 tab's 기준 follows it to the new motion
         self.status(f"{item.label}: 다시 리타게팅 중 ({retarget_text(foot_flat, swing_clearance_cm, self_collision)}; "
                     "처음 쓰는 보정이면 수십 초)")
 
         def work():
             try:
                 new = self.scene.retarget_again(item, foot_flat, swing_clearance_cm, self_collision)
-                done = lambda: (self.select(new), self.status(  # noqa: E731
-                    f"{new.label}: 다시 리타게팅함 · 점수 {item.metrics.get('retarget_score', 0):.0f} → "
-                    f"{new.metrics.get('retarget_score', 0):.0f}", 10000))
+                done = lambda: (self.select(new), self._analysis_ref_follows(new, was_ref),  # noqa: E731
+                                self.status(f"{new.label}: 다시 리타게팅함 · 점수 {_score(item)} → {_score(new)}", 10000))
             except Exception as e:
                 item.handles.pop("ui_busy", None)
                 done = lambda e=e: self.status(f"{item.label}: 다시 리타게팅하지 못함 ({type(e).__name__}: {e})", 10000)  # noqa: E731
@@ -4567,14 +4693,23 @@ class EditorWindow(QMainWindow):
 
         threading.Thread(target=work, daemon=True, name="recommend-retarget").start()
 
+    def _analysis_ref_follows(self, new: Item, was_ref: bool) -> None:
+        """다시 리타게팅 put new in the old motion's place: the 분석 tab's 기준 too, when it was the old one."""
+        i = self.analysis.ref.findData(id(new))
+        if was_ref and i >= 0 and self.analysis.ref.currentIndex() != i:
+            self.analysis.ref.setCurrentIndex(i)
+
     def _offer_recommendation(self, item: Item, ranked: list[dict]) -> None:
         r = item.retarget
         now = retarget_text(r.get("foot_flat", False), r.get("swing_clearance_cm", 0.0), r.get("self_collision", False))
         best = ranked[0]
+        if best["score"] is None:  # no combination could be scored (no human limbs to compare with)
+            self.status(f"{item.label}: 리타게팅 점수를 잴 수 없는 모션이라 추천할 수 없습니다", 10000)
+            return
         lines = "\n".join(f"{c['score']:.0f}점  {c['text']}" if c["score"] is not None else f"-  {c['text']}" for c in ranked)
         box = QMessageBox(self)
         box.setWindowTitle("추천 보정")
-        box.setText(f"{item.label}\n\n지금: {now} · {item.metrics.get('retarget_score', 0):.0f}점\n"
+        box.setText(f"{item.label}\n\n지금: {now} · {_score(item)}점\n"
                     f"추천: {best['text']} · {best['score']:.0f}점\n\n보정 조합별 리타게팅 점수:\n{lines}")
         apply = box.addButton("추천 보정으로 다시 리타게팅", QMessageBox.AcceptRole)
         box.addButton("닫기", QMessageBox.RejectRole)
@@ -4595,27 +4730,86 @@ class EditorWindow(QMainWindow):
             self.status(f"{it.label}: {PROBLEM_NAMES.get(kind, kind)} {t - it.offset:.2f}s", 6000)
 
     def add_paths(self, paths: list[str]) -> None:
-        """Load motion files in the background (retargeting can take tens of seconds)."""
-        paths = [p for p in paths if p]
+        """Load motion files in the background (retargeting can take tens of seconds), one after another (열기 n/m in
+        the status bar; 작업 취소 leaves the ones not started). A take's prop FBX is drawn with its person's motion,
+        not opened as one (_without_props)."""
+        paths, notes = self._without_props([p for p in paths if p])
         if not paths:
+            if notes:
+                self.status(notes, 10000)
             return
         self._loading += len(paths)
-        self.status(f"불러오는 중: {', '.join(os.path.basename(p) for p in paths)} (처음 리타게팅하는 사람 모션이면 수십 초)")
+        self._load_total += len(paths)
+        cancel = self._load_cancel
+        self.status(f"불러오는 중: {', '.join(os.path.basename(p) for p in paths)} (처음 리타게팅하는 사람 모션이면 수십 초)"
+                    + (f" · {notes}" if notes else ""))
+        self._refresh_status()
 
         def work():
             for p in paths:
+                if cancel.is_set():  # 작업 취소: not opened, and nothing to say about it but the count
+                    self.bridge.added.emit((p, None))
+                    continue
                 try:
-                    self.bridge.added.emit(self.scene.add(p))
+                    if not os.path.exists(p):
+                        raise FileNotFoundError(2, "No such file or directory", p)
+                    self.bridge.added.emit((p, self.scene.add(p)))
                 except Exception as e:
                     import traceback
 
                     traceback.print_exc()  # the whole story goes to the console / log file
-                    self.bridge.added.emit((p, f"{os.path.basename(p)}: {type(e).__name__}: {e}"))
+                    self.bridge.added.emit((p, _open_error(p, e)))
 
         threading.Thread(target=work, daemon=True, name="add-motion").start()
 
+    def _without_props(self, paths: list[str]) -> tuple[list[str], str]:
+        """(the paths without a take's prop FBX files (retlens.props), what was left out and why): a prop file opened
+        with its person's FBX is drawn with that motion; one opened alone has no person to retarget, which is said
+        here instead of after a Blender run. A copy the person does not use (another file of the same name is drawn)
+        is left out with that reason. A prop file not named as one is opened (and says so) as before."""
+        from .. import props
+
+        fbx = [p for p in paths if p.lower().endswith(".fbx")]
+        if not fbx:
+            return paths, ""
+        try:
+            is_prop = {p: props.is_prop_file(p) for p in fbx}
+            used, copies = set(), {}  # drawn with a person; {not-used copy: why (같은 이름의 <folder> 파일을 씀)}
+            for p in fbx:
+                if not is_prop[p]:
+                    files, skipped = props.find_props(p)
+                    used |= {_path_key(f) for f in files}
+                    for s in skipped:
+                        copies.setdefault(_path_key(s["file"]), s["skipped"])
+        except Exception as e:  # noqa: BLE001  a folder that cannot be read: opened as given
+            self.scene.log(f"prop files not checked: {type(e).__name__}: {e}")
+            return paths, ""
+        with_person = [p for p in fbx if _path_key(p) in used]  # another person may use a copy one person skips
+        unused = [p for p in fbx if _path_key(p) not in used and _path_key(p) in copies]
+        alone = [p for p in fbx if is_prop[p] and _path_key(p) not in used and _path_key(p) not in copies]
+        if not with_person and not unused and not alone:
+            return paths, ""
+        names = lambda ps: ", ".join(os.path.basename(p) for p in ps)  # noqa: E731
+        where = ", ".join(os.path.join(os.path.basename(os.path.dirname(p)), os.path.basename(p)) for p in unused)
+        why = "; ".join(dict.fromkeys(copies[_path_key(p)] for p in unused))  # 같은 이름의 <folder> 파일을 씀
+        notes = ([f"물체 파일 {names(with_person)}은(는) 같은 촬영의 사람 모션과 함께 그립니다"] if with_person else []) + \
+                ([f"물체 파일 {where}은(는) 그리지 않습니다 (같은 촬영의 사람 모션은 {why})"] if unused else []) + \
+                ([f"{names(alone)}은(는) 물체만 든 FBX라 따로 열지 않습니다. 같은 촬영의 사람 모션 FBX를 열면 함께 그립니다"]
+                 if alone else [])
+        left = {_path_key(p) for p in with_person + unused + alone}
+        for k in left:
+            self._pending_labels.pop(k, None)  # a label file dropped for it goes nowhere
+        for n in notes:
+            self.scene.log(n)
+        return [p for p in paths if _path_key(p) not in left], " · ".join(notes)
+
     def _on_added(self, result) -> None:
-        self._loading = max(0, self._loading - 1)
+        """add_paths' (file, its Item or why it did not open; None: 작업 취소 came first), or an Item the API opened
+        (not one of the files counted in 열기 n/m)."""
+        if isinstance(result, tuple):
+            self._loading = max(0, self._loading - 1)
+            self._load_done += 1
+            path, result = result
         if isinstance(result, Item):
             self.status(f"추가됨: {result.label}", 5000)
             self.select(result)
@@ -4627,19 +4821,33 @@ class EditorWindow(QMainWindow):
                     self.status(f"라벨 파일 {len(pending)}개를 함께 놓아 {os.path.basename(f)}만 {result.label}에 붙였습니다", 10000)
             if len(self.scene.items) == 1 or self._loading == 0:
                 self.scene.fit_camera()
+            why = None
         else:
-            path, result = result  # (the file, why it did not open)
+            why = result  # why the file did not open; None: 작업 취소 came first
             self._pending_labels.pop(_path_key(path), None)  # its label file goes nowhere else
-            self.status(f"열지 못함: {result}", 10000)
-            self.scene.log(f"failed to open: {result}")  # into the console panel and the log file
-            text = str(result)
+            if why is None:
+                self._load_cancelled += 1
+        if self._loading == 0:  # the last file of what was opening
+            if self._load_cancelled:
+                self.status(f"모션 열기를 멈췄습니다 (열지 않은 파일 {self._load_cancelled}개)", 8000)
+            self._load_done = self._load_total = self._load_cancelled = 0
+        self._refresh_status()
+        if why is not None:
+            self.status(f"열지 못함: {why}", 10000)
+            self.scene.log(f"failed to open: {why}")  # into the console panel and the log file
+            text = str(why)
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Warning)
             box.setWindowTitle("모션을 열지 못했습니다")
             box.setText(text)
             go = None
-            if any(k in text for k in ("Blender", "SMPL", "smplx", "GMR", "general_motion_retargeting", "환경 설정")):
-                go = box.addButton("환경 설정 열기", QMessageBox.AcceptRole)  # a missing tool / model: say where to set it
+            # a missing tool / model: say where to set it (a missing Blender says 환경 설정; a bad FBX says Blender).
+            # Markers of a missing model only: a format message names 'AMASS SMPL-X npz' too. The text after
+            # '<file>: ', so a file's own name (walk_smplx.npz) does not count
+            why_text = text.split(": ", 1)[-1]
+            if any(k in why_text for k in ("SMPL_MODEL_DIR", "SMPLX_", "SMPL-X 모델", "smplx", "GMR",
+                                           "general_motion_retargeting", "환경 설정")):
+                go = box.addButton("환경 설정 열기", QMessageBox.AcceptRole)
             box.addButton("닫기", QMessageBox.RejectRole)
             box.exec()
             if go is not None and box.clickedButton() is go:
@@ -4668,8 +4876,19 @@ class EditorWindow(QMainWindow):
                     self.status("작업 세션 파일과 함께 놓은 다른 파일은 열지 않았습니다", 8000)
                 QTimer.singleShot(0, lambda p=sessions[0]: self.open_session(p))
                 return
-            labels = [f for f in files if motion_labels.is_label_file(f)]  # before motions: a label table is a .csv
-            paths = [f for f in files if f not in labels and f.lower().endswith(MOTION_EXT)]
+            folders = [f for f in files if os.path.isdir(f)]
+            labels = [f for f in files if f not in folders and motion_labels.is_label_file(f)]  # before motions: a .csv
+            paths = [f for f in files if f not in folders and f not in labels and f.lower().endswith(MOTION_EXT)]
+            other = [f for f in files if f not in folders and f not in labels and f not in paths]
+            notes = []
+            if folders:  # a capture folder: to the 데이터셋 tab (opening every motion in it would take long)
+                self.dataset.add_folders(folders)
+                self.docks["dataset"].show()
+                self.docks["dataset"].raise_()
+                notes.append(f"폴더를 데이터셋 탭에 더했습니다: {', '.join(os.path.basename(f) or f for f in folders)} "
+                             "(시작을 누르면 폴더의 모션을 처리)")
+            if other:
+                notes.append(f"열 수 없는 파일: {', '.join(os.path.basename(f) for f in other)} (모션·라벨 파일이 아님)")
             alone, opened = [], [x.source for x in self.scene.items]
             for f in labels:  # dropped with its motion: attached to that file once it has loaded (_on_added)
                 motion = _motion_for_label(f, paths)
@@ -4683,7 +4902,10 @@ class EditorWindow(QMainWindow):
         else:  # rows dragged from the project panel
             paths = [self.project.files.item(i.row(), 0).data(Qt.UserRole) for i in self.project.files.selectedIndexes()
                      if i.column() == 0]
+            notes = []
         self.add_paths(paths)
+        if notes:  # after add_paths' 불러오는 중 (the status bar's 열기 n/m still shows the files opening)
+            self.status(" · ".join(notes), 10000)
 
     # ---------------------------------------------------------------- physics / video
     def accept_isaac_eula(self) -> None:
@@ -4803,6 +5025,8 @@ class EditorWindow(QMainWindow):
 
     def _on_scene(self, event: str, payload) -> None:
         if event == "items":
+            if isinstance(payload, Item):  # just opened: no longer one of the session's motions that did not open
+                self._drop_carried(payload)
             if self.selected is not None and self.selected not in self.scene.items:
                 self.select(None)
             self.a_remove_all.setEnabled(bool(self.scene.items))
@@ -4845,6 +5069,8 @@ class EditorWindow(QMainWindow):
         self.st_physics.setToolTip("\n".join(f"{it.label}: {sc.job_text(it)}" for it in list(sc.items)
                                              if not sc.is_sim_result(it)) if sc.physics_on else "")
         jobs = sc.jobs_summary()
+        if self._loading > 0:  # motion files opening (add_paths)
+            jobs = " · ".join(x for x in (f"열기 {self._load_done}/{self._load_total}", jobs) if x)
         r = self._restore
         if r is not None:  # a work session opening
             jobs = " · ".join(x for x in (f"작업 세션 {r.done}/{r.total}", jobs) if x)
@@ -4906,6 +5132,7 @@ class EditorWindow(QMainWindow):
     session_path: str | None = None  # the session file open (None: untitled)
     _session_clean = None  # session.fingerprint when it was last saved / opened (None: changed)
     _restore = None  # the session.Restore running
+    _restore_last = None  # the last one started (its worker may still end a motion after 멈춤)
     _restore_cancel = False
     _autosave_fp = None
     _autosave_at = 0.0
@@ -4914,6 +5141,20 @@ class EditorWindow(QMainWindow):
 
     def _carry_list(self) -> list:
         return getattr(self, "_carry", [])
+
+    def _drop_carried(self, item: Item) -> None:
+        """A motion opened (by hand, the API or another session) whose file is one of the work's entries that did not
+        open: that entry goes (one per motion: a session may hold a file twice), or the next save would write the
+        file twice."""
+        r = self._restore_last
+        if (r is not None and not r.finished) or item not in self.scene.items:
+            return  # a session opening (or stopped, ending the motion it was on, which it removes again): kept as is
+        key = _path_key(item.source)
+        carry = self._carry_list()
+        i = next((k for k, e in enumerate(carry) if _path_key(work.ref_text(e.get("file"))) == key), None)
+        if i is not None:
+            self._carry = carry[:i] + carry[i + 1:]
+            self._update_title()
 
     def _session_dirty(self) -> bool:
         if self._restore is not None:
@@ -4940,18 +5181,30 @@ class EditorWindow(QMainWindow):
                             "follow_s": self.analysis.follow.currentData()}
         return data
 
-    def save_session(self, path: str | None = None) -> bool:
-        """작업 세션 저장 (untitled: 다른 이름으로). Unsaved label edits go into the session file (not to CSVs)."""
+    _last_save_error = ""  # why the last save_session did not save ('' when it did)
+
+    def save_session(self, path: str | None = None, interactive: bool = True) -> bool:
+        """작업 세션 저장 (untitled: 다른 이름으로). Unsaved label edits go into the session file (not to CSVs).
+        interactive False (the API): no dialog; why it did not save is in _last_save_error."""
+        self._last_save_error = ""
         if self._restore is not None:
-            self.status("작업 세션을 여는 중에는 저장할 수 없습니다", 5000)
+            self._last_save_error = "작업 세션을 여는 중에는 저장할 수 없습니다"
+            self.status(self._last_save_error, 5000)
             return False
         path = path or self.session_path
         if path is None:
+            if not interactive:
+                self._last_save_error = "저장할 파일 이름이 없습니다"
+                return False
             return self.save_session_as()
         try:
             path = work.write(path, self.capture_session(self._session_base(path)))
         except OSError as e:
-            QMessageBox.warning(self, "작업 세션 저장", f"저장하지 못했습니다:\n{path}\n\n{e}")
+            self._last_save_error = f"{type(e).__name__}: {e}"
+            if interactive:
+                QMessageBox.warning(self, "작업 세션 저장", f"저장하지 못했습니다:\n{path}\n\n{e}")
+            else:
+                self.status(f"작업 세션을 저장하지 못했습니다: {path}", 8000)
             return False
         self.session_path = path
         self._session_clean = work.fingerprint(self.scene, self._carry_list())
@@ -5065,7 +5318,7 @@ class EditorWindow(QMainWindow):
         # relative paths start at the session file's folder; an autosave's at the folder of the session it was of
         base = self._session_base(autosave_of.get("session_path")) if autosave_of is not None else self._session_base(path)
         r = work.Restore(data, base, mode)
-        self._restore, self._restore_cancel = r, False
+        self._restore, self._restore_cancel, self._restore_last = r, False, r
         if mode == "replace":
             self.label_sel, self._carry = None, []
             self.session_path = (autosave_of or {}).get("session_path") if autosave_of is not None else path
@@ -5245,8 +5498,13 @@ class EditorWindow(QMainWindow):
         self._update_title()
 
     def cancel_all(self) -> None:
-        """작업 취소: physics and video jobs, and a session being opened (after the motion it is on)."""
+        """작업 취소: physics and video jobs, a session being opened and motion files being opened (each after the
+        motion it is on)."""
         self.scene.cancel_jobs()
+        if self._loading > 0:
+            self._load_cancel.set()
+            self._load_cancel = threading.Event()  # files opened from now on are not cancelled
+            self.status("모션 열기를 멈추는 중 (지금 파일이 끝나면)", 6000)
         if self._restore is not None:
             self._restore_cancel = True
             self.status("작업 세션 열기를 멈추는 중 (지금 모션이 끝나면)", 6000)
@@ -5322,29 +5580,58 @@ class EditorWindow(QMainWindow):
                                           f"균형 제어 (MuJoCo): GMT 추적 정책 (Apache-2.0, 공개 모델은 연구용)<br><br>"
                                           f"<b>파일 위치</b><table>{where}</table>")
 
+    _close_pending = False  # 종료 asked while the 데이터셋 tab was busy: the window closes once it has stopped
+    _close_fp = None  # the work's fingerprint (session.fingerprint) when that 종료 was answered
+
     def closeEvent(self, e):
-        if self._restore is not None and self.confirm_unsaved and QMessageBox.question(
+        # the questions below were answered then, unless the work changed while the window waited (asked again;
+        # 취소 there takes the pending close back)
+        pending = self._close_pending
+        asked = pending and work.fingerprint(self.scene, self._carry_list()) == self._close_fp
+
+        def cancel():
+            self._close_pending = False
+            e.ignore()
+            if pending:  # what was armed to run after that close (an update's restart, an uninstall) is undone too
+                self.updates.close_withdrawn()
+
+        if not asked and self._restore is not None and self.confirm_unsaved and QMessageBox.question(
                 self, "작업 세션", "작업 세션을 여는 중입니다. 지금 끄면 아직 열지 않은 모션은 열지 않고, 지금까지의 "
                                  "작업은 자동 저장에 남깁니다. 끌까요?") != QMessageBox.Yes:
-            e.ignore()
+            cancel()
             return
-        if self._restore is None and not self._confirm_session("종료하기"):  # a session file with changes
-            e.ignore()
+        if not asked and self._restore is None and not self._confirm_session("종료하기"):  # a session file with changes
+            cancel()
             return
         # untitled work: unsaved label edits asked about (a session file holds its edits; 저장 안 함 let them go)
-        if not self.session_path and self._restore is None and \
+        if not asked and not self.session_path and self._restore is None and \
                 not self._confirm_discard_labels(list(self.scene.items), "종료하면"):
+            cancel()
+            return
+        if self.dataset._running:  # its worker would die with the window, halfway through an export's folder
+            if not asked and self.confirm_unsaved and QMessageBox.question(
+                    self, "데이터셋", "데이터셋 일괄 처리·내보내기가 진행 중입니다. 종료하면 지금 모션이 끝난 뒤 멈추고 "
+                                   "창을 닫습니다. 종료할까요?") != QMessageBox.Yes:
+                cancel()
+                return
+        if self.dataset._running:  # (it may have ended while the question was up: then it closes now)
+            self._close_pending = True  # DatasetPanel._finished / _export_done close the window again
+            self._close_fp = work.fingerprint(self.scene, self._carry_list())
+            if not self.dataset._stop:
+                self.dataset._request_stop()
+            self.status("데이터셋 작업이 지금 모션에서 멈추면 종료합니다")
             e.ignore()
             return
+        self._close_pending = False
         if not self.updates.stop_for_close():  # an update downloading / installing (asked before anything stops)
-            e.ignore()
+            cancel()
             return
         setup = self._setup
         if setup is not None and setup.running:  # an install in the (maybe hidden) 설치 도우미
             name = setup.prereqs.NAMES[setup.running]
             if QMessageBox.question(self, "설치 중", f"{name}을(를) 설치하고 있습니다. 종료하면 설치가 멈춥니다"
                                     "(받던 파일은 다음에 이어 받습니다). 종료할까요?") != QMessageBox.Yes:
-                e.ignore()
+                cancel()
                 return
             setup.cancel.set()
             setup.worker.join(timeout=15)  # downloads and unpacks stop at the next chunk / file and clean up
@@ -5358,6 +5645,39 @@ class EditorWindow(QMainWindow):
         self._ticker.join(timeout=1.0)
         self.scene.shutdown()
         super().closeEvent(e)
+
+
+def _splash(icon: str, light: bool, version: str):
+    """Shown while the window is made (the robot model loaded and its meshes built take seconds): the icon, the name
+    and what it is doing (showMessage). Not on top of other windows: a question box before the window stays seen."""
+    from PySide6.QtWidgets import QSplashScreen
+
+    bg, fg = (QColor(245, 245, 247), QColor(40, 40, 44)) if light else (QColor(53, 53, 57), QColor(220, 220, 224))
+    pix = QPixmap(440, 150)
+    pix.fill(bg)
+    p = QPainter(pix)
+    if os.path.isfile(icon):
+        p.drawPixmap(24, 27, QPixmap(icon).scaled(96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    p.setPen(fg)
+    font = QFont()
+    font.setPointSize(20)
+    font.setBold(True)
+    p.setFont(font)
+    p.drawText(140, 66, f"{APP_NAME} {version}")
+    font.setPointSize(10)
+    font.setBold(False)
+    p.setFont(font)
+    p.drawText(140, 92, APP_TAGLINE)
+    p.end()
+    splash = QSplashScreen(pix)
+
+    def say(text: str) -> None:
+        splash.showMessage(text, Qt.AlignBottom | Qt.AlignRight, fg)
+        QApplication.processEvents()
+
+    splash.show()
+    say("로봇 모델 불러오는 중...")
+    return splash, say
 
 
 def run(argv=None) -> int:
@@ -5401,6 +5721,7 @@ def run(argv=None) -> int:
     if not args.light:
         app.setPalette(dark_palette())
     runtime.install_error_hooks()  # uncaught errors: log + dialog
+    splash, say = _splash(icon, args.light, __version__)  # the window comes seconds later
 
     def log(msg: str) -> None:
         print(f"[editor] {msg}", flush=True)
@@ -5419,16 +5740,21 @@ def run(argv=None) -> int:
                 load_robot(opts.robot).parts
             except Exception as e:
                 log(f"robot model {opts.robot} unusable ({type(e).__name__}: {e}); starting with the built-in G1")
+                splash.hide()  # not over the question
                 QMessageBox.warning(None, APP_NAME, "환경 설정의 로봇 모델을 쓸 수 없어 내장 Unitree G1로 시작합니다.\n\n"
                                     f"{opts.robot}\n{type(e).__name__}: {e}\n\n"
                                     "파일 > 환경 설정 > 로봇 모델에서 고치거나 비우세요.")
+                splash.show()
+                say("로봇 모델 불러오는 중...")
                 opts.robot = "unitree_g1"
         urdf = load_robot_drawing(opts.robot, opts.urdf, args.mesh_cell, log=log)
     except Exception as e:  # without the robot model nothing can be shown: say why instead of vanishing
+        splash.close()
         robot = next(c for c in settings.check_all() if c.key == "robot")
         QMessageBox.critical(None, APP_NAME, f"로봇 모델을 불러오지 못해 시작할 수 없습니다.\n\n{opts.urdf or opts.robot}\n"
                                              f"{type(e).__name__}: {e}\n\n{robot.hint}")
         return 1
+    say("창을 여는 중...")
     server = viser.ViserServer(host="127.0.0.1", port=port, label=APP_NAME, verbose=False)
     scene = MotionScene(server, urdf, opts, log=log)
     if args.body_mesh:
@@ -5440,6 +5766,7 @@ def run(argv=None) -> int:
     win.auto_setup = args.quit_after <= 0  # smoke tests must not stop at the first-start 환경 설정
     win.confirm_unsaved = args.quit_after <= 0  # nor at a question about unsaved label edits
     win.show()
+    splash.finish(win)
     if args.physics:
         win.a_physics.setChecked(True)
     win.startup_inputs = [os.path.abspath(p) for p in args.inputs]  # (an install hands them to the installed copy)

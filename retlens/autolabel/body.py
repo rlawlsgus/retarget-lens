@@ -27,7 +27,7 @@ BALL = 0.152 / 2  # ankle to the ball of the foot / stature: half the foot lengt
 _SMPL = {"pelvis": "pelvis", "head": "head", "spine3": "spine3",
          **{f"{s}_{j}": f"{side}_{j}" for s, side in (("l", "left"), ("r", "right"))
             for j in ("hip", "knee", "ankle", "foot", "shoulder", "elbow", "wrist")}}
-_TOES = ("LeftToeBase", "LeftToe", "LeftToes", "LToe", "lToe", "left_foot", "left_toe")
+_TOES = ("LeftToeBase", "LeftToe", "LeftToes", "LToe", "lToe", "left_foot", "left_toe", "L Toe0")
 _HEADS = ("Head", "head", "HEAD")
 
 
@@ -38,7 +38,7 @@ def joint_index(human: SkeletonMotion) -> dict[str, int]:
     lookup = {n: i for i, n in enumerate(names)}
     if all(v in lookup for v in _SMPL.values()):
         return {k: lookup[v] for k, v in _SMPL.items()}
-    from ..retarget import _HIPS_ALIASES, _LEFT_ALIASES, _right_alias, _strip_common_prefix
+    from ..retarget import _HIPS_ALIASES, _LEFT_ALIASES, _arm_chest, _right_alias, _strip_common_prefix
 
     names = _strip_common_prefix(names)
     lookup = {n: i for i, n in enumerate(names)}
@@ -62,11 +62,9 @@ def joint_index(human: SkeletonMotion) -> dict[str, int]:
         except ValueError:  # no toe joint by name: the ankle's child (a toe end site at least), else the ankle
             kids = [i for i, p in enumerate(parents) if p == idx[f"{s}_ankle"]]
             idx[f"{s}_foot"] = kids[0] if kids else idx[f"{s}_ankle"]
-    # chest = the spine joint the arm hangs from (past a clavicle / shoulder joint), as retargeting takes it
-    p = int(parents[idx["l_shoulder"]])
-    if any(k in names[p].lower() for k in ("shoulder", "clavicle", "collar")):
-        p = int(parents[p])
-    idx["spine3"] = p
+    # chest = the spine joint the arm hangs from (past clavicle / shoulder joints and a neck they hang from), as
+    # retargeting takes it
+    idx["spine3"] = _arm_chest(names, parents, idx["l_shoulder"])
     head = next((lookup[h] for h in _HEADS if h in lookup), None)
     if head is None:
         raise ValueError("머리 관절(Head)이 없습니다")

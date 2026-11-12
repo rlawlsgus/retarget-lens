@@ -107,6 +107,7 @@ class _RobotFK:
         self.cmodel.geom_conaffinity[:] = np.where(robot_geom, 1, 0)
         self.cdata = mj.MjData(self.cmodel)
         self.parent = model.body_parentid
+        self.hands: list = []  # sets of bodies of one hand (robot_profile.Parts.hand_bodies): their contacts are left out
 
     def body(self, name: str) -> int:
         b = self.mj.mj_name2id(self.model, self.mj.mjtObj.mjOBJ_BODY, name)
@@ -149,6 +150,8 @@ class _RobotFK:
                     continue
                 a, b = sorted((int(cm.geom_bodyid[c.geom1]), int(cm.geom_bodyid[c.geom2])))
                 if self.parent[a] == self.parent[b] or self.parent[b] == a or self.parent[a] == b:
+                    continue
+                if any(a in h and b in h for h in self.hands):  # fingers / palm of one hand
                     continue
                 pairs.add((a, b))
             hits.append(pairs)
@@ -206,6 +209,9 @@ def measure(human: SkeletonMotion, m: RobotMotion, robot: str, model) -> dict:
         return {}
     roles = _resolve_bvh_bodies(human.joint_names, human.parents)
     fk = _RobotFK(model)
+    prof = profile(robot)
+    fk.hands = [set(prof.parts.hand_bodies.get(s, ())) for s in ("left", "right")]  # a hand touching itself is no fault
+    fingers = prof.finger_joints()  # an open finger rests at its range's end: not a pinned joint
 
     def key(p):  # robot points are compared by value: the same joint centre in two segments
         return (p.body, tuple(np.round(p.local, 9)))
@@ -268,7 +274,7 @@ def measure(human: SkeletonMotion, m: RobotMotion, robot: str, model) -> dict:
     at_limit = np.zeros(q.shape, dtype=bool)
     for k, n in enumerate(fk.joint_names):
         i = jcol.get(n)
-        if i is not None and np.isfinite(fk.lo[k]) and np.isfinite(fk.hi[k]):
+        if i is not None and n not in fingers and np.isfinite(fk.lo[k]) and np.isfinite(fk.hi[k]):
             at_limit[:, i] = (q[:, i] <= fk.lo[k] + LIMIT_MARGIN) | (q[:, i] >= fk.hi[k] - LIMIT_MARGIN)
     pinned = {m.joint_names[i]: round(100 * float(at_limit[:, i].mean()), 1)
               for i in np.argsort(-at_limit.mean(0))[:3] if at_limit[:, i].any()}

@@ -96,8 +96,10 @@ KEY_BODIES = ["torso_link", "left_knee_link", "right_knee_link", "left_ankle_rol
               "left_elbow_link", "right_elbow_link", "left_rubber_hand", "right_rubber_hand"]
 CONTROLLERS = ("pd", "harness", "gmt")
 LABELS = {"pd": "제어기 없음 (PD 재생)", "harness": "골반 보조 힘 (PD 재생 + 가상 하네스)", "gmt": "추적 정책 (GMT)"}
-RESULT_VERSION = 2  # bump when run()'s metrics change meaning (cached results are made again; 1: fall diagnosis,
-# 2: a condition counts as already on only when its run starts with the window)
+RESULT_VERSION = 4  # bump when run()'s metrics change meaning (cached results are made again; 1: fall diagnosis,
+# 2: a condition counts as already on only when its run starts with the window; 3: another robot's torque limits
+# also from its motors, mesh feet; 4: a joint's own torque limit wins over its motor's, a normalized motor command
+# is no torque limit, torque_limits_missing)
 
 # fall diagnosis (retlens/diagnosis.py) at the 50 Hz control rate
 FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -225,6 +227,8 @@ class Reference:
 
     def __init__(self, root_pos, root_rot_xyzw, dof_pos, fps: float, loop: bool = False):
         self.fps = float(fps)
+        if not self.fps > 0 or len(root_pos) < 2:
+            raise ValueError("물리 검사에는 2프레임 이상, fps가 0보다 큰 모션이 필요합니다")
         self.root_pos = np.asarray(root_pos, dtype=np.float64)
         self.root_rot = np.asarray(root_rot_xyzw, dtype=np.float64)
         self.dof_pos = np.asarray(dof_pos, dtype=np.float64)
@@ -263,8 +267,9 @@ class Reference:
         col = {n: i for i, n in enumerate(m.joint_names)}
         missing = [n for n in joints if n not in col]
         if missing:
-            raise ValueError(f"{m.name}: the motion lacks {', '.join(missing[:5])}"
-                             + (" (GMT needs the G1 joints)" if joints is GMT_DOFS else " (a motion for another robot?)"))
+            raise ValueError(f"{m.name}: 모션에 {', '.join(missing[:5])} 관절이 없습니다"
+                             + (" (MuJoCo의 G1 모델은 G1의 관절이 필요합니다. 다른 로봇의 모션인가요?)" if joints is GMT_DOFS
+                                else " (다른 로봇의 모션인가요?)"))
         dof = m.dof_pos[:, [col[n] for n in joints]]
         xyzw = np.concatenate([m.root_quat[:, 1:4], m.root_quat[:, :1]], axis=1)
         return cls(m.root_pos, xyzw, dof, m.fps, loop=loop)
@@ -364,6 +369,7 @@ class G1Sim:
     foot_names = FEET
     knee_names = KNEES
     tau_lim = TORQUE_LIMIT
+    no_torque_limit = ()  # joints the model gives no torque limit (1000 N m assumed)
 
     def __init__(self, model_path: str, controller: str, policy_path: str | None = None,
                  physics_config: str | None = None):
@@ -549,7 +555,8 @@ class RobotSim(G1Sim):
             raise ValueError("GMT's tracking policy is trained for the G1; another robot runs pd or harness")
         self.mj, self.controller = mujoco, controller
         prof = load(robot)
-        parts = prof.parts
+        parts = prof.parts  # refuses a robot whose feet have no sole points (robot_profile.derive)
+        motor_lim = _motor_limits(prof.model())
         spec = prof.spec()
         if not any(g.type == mujoco.mjtGeom.mjGEOM_PLANE for g in spec.worldbody.geoms):
             spec.worldbody.add_geom(type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 1])
@@ -573,9 +580,15 @@ class RobotSim(G1Sim):
         role.update({j: "waist" for j in parts.waist})
         jid = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n) for n in names]
         kp, kd, lim = np.zeros(len(names)), np.zeros(len(names)), np.zeros(len(names))
+        self.no_torque_limit = []
         for i, j in enumerate(jid):
             kp[i], kd[i] = _gain(cfg, ROLE_JOINT[role.get(j, "other")])
-            lim[i] = float(m.jnt_actfrcrange[j][1]) if m.jnt_actfrclimited[j] else 1000.0
+            # the joint's own limit (actuatorfrcrange, URDF effort), else its motor's; none: 1000 N m
+            own = float(np.abs(m.jnt_actfrcrange[j]).max()) if m.jnt_actfrclimited[j] else 0.0
+            lim[i] = own if own > 0 else motor_lim.get(names[i], 0.0)
+            if not lim[i] > 0:
+                lim[i] = 1000.0
+                self.no_torque_limit.append(names[i])
         kp, kd = kp * self.gain_scale, kd * self.gain_scale
         for a in range(m.nu):  # position servos, as G1Sim's pd / harness
             m.actuator_gaintype[a] = mujoco.mjtGain.mjGAIN_FIXED
@@ -627,8 +640,41 @@ class RobotSim(G1Sim):
 
     def model_text(self) -> str:
         """What a result's json says the model was."""
+        n = len(self.no_torque_limit)
         return (f"{self.robot_name} ({len(self.joint_names)} DoF), MuJoCo 1 kHz, the G1's PD gains x {self.gain_scale:.2f} "
-                f"(mass {self.mass:.1f} kg / {G1_MASS} kg)")
+                f"(mass {self.mass:.1f} kg / {G1_MASS} kg)"
+                + (f", torque limits missing on {n} joints (1000 N m assumed: torque saturation is not judged there)"
+                   if n else ""))
+
+
+def _motor_limits(m) -> dict:
+    """{joint name: torque limit} from a model's own joint actuators (models that limit torque on the motor rather
+    than on the joint; RobotSim uses it only for a joint without its own limit): the force range times the gear
+    (MuJoCo applies gear x force to the joint), or a motor's (fixed gain, no bias) control range times its gain and
+    gear; the smaller when both apply. A normalized command (control range within +-1 at gain x gear within 1, as
+    the G1 mocap model's placeholder motors) is not a torque and gives none."""
+    import mujoco
+
+    out = {}
+    for a in range(m.nu):
+        if m.actuator_trntype[a] != mujoco.mjtTrn.mjTRN_JOINT:
+            continue
+        j = int(m.actuator_trnid[a, 0])
+        name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j)
+        gear = abs(float(m.actuator_gear[a, 0]))
+        found = []
+        if m.actuator_forcelimited[a]:
+            found.append(float(np.abs(m.actuator_forcerange[a]).max()) * gear)
+        if (m.actuator_ctrllimited[a] and m.actuator_gaintype[a] == mujoco.mjtGain.mjGAIN_FIXED
+                and m.actuator_biastype[a] == mujoco.mjtBias.mjBIAS_NONE):
+            ctrl = float(np.abs(m.actuator_ctrlrange[a]).max())
+            k = abs(float(m.actuator_gainprm[a, 0])) * gear
+            if ctrl > 1 or k > 1:
+                found.append(ctrl * k)
+        found = [x for x in found if x > 0]
+        if name and found:
+            out[name] = min(min(found), out.get(name, np.inf))
+    return out
 
 
 class FallProbe:
@@ -821,6 +867,8 @@ def run(sim: G1Sim, ref: Reference, hold_s: float = 1.0, grace_s: float = 0.5, h
         "policy_correction_deg": round(float(np.degrees(np.mean(np.abs(corr)))), 2) if corr else None,
         "torque_saturated_ratio": round(sat[True] / max(steps[True], 1), 4),
         "hold_torque_saturated_ratio": round(sat[False] / steps[False], 4) if steps[False] else None,
+        # joints without a torque limit (1000 N m assumed): saturation is not judged there
+        "torque_limits_missing": len(sim.no_torque_limit),
     }
     if harness:
         metrics.update(harness_metrics(sim, np.array(pull_f), np.array(pull_f_max), np.array(pull_t),

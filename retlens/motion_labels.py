@@ -35,11 +35,12 @@ from __future__ import annotations
 
 import bisect
 import csv
+import errno
 import io
 import json
 import math
 import os
-import tempfile
+import secrets
 from dataclasses import dataclass, field, replace
 
 SUFFIXES = (".labels.csv", ".labels.json", "_labels.csv", "_labels.json", "_subtask.csv")
@@ -398,13 +399,31 @@ def _load(path: str, sources: list[str], fps: float, duration: float | None, tab
     return lab
 
 
+def temp_file(folder: str, prefix: str, suffix: str) -> tuple[int, str]:
+    """A new file in folder (os.open's descriptor, its path), as tempfile.mkstemp. On Windows mkstemp tries
+    another name after every PermissionError while os.access calls the folder writable, which only reads its
+    read-only flag: in a folder that refuses new files (C:\\, a share) it never returns. This raises instead."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0)
+    for _ in range(20):
+        name = os.path.join(folder, f"{prefix}{secrets.token_hex(4)}{suffix}")
+        try:
+            return os.open(name, flags, 0o600), name
+        except FileExistsError:
+            continue
+        except PermissionError:
+            if os.path.isdir(name):  # a folder of that name (Windows says denied): another name
+                continue
+            raise
+    raise FileExistsError(errno.EEXIST, "no free temporary file name", folder)
+
+
 def save_csv(lab: MotionLabels, path: str) -> str:
     """Write the segments as a label file (UTF-8 with BOM, so Excel reads the Korean); it reads back
     with load to the same segments. Times are written in full: rounded, a boundary on frame k/30
     (2.2666...) could read back after its frame (2.2667) and move it to the neighbour. Written to a
     temporary file next to it first: a failed write (the file open in Excel) leaves the old one."""
     folder = os.path.dirname(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(prefix=".labels-", suffix=".tmp", dir=folder)
+    fd, tmp = temp_file(folder, ".labels-", ".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
@@ -557,6 +576,8 @@ def added(lab: MotionLabels | None, track: str, t: float, fps: float, duration: 
     label = str(label).strip()
     if not label:
         raise ValueError("라벨 이름이 비었습니다")
+    if not math.isfinite(t):  # NaN (the API's JSON) is under no segment: a new one over the whole track
+        raise ValueError("재생 위치가 숫자가 아닙니다")
     usable = lab if lab is not None and not lab.error else None
     segs_on = lane(usable, track)
     if any(s.start - EPS <= t < s.end for s in segs_on):

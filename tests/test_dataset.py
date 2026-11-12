@@ -95,8 +95,8 @@ def test_export_motion_cuts_bad_frames_and_reads_back(tmp_path):
     back = load_robot_npz(first["files"][0])
     assert back.num_frames == 95 and np.allclose(back.dof_pos, m.dof_pos[:95])
     assert back.meta["robot_ident"] == {"name": "unitree_g1", "digest": "abc"}
-    rows = np.loadtxt(first["files"][1], delimiter=",")
-    assert rows.shape == (95, 7 + 29) and np.allclose(rows[:, 3:7], m.root_quat[:95][:, [1, 2, 3, 0]], atol=1e-6)
+    rows = np.loadtxt(first["files"][1], delimiter=",")  # the csv at 30 fps (read at 30): every 3rd = every 5th at 50
+    assert rows.shape == (57, 7 + 29) and np.allclose(rows[::3, 3:7], m.root_quat[:95:5][:, [1, 2, 3, 0]], atol=1e-6)
     second = res["pieces"][1]
     found = motion_labels.load_for(second["files"][0], 50.0, second["duration_s"])  # RetLens finds them by the npz
     assert found is not None and [(s.label, round(s.start, 3), round(s.end, 3)) for s in found.segments] == \
@@ -177,6 +177,28 @@ def test_exporter_writes_what_passes_and_says_why_not(capture, tmp_path):
                          runner=runner).run(inputs)
 
 
+CMU_143_11 = os.path.join(ROOT, "data", "raw", "cmu_bvh", "143_11.bvh")
+
+
+@pytest.mark.skipif(not os.path.isfile(CMU_143_11), reason="needs data/raw/cmu_bvh (CMU 143_11)")
+def test_pieces_get_the_balance_check(tmp_path, monkeypatch):
+    """CMU 143_11 is QC WARN for standing with the CoM outside the feet only: its pieces too, as inspect says."""
+    from retlens import compare
+
+    monkeypatch.setattr(compare, "CACHE", str(tmp_path / "retarget"))  # not the user's retarget cache
+    runner = batch.Batch(batch.BatchOptions(), cache_dir=str(tmp_path / "batch"))
+    assert runner.process(CMU_143_11)["qc"] == "WARN"
+    for opts in (dataset.ExportOptions(cut=dataset.CutOptions(), qc="PASS"),
+                 dataset.ExportOptions(range_s=(0.0, 10.0), qc="PASS")):
+        m = dataset.Exporter(batch.BatchOptions(), opts, str(tmp_path / "out"), runner=runner).run([CMU_143_11])
+        assert m["clips"] == [] and any("CoM outside the feet" in e["reason"] for e in m["excluded"])
+    m = dataset.Exporter(batch.BatchOptions(), dataset.ExportOptions(), str(tmp_path / "out"), runner=runner).run(
+        [CMU_143_11])
+    assert [c["qc"] for c in m["clips"]] == ["WARN"]  # the manifest's QC is the row's
+    with open(tmp_path / "out" / m["clips"][0]["info"], encoding="utf-8") as f:
+        assert json.load(f)["qc"] == "WARN"
+
+
 @needs_samples
 def test_cli_export(capture, tmp_path):
     env = dict(os.environ, RETLENS_USER_DIR=str(tmp_path / "user"))
@@ -224,6 +246,13 @@ def test_export_dialogs(tmp_path):
     assert one.range_s() is None
     one.b.setValue(3.0)  # typing a time picks 직접
     assert one.range_s() == (0.0, 3.0) and not one.cut.falls.isEnabled()
+    src = tmp_path / "s01"
+    store.setValue("export/motion_folder", str(src))  # remembered by 0.10.0, whose default was the motion's own folder
+    moved = ed.MotionExportDialog(None, store, "s01/walk", 6.0, start=str(src / "retlens_export"))
+    assert moved.folder.path() == str(src / "retlens_export")  # never offered beside the source again
+    store.setValue("export/motion_folder", str(tmp_path / "picked"))
+    kept = ed.MotionExportDialog(None, store, "s01/walk", 6.0, start=str(src / "retlens_export"))
+    assert kept.folder.path() == str(tmp_path / "picked")  # any other remembered folder stays
     assert ed.manifest_text({"totals": {"exported_motions": 2, "clips": 3, "seconds": 90.0, "cut_seconds": 1.0,
                                         "short_seconds": 0.5, "excluded": 1, "excluded_by_reason": {"QC FAIL": 1}}}) \
         .startswith("모션 2개 → 파일 3개 · 1.5분")

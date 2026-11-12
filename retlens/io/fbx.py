@@ -1,8 +1,8 @@
 """FBX skeletal animation reader (through Blender's FBX importer).
 
 FBX is the native export of MotionBuilder, Vicon Shogun, OptiTrack Motive, Xsens
-MVN, Rokoko and of Blender / game-engine pipelines (Mixamo, the CMU-to-FBX
-conversions). The format is proprietary; Blender's importer (pre/post rotations,
+MVN, Rokoko, 3ds Max (Biped) and of Blender / game-engine pipelines (Mixamo, the
+CMU-to-FBX conversions). The format is proprietary; Blender's importer (pre/post rotations,
 pivots, rotation orders, units, axes, takes) is the reader here: Blender runs
 headless with blender_fbx_script.py and dumps the armature's world joint
 matrices per frame (about 2 s per clip). Dumps are cached in data/cache/fbx/.
@@ -22,6 +22,8 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import tempfile
+import threading
 
 import numpy as np
 
@@ -31,7 +33,10 @@ from .bvh import cmu_capture_fps
 
 CACHE_DIR = paths.cache_dir("fbx")  # dev: data/cache/fbx
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_fbx_script.py")  # Blender runs this file
-SCRIPT_VERSION = 2  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
+SCRIPT_VERSION = 3  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
+PROPS_VERSION = 3  # = blender_fbx_script.PROPS_VERSION (read_props)
+_DUMP_LOCKS: dict[str, threading.Lock] = {}  # one Blender run per dump at a time in this process
+_DUMP_LOCKS_GUARD = threading.Lock()
 
 # Extra factors to meters: files whose numbers are 100x off (centimetre values in a
 # meter scene, e.g. a BVH imported into Blender at scale 1) or in inches.
@@ -52,14 +57,39 @@ def find_blender() -> str:
 
 
 def run_blender(*args: str, timeout: float = 1800) -> str:
-    """Run blender_fbx_script.py in a headless Blender; returns its log, raises on failure."""
+    """Run blender_fbx_script.py in a headless Blender; returns its log, raises on failure (ValueError saying what
+    is wrong with the file when the importer says so: ASCII FBX, empty, damaged)."""
     cmd = [find_blender(), "-b", "--factory-startup", "--python-exit-code", "2", "--python", SCRIPT, "--", *args]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace",
                        stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console flash
     log = "\n".join(line for line in (r.stdout + r.stderr).splitlines() if "[blender_fbx]" in line or "Error" in line)
     if r.returncode != 0:
-        raise RuntimeError(f"Blender failed ({r.returncode}) on {args}:\n{log or r.stdout[-2000:] + r.stderr[-2000:]}")
+        raise _blender_error(args, r.returncode, log or r.stdout[-2000:] + r.stderr[-2000:])
     return log
+
+
+def _blender_error(args: tuple, code: int, log: str) -> Exception:
+    """The error of a failed Blender run on args (mode, input, ...): the importer's known complaints about the
+    input file as a short ValueError, else Blender's log (each line once) without the cache file paths."""
+    src = args[1] if len(args) > 1 else ""
+    name = os.path.basename(src) or "?"
+    if "ASCII FBX files are not supported" in log:
+        try:
+            empty = os.path.getsize(src) == 0
+        except OSError:
+            empty = False
+        return ValueError(f"{name}: 빈 파일입니다" if empty else
+                          f"{name}: ASCII FBX는 읽지 못합니다. 만든 프로그램에서 바이너리 FBX로 다시 내보내세요")
+    if any(k in log for k in ("Couldn't open file", "failed to read", "Invalid FBX", "Not an FBX")):
+        return ValueError(f"{name}: FBX 파일이 손상되었거나 잘렸습니다")
+    lines = []
+    for line in log.splitlines():
+        for a in args[2:]:  # the cache's temporary output file
+            line = line.replace(a, os.path.basename(a))
+        if line.strip() and line not in lines:
+            lines.append(line)
+    return RuntimeError(f"{name}: Blender로 처리하지 못했습니다 (종료 코드 {code}, {args[0] if args else '?'}):\n"
+                        + "\n".join(lines))
 
 
 def _file_key(path: str) -> str:
@@ -72,37 +102,81 @@ def _file_key(path: str) -> str:
 
 def _orthonormal(M: np.ndarray) -> np.ndarray:
     """Rotation part of (..., 3, 3) matrices that may carry scale."""
+    if M.size == 0:
+        return np.array(M, dtype=np.float64)
     U, _, Vt = np.linalg.svd(M)
     D = np.ones(M.shape[:-1])
     D[..., -1] = np.sign(np.linalg.det(U @ Vt))
     return (U * D[..., None, :]) @ Vt
 
 
+def _dumped(mode: str, path: str, version: int, take: str | None, cache: bool) -> str:
+    """The cached Blender dump of `path` (made when missing)."""
+    path = os.path.abspath(path)
+    if os.path.getsize(path) == 0:  # (Blender would call it an ASCII FBX)
+        raise ValueError(f"{os.path.basename(path)}: 빈 파일입니다")
+    stem = os.path.splitext(os.path.basename(path))[0][:48]  # the file key tells files apart; long names hit MAX_PATH
+    tag = (f"{stem}-{_file_key(path)}-{'props-' if mode == 'props' else ''}v{version}"
+           + (f"-{hashlib.sha1(take.encode()).hexdigest()[:8]}" if take else ""))
+    out = os.path.join(CACHE_DIR, tag + ".npz")
+    if cache and os.path.isfile(out):
+        return out
+    with _DUMP_LOCKS_GUARD:
+        lock = _DUMP_LOCKS.setdefault(os.path.normcase(out), threading.Lock())
+    with lock:  # two motions of a take open together share its prop file: one Blender run, the other waits
+        if cache and os.path.isfile(out):
+            return out
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=tag[:40] + ".", suffix=".tmp.npz")  # own file per run
+        os.close(fd)
+        try:
+            run_blender(mode, path, tmp, *([take] if take else []))
+            try:
+                os.replace(tmp, out)
+            except OSError:  # another process wrote it meanwhile (or has it open): use theirs
+                if not os.path.isfile(out):
+                    raise
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    return out
+
+
+def _dumped_objects(d) -> list[dict]:
+    objects = []
+    if "obj_names" not in d:
+        return objects
+    vs, fs = d["obj_vert_start"], d["obj_face_start"]
+    for i, name in enumerate(d["obj_names"]):
+        o = {"name": str(name), "kind": str(d["obj_kinds"][i]), "mats": d["obj_mats"][:, i],
+             "vertices": d["obj_verts"][vs[i]:vs[i + 1]], "faces": d["obj_faces"][fs[i]:fs[i + 1]]}
+        if "obj_groups" in d:  # read_props
+            o.update(group=str(d["obj_groups"][i]), parent=int(d["obj_parents"][i]), bind=str(d["obj_binds"][i]),
+                     children=int(d["obj_children"][i]), below_mesh=bool(d["obj_below_mesh"][i]))
+        objects.append(o)
+    return objects
+
+
 def read_fbx(path: str, take: str | None = None, cache: bool = True) -> dict:
     """Raw armature animation of an FBX file in Blender's frame (Z-up, file scale).
 
     Returns joint (bone) names, parents, world positions (T, J, 3) and frames
-    (T, J, 3, 3), the rest pose of the same, the frame rate and the takes, and the objects:
-    [{"name", "kind", "mats" (T, 4, 4) world matrices, "vertices", "faces"} (mesh in its own frame)].
+    (T, J, 3, 3), the rest pose of the same, the frame rate, the first frame's number and the takes,
+    the objects: [{"name", "kind", "mats" (T, 4, 4) world matrices, "vertices", "faces"} (mesh in
+    its own frame)], the armature read ("armature") and the bones of the file's other armatures
+    ("other_bones": [{"name", "kind" "bone", "group" (its armature), "parent" (index in the list, -1),
+    "children", "animated", "mats" (T, 4, 4)}]). A file without an armature gives no joints.
     """
-    path = os.path.abspath(path)
-    stem = os.path.splitext(os.path.basename(path))[0][:48]  # the file key tells files apart; long names hit MAX_PATH
-    tag = f"{stem}-{_file_key(path)}-v{SCRIPT_VERSION}" + (f"-{hashlib.sha1(take.encode()).hexdigest()[:8]}"
-                                                            if take else "")
-    out = os.path.join(CACHE_DIR, tag + ".npz")
-    if not (cache and os.path.isfile(out)):
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = out[:-4] + ".tmp.npz"
-        run_blender("dump", path, tmp, *( [take] if take else []))
-        os.replace(tmp, out)
+    out = _dumped("dump", path, SCRIPT_VERSION, take, cache)
     with np.load(out, allow_pickle=False) as d:
         mats, rest = d["mats"], d["rest"]
-        objects = []
-        if "obj_names" in d:
-            vs, fs = d["obj_vert_start"], d["obj_face_start"]
-            for i, name in enumerate(d["obj_names"]):
-                objects.append({"name": str(name), "kind": str(d["obj_kinds"][i]), "mats": d["obj_mats"][:, i],
-                                "vertices": d["obj_verts"][vs[i]:vs[i + 1]], "faces": d["obj_faces"][fs[i]:fs[i + 1]]})
+        other = []
+        if "xb_names" in d:
+            xm = d["xb_mats"]
+            other = [{"name": str(n), "kind": "bone", "group": str(d["xb_groups"][i]), "parent": int(d["xb_parents"][i]),
+                      "children": int(d["xb_children"][i]), "animated": bool(d["xb_animated"][i]), "bind": "",
+                      "below_mesh": False, "mats": xm[:, i], "vertices": np.zeros((0, 3)),
+                      "faces": np.zeros((0, 3), dtype=np.int64)} for i, n in enumerate(d["xb_names"])]
         return {
             "names": [str(n) for n in d["names"]],
             "parents": d["parents"].astype(int),
@@ -111,12 +185,28 @@ def read_fbx(path: str, take: str | None = None, cache: bool = True) -> dict:
             "rest_positions": rest[:, :3, 3],
             "rest_frames": _orthonormal(rest[:, :3, :3]),
             "fps": float(d["fps"]),
+            "frame_start": int(d["frame_start"]),
             "take": str(d["take"]),
             "takes": [str(t) for t in d["takes"]],
             "reader": f"Blender {d['blender']} FBX importer",
             "cache": out,
-            "objects": objects,
+            "objects": _dumped_objects(d),
+            "armature": str(d["armature"]) if "armature" in d else "",
+            "other_bones": other,
         }
+
+
+def read_props(path: str, take: str | None = None, cache: bool = True) -> dict:
+    """Every node of a props-only FBX (blender_fbx_script dump_props), raw, in Blender's frame (Z-up, file scale):
+    {"fps", "key_fps" (frame number / key_fps = file time), "frame_start", "take" (the stack sampled), "takes",
+    "objects": [{"name", "kind" ("bone" | "empty" | "mesh"), "group" (a bone's armature, or the armature a node
+    hangs on), "parent" (index in objects, -1), "bind", "children", "below_mesh", "mats" (T, 4, 4), "vertices",
+    "faces"}]}. take: the animation stack to sample (default: the file's first)."""
+    out = _dumped("props", path, PROPS_VERSION, take, cache)
+    with np.load(out, allow_pickle=False) as d:
+        return {"fps": float(d["fps"]), "key_fps": float(d["key_fps"]), "frame_start": int(d["frame_start"]),
+                "objects": _dumped_objects(d), "take": str(d["take"]), "takes": [str(t) for t in d["takes"]],
+                "reader": f"Blender {d['blender']} FBX importer", "cache": out}
 
 
 def _auto_scale(rest_positions: np.ndarray) -> float:
@@ -161,10 +251,15 @@ def load_fbx(
         fps: frame rate. "auto" = the file's, except conversions of cgspeed CMU
             BVHs of 60 Hz trials, which keep cgspeed's 120 Hz time base.
         take: take (animation stack / action) name; default the armature's own.
-    meta["rest_pose"] = (positions (J, 3), frames (J, 3, 3)) in the same frame.
+    meta["rest_pose"] = (positions (J, 3), frames (J, 3, 3)) in the same frame. A file of several armatures
+    shows the animated one with the most bones; the others are props (_other_armatures) or, when a person's,
+    left out with meta["warnings"] saying so.
     """
     raw = read_fbx(path, take=take)
     stem = os.path.splitext(os.path.basename(path))[0]
+    if not raw["names"]:
+        raise ValueError(f"{os.path.basename(path)}: FBX에 골격(armature)이 없습니다. 물체만 든 파일이면 같은 촬영의 사람 "
+                         "모션 FBX를 여세요. 이름이 규칙에 맞으면 함께 그립니다(사용 설명서 '따로 받은 물체 FBX')")
     tpose0 = _frame0_is_rest(raw["frames"], raw["rest_frames"])
     file_fps = raw["fps"]
     if abs(file_fps - round(file_fps)) < 1e-4 * file_fps:  # 120.0048 from a rounded BVH frame time
@@ -189,6 +284,9 @@ def load_fbx(
         pos = pos - [0.0, 0.0, ground_offset]
         rest_pos = rest_pos - [0.0, 0.0, ground_offset]
     objects = [_object_track(o, s, dropped, ground_offset) for o in raw.get("objects", [])]
+    extra, warnings = _other_armatures(raw, path, s, dropped, ground_offset, len(objects))
+    objects += extra
+    meta_extra = {"warnings": warnings} if warnings else {}
     return SkeletonMotion(
         name=stem,
         joint_names=raw["names"],
@@ -198,11 +296,66 @@ def load_fbx(
         source=os.path.abspath(path),
         kind="skeleton",
         meta={"format": "fbx", "unit_scale": s, "ground_offset_m": ground_offset, "tpose_frame0": tpose0,
-              "dropped_frames": dropped, "file_fps": file_fps, "fps_note": fps_note, "take": raw["take"],
-              "takes": raw["takes"], "reader": raw["reader"], "rest_pose": (rest_pos, raw["rest_frames"])},
+              "dropped_frames": dropped, "file_fps": file_fps, "frame_start": raw["frame_start"],
+              "fps_note": fps_note, "take": raw["take"],
+              "takes": raw["takes"], "reader": raw["reader"], "rest_pose": (rest_pos, raw["rest_frames"]), **meta_extra},
         rotations=raw["frames"][dropped:] if with_rotations else None,
         objects=objects,
     )
+
+
+def _other_armatures(raw: dict, path: str, s: float, dropped: int, ground_offset: float,
+                     offset: int) -> tuple[list[ObjectTrack], list[str]]:
+    """(objects, warnings) of the file's other armatures (read_fbx "other_bones"). Another person's skeleton is not
+    read: a warning says which one is shown. An animated armature of fewer than 8 bones that is not a person (a prop a
+    mocap system wrote as a skeleton: "Ball_1" > "Ball_1:root") gives props, its bones made objects as retlens.props
+    makes those of a prop file (end sites and grouping nodes left out, shapes from a shape file or a ball's default);
+    a bigger one is left out with a warning (a face or helper rig, or a person named in a way the retarget does not
+    know: its bones are no objects for the hands to touch)."""
+    bones = raw.get("other_bones") or []
+    if not bones:
+        return [], []
+    from .. import props
+
+    groups: dict[str, list[int]] = {}
+    for i, b in enumerate(bones):
+        groups.setdefault(b["group"], []).append(i)
+    people, rigs, keep = [], [], []
+    for g, idx in groups.items():
+        pos = {b: k for k, b in enumerate(idx)}
+        if props.is_person([bones[i]["name"] for i in idx], [pos.get(bones[i]["parent"], -1) for i in idx]):
+            people.append(f"{g}(관절 {len(idx)}개)")
+        elif not bones[idx[0]]["animated"]:  # a still helper rig (camera, face) is no prop
+            continue
+        elif len(idx) >= 8:  # many bones not named like a person's (a face or helper rig): no props of it either
+            rigs.append(f"{g}(관절 {len(idx)}개)")
+        else:
+            keep += idx
+    warnings = []
+    if people:
+        warnings.append(f"이 파일에는 사람 골격이 {len(people) + 1}개 있어 {raw.get('armature') or '첫 골격'}"
+                        f"(관절 {len(raw['names'])}개)만 엽니다. 열지 않은 골격: {', '.join(people)}")
+    if rigs:
+        warnings.append(f"사람 골격으로도 물체로도 보지 않아 열지 않은 골격: {', '.join(rigs)}")
+    if not keep:
+        return [], warnings
+    pos = {b: k for k, b in enumerate(keep)}
+    objs = [{**bones[i], "parent": pos.get(bones[i]["parent"], -1), "mats": bones[i]["mats"][dropped:]} for i in keep]
+    shapes, sdir, sfile = None, "", props.shape_file(path)
+    if sfile:
+        try:
+            shapes, sdir = props.load_shapes(sfile), os.path.dirname(sfile)
+        except Exception as e:  # the props still show, without its shapes
+            warnings.append(f"물체 모양 파일 {os.path.basename(sfile)}을(를) 읽지 못함: {type(e).__name__}: {e}")
+    out = []
+    for nd in props.prop_nodes({"objects": objs}):
+        o = objs[nd["index"]]
+        M = o["mats"]
+        V, F, shape = props.node_shape(nd, o, s, shapes, sdir)
+        out.append(ObjectTrack(name=nd["name"], kind=nd["kind"], positions=M[:, :3, 3] * s - [0.0, 0.0, ground_offset],
+                               rotations=_orthonormal(M[:, :3, :3]), vertices=V, faces=F, source=os.path.abspath(path),
+                               group=nd["prop"], parent=offset + nd["parent"] if nd["parent"] >= 0 else -1, shape=shape))
+    return out, warnings
 
 
 def _object_track(o: dict, s: float, dropped: int, ground_offset: float) -> ObjectTrack:

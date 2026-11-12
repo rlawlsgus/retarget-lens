@@ -63,6 +63,34 @@ def test_daz_mixamo_and_motive_skeletons_resolve():
     assert names[idx["Spine2"]] == "Skeleton1_Chest" and names[idx["RightArm"]] == "Skeleton1_RUArm"
 
 
+def test_3dsmax_biped_skeleton_resolves():
+    """3ds Max Biped ("Bip001 L Thigh", spaces, Calf / UpperArm / Forearm), also under a take namespace."""
+    biped = [("Pelvis", None), ("Spine", "Pelvis"), ("Spine1", "Spine"), ("Spine2", "Spine1"), ("Spine3", "Spine2"),
+             ("Neck", "Spine3"), ("Head", "Neck")]
+    for s in "LR":
+        biped += [(f"{s} Clavicle", "Spine3"), (f"{s} UpperArm", f"{s} Clavicle"), (f"{s} Forearm", f"{s} UpperArm"),
+                  (f"{s} Hand", f"{s} Forearm"), (f"{s} Finger0", f"{s} Hand"), (f"{s} Finger02_End", f"{s} Finger0"),
+                  (f"{s} Thigh", "Pelvis"), (f"{s} Calf", f"{s} Thigh"), (f"{s} Foot", f"{s} Calf"),
+                  (f"{s} Toe0", f"{s} Foot")]
+    for pre in ("Bip001 ", "clip:Bip01 "):
+        names, parents = _chain([(pre + n, p and pre + p) for n, p in biped])
+        idx = _resolve_bvh_bodies(names, parents)
+        got = {k: names[v][len(pre):] for k, v in idx.items()}
+        assert got["Hips"] == "Pelvis" and got["Spine2"] == "Spine3"  # the chest is above the clavicle
+        assert got["LeftUpLeg"] == "L Thigh" and got["RightLeg"] == "R Calf" and got["LeftFoot"] == "L Foot"
+        assert got["RightArm"] == "R UpperArm" and got["LeftForeArm"] == "L Forearm" and got["RightHand"] == "R Hand"
+
+    from retlens.autolabel.body import joint_index
+    from retlens.motion import SkeletonMotion
+
+    names, parents = _chain([("Bip001 " + n, p and "Bip001 " + p) for n, p in biped])
+    h = SkeletonMotion(name="biped", joint_names=names, parents=parents, positions=np.zeros((2, len(names), 3)),
+                       fps=30.0)
+    j = joint_index(h)
+    assert names[j["l_foot"]] == "Bip001 L Toe0" and names[j["r_knee"]] == "Bip001 R Calf"
+    assert names[j["spine3"]] == "Bip001 Spine3" and names[j["head"]] == "Bip001 Head"
+
+
 def test_fbx_is_its_own_format(tmp_path):
     p = tmp_path / "clip.fbx"
     p.write_bytes(b"Kaydara FBX Binary  \x00")

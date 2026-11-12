@@ -73,43 +73,82 @@ def settings_path() -> str:
 
 
 _current: Settings | None = None
+_problem = ("", "", False)  # (settings.json, what was wrong with it when it was last read or '', not readable at all)
+_kept_aside = ""  # where save() moved a settings.json it could not read, in this run
+_warned: set = set()
+_BAD = object()
+
+
+def _value(name: str, v, default):
+    """A value from settings.json if it has the field's type (library_dirs: one folder as a string is a list of
+    one), else _BAD: a hand-edited null, number or string where another type belongs keeps the default."""
+    if name == "library_dirs":
+        v = [v] if isinstance(v, str) else v
+        return [d for d in v if isinstance(d, str) and d.strip()] if isinstance(v, list) else _BAD
+    if name == "api_port":  # the settings window's range
+        return v if isinstance(v, int) and not isinstance(v, bool) and 1024 <= v <= 65535 else _BAD
+    return v if type(v) is type(default) else _BAD
 
 
 def load(reload: bool = False) -> Settings:
-    """The saved settings (cached; defaults when there is no file or it is broken)."""
-    global _current
+    """The saved settings (cached). Defaults when there is no file; when it cannot be read (not JSON, not an
+    object) too, and check_all says so; a value of the wrong type keeps its default (said once on stderr). A
+    UTF-8 byte order mark (Notepad, PowerShell 5.1) is fine."""
+    global _current, _problem
     if _current is None or reload:
-        s = Settings()
+        s, problem, unreadable = Settings(), "", False
         try:
-            with open(settings_path(), encoding="utf-8") as f:
+            with open(settings_path(), encoding="utf-8-sig") as f:
                 data = json.load(f)
-            names = {f.name for f in fields(Settings)}
-            s = Settings(**{k: v for k, v in data.items() if k in names})
-            s.library_dirs = [str(d) for d in (s.library_dirs or []) if str(d).strip()]
-        except (OSError, ValueError, TypeError):
+            if not isinstance(data, dict):
+                raise ValueError(f"not a JSON object but {type(data).__name__}")
+            bad = []
+            for fl in fields(Settings):
+                if fl.name in data:
+                    v = _value(fl.name, data[fl.name], getattr(s, fl.name))
+                    if v is _BAD:
+                        bad.append(fl.name)
+                    else:
+                        setattr(s, fl.name, v)
+            if bad:
+                problem = f"{', '.join(bad)} 값의 형식이 맞지 않아 기본값을 씁니다"
+        except FileNotFoundError:
             pass
-        _current = s
+        except (OSError, ValueError, TypeError, AttributeError) as e:  # unreadable, not JSON or not an object
+            s, unreadable = Settings(), True
+            problem = f"설정 파일을 읽지 못해 기본값을 씁니다 ({type(e).__name__}: {e})"
+        if problem and problem not in _warned:
+            _warned.add(problem)
+            print(f"{settings_path()}: {problem}", file=sys.stderr)
+        _current, _problem = s, (settings_path(), problem, unreadable)
     return _current
 
 
 def save(s: Settings) -> None:
-    global _current
+    global _current, _kept_aside, _problem
     path = settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     data = {}
     try:  # keys this version does not know (a newer RetLens wrote them) are kept, not dropped
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             old = json.load(f)
-        if isinstance(old, dict):
-            data = {k: v for k, v in old.items() if k not in {fl.name for fl in fields(Settings)}}
-    except (OSError, ValueError):
+        if not isinstance(old, dict):
+            raise ValueError("not a JSON object")
+        data = {k: v for k, v in old.items() if k not in {fl.name for fl in fields(Settings)}}
+    except FileNotFoundError:
         pass
+    except (OSError, ValueError):  # a file that cannot be read is kept aside for the user, not overwritten
+        try:
+            os.replace(path, path + ".broken")
+            _kept_aside = path + ".broken"
+        except OSError:
+            pass
     data.update(asdict(s))
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
-    _current = s
+    _current, _problem = s, (path, "", False)  # what was wrong with the file it replaced is gone with it
 
 
 @dataclass
@@ -321,12 +360,21 @@ def find_gmt(s: Settings | None = None) -> Found:
 
 # ------------------------------------------------------------------------------ the robot
 ROBOT_EXT = (".xml", ".urdf")
+# the built-in G1 models (= retlens.robot_profile.is_builtin): Isaac replays them on NVIDIA's G1 (its hands' joints,
+# which that USD lacks, left out)
+BUILTIN_G1 = ("unitree_g1", "unitree_g1_with_hands")
 
 
 def robot_spec(s: Settings | None = None) -> str:
-    """The robot to retarget to and show: the chosen MJCF / URDF, else the built-in Unitree G1."""
+    """The robot to retarget to and show: the chosen MJCF / URDF, else the built-in Unitree G1. A chosen file
+    that is a built-in model's own (the G1 RetLens ships) is that model's key (robot_profile.canonical)."""
     s = s or load()
-    return s.robot_model.strip().strip('"') or "unitree_g1"
+    spec = s.robot_model.strip().strip('"') or "unitree_g1"
+    try:
+        from .robot_profile import canonical
+    except ImportError:  # numpy missing (only in a bare Python): the spec as it is
+        return spec
+    return canonical(spec)
 
 
 def find_robot(s: Settings | None = None) -> Found:
@@ -361,7 +409,7 @@ def find_robot_usd(s: Settings | None = None) -> Found:
     s = s or load()
     v = s.robot_usd.strip().strip('"')
     if not v:
-        if robot_spec(s) != "unitree_g1":  # NVIDIA's G1 would replay another robot's motions
+        if robot_spec(s) not in BUILTIN_G1:  # NVIDIA's G1 would replay another robot's motions
             return Found(None, "설정", problem="G1이 아닌 로봇은 그 로봇의 USD를 골라야 Isaac에서 돌릴 수 있습니다")
         return Found("", "기본 (NVIDIA 에셋 서버)", "Isaac Sim 에셋 라이브러리의 Unitree G1, 인터넷 필요")
     if "://" in v:
@@ -378,10 +426,11 @@ def video_dir(s: Settings | None = None) -> str:
 
 
 def library_dirs(s: Settings | None = None) -> list[str]:
-    """The motion folders listed in the project panel: the defaults, then the user's."""
+    """The motion folders listed in the project panel: the defaults, then the user's (full paths only: a
+    relative one, from a hand edit, would name a folder under wherever the program was started)."""
     s = s or load()
     out: list[str] = []
-    for d in [*paths.library_roots(), *s.library_dirs]:
+    for d in [*paths.library_roots(), *(d for d in s.library_dirs if os.path.isabs(d))]:
         d = os.path.abspath(d)
         if os.path.normcase(d) not in {os.path.normcase(x) for x in out}:
             out.append(d)
@@ -432,7 +481,7 @@ def check_all(s: Settings | None = None) -> list[Check]:
     s = s or load()
     out = []
     robot = find_robot(s)
-    custom = robot_spec(s) != "unitree_g1"
+    custom = robot_spec(s) not in BUILTIN_G1
     out.append(Check("robot", "로봇 모델", robot.path is not None, True, robot.path or "",
                      " · ".join(x for x in (robot.detail, robot.source) if x) if robot.path else robot.problem,
                      "모든 화면", "" if robot.path else
@@ -471,8 +520,8 @@ def check_all(s: Settings | None = None) -> list[Check]:
                      "" if ok else "설치 도우미에서 받으세요(연구용 라이선스 동의 필요)" + (
                          "" if paths.INSTALLED else ", 또는 scripts\\install_gmt.ps1"), URLS["gmt"]))
     vd = video_dir(s)
-    out.append(Check("video", "동영상 저장 폴더", _writable(vd), False, vd, "", "동영상 저장",
-                     "쓸 수 있는 폴더를 지정하세요"))
+    ok = _writable(vd)
+    out.append(Check("video", "동영상 저장 폴더", ok, False, vd, "", "동영상 저장", "" if ok else "쓸 수 있는 폴더를 지정하세요"))
     libs = library_dirs(s)
     have = [d for d in libs if os.path.isdir(d)]
     out.append(Check("library", "모션 폴더", bool(have), False, "; ".join(libs), f"{len(have)}/{len(libs)}개 있음",
@@ -482,4 +531,14 @@ def check_all(s: Settings | None = None) -> list[Check]:
         ok = os.path.isfile(rules)
         out.append(Check("label_rules", "자동 라벨 규칙 파일", ok, False, rules, "" if ok else "파일이 없습니다",
                          "자동 라벨", "" if ok else "인스펙터 > 라벨 > 규칙 파일...에서 다시 고르세요"))
+    path = settings_path()
+    problem, unreadable = _problem[1:] if _problem[0] == path else ("", False)
+    kept = _kept_aside if _kept_aside == path + ".broken" and os.path.isfile(_kept_aside) else ""
+    if problem or kept:  # only when settings.json (edited by hand) could not be read as it is
+        out.append(Check("settings", "설정 파일", False, False, kept or path,
+                         problem or "읽지 못한 설정 파일을 옮겨 두고 새로 저장했습니다", "저장한 환경 설정",
+                         f"읽지 못한 원래 파일은 {kept}에 있습니다. 필요한 값은 환경 설정에서 다시 고르세요" if kept else
+                         f"{path}를 고치세요. 환경 설정에서 저장하면 기본값으로 새로 쓰고 원래 파일은 "
+                         f"{os.path.basename(path)}.broken으로 옮겨 둡니다" if unreadable else
+                         f"{path}를 고치거나, 환경 설정에서 저장해 그 값을 기본값으로 새로 쓰세요"))
     return out

@@ -46,7 +46,7 @@ Write-Host "conda: $conda"
 $env:CONDA_CHANNELS = "conda-forge"
 $exists = (& $conda env list) -match "^\s*$([regex]::Escape($EnvName))\s"
 if ($HooksOnly) {
-    if (-not $exists) { throw "env $EnvName not found; create it first (README, 소스에서 실행)" }
+    if (-not $exists) { throw "env $EnvName not found; create it first (see README, developer setup)" }
 } else {
     Push-Location $ProjectRoot
     try {
@@ -110,6 +110,7 @@ if (-not $SkipGmr) {
 Write-Host ""
 Write-Host "Done. Next:"
 Write-Host "  conda activate $EnvName"
+Write-Host "  powershell -ExecutionPolicy Bypass -File scripts\install_gmt.ps1   # G1 model for the MuJoCo physics modes (GMT)"
 Write-Host "  python tools\make_samples.py"
 Write-Host "  python tools\isaac_replay.py --human data\samples\synthetic_walk_glitch.bvh"
 Write-Host "  python tools\fetch_samples.py; python tools\retarget.py data\raw\cmu_bvh"

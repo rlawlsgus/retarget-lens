@@ -21,7 +21,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import tempfile
 import time
 from dataclasses import asdict, fields
 from typing import Callable
@@ -474,7 +473,7 @@ def write(path: str, data: dict) -> str:
     out = {"format": FORMAT, "version": VERSION, "app_version": __version__,
            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"), **body}
     text = json.dumps(jsonable(out), ensure_ascii=False, indent=1) + "\n"
-    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=folder)
+    fd, tmp = motion_labels.temp_file(folder, os.path.basename(path) + ".", ".tmp")  # not mkstemp: it can loop forever
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
@@ -878,7 +877,10 @@ class Restore:
 
             other = not same_robot(ident, prof.ident) if ident else bool(robot) and robot != (
                 prof.key if prof.builtin else prof.name)
-            if other:
+            if other and ident and ident.get("name") == prof.name:  # same name, other digest (scene._check_robot)
+                self.notes.append(f"{prof.name}의 모델 파일이 바뀐 뒤(또는 이전 버전 RetLens에서) 저장한 작업 세션일 수 "
+                                  "있습니다. 지금 모델로 엽니다")
+            elif other:
                 self.notes.append(f"다른 로봇({robot})으로 저장한 작업 세션입니다. 지금 로봇({prof.name})으로 엽니다")
             if self.mode == "replace":
                 clear(scene)

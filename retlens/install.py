@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -62,6 +63,8 @@ APP = "RetLens"
 AUMID = "RetLens.Editor"  # the window's AppUserModelID (retlens/app/editor.py run()); the shortcut carries it too
 TAG_RE = re.compile(r"^v(\d{1,4})\.(\d{1,4})\.(\d{1,4})$")
 ASSET_RE = re.compile(r"^RetLens-(\d{1,4}\.\d{1,4}\.\d{1,4})-win64\.zip$")
+# a zip the user downloaded: browsers save a second copy as "... (1).zip"
+LOCAL_ZIP_RE = re.compile(r"^RetLens-(\d{1,4}\.\d{1,4}\.\d{1,4})-win64(?: ?\(\d+\))?\.zip$", re.IGNORECASE)
 SHA_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(\S+)\s*$")
 SHIPPED = ("RetLens.exe", "retlens-cli.exe", "retlens-update.exe", "_internal")
 MARKER, STAMP, MANIFEST = helper.MARKER, helper.STAMP, helper.MANIFEST
@@ -495,7 +498,7 @@ def _get(url: str, extra: frozenset, headers: dict | None = None, timeout: float
             return r.status, r.headers, r.read(limit + 1)[:limit]
     except urllib.error.HTTPError as e:
         return e.code, e.headers, b""
-    except (urllib.error.URLError, OSError, TimeoutError) as e:
+    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as e:
         reason = getattr(e, "reason", e)
         if "407" in str(reason):
             raise UpdateError("프록시가 로그인을 요구해 GitHub에 연결하지 못했습니다. 릴리즈 페이지에서 zip을 받아 "
@@ -619,21 +622,23 @@ def check_latest(etag: str | None = None, cached: dict | None = None, timeout: f
 def release_from_zip(path: str, check: Check | None = None) -> Release:
     """A RetLens-<ver>-win64.zip the user downloaded (proxy, offline): its version from the name, its hash from the
     latest release when that is the same version, else from a .sha256 next to it (None: unchecked)."""
-    name = os.path.basename(path)
-    m = ASSET_RE.match(name)
+    m = LOCAL_ZIP_RE.match(os.path.basename(path))
     if not m:
-        raise UpdateError(f"RetLens 릴리즈 zip 이름이 아닙니다 (RetLens-<버전>-win64.zip): {name}")
+        raise UpdateError(f"RetLens 릴리즈 zip 이름이 아닙니다 (RetLens-<버전>-win64.zip): {os.path.basename(path)}")
     v = m.group(1)
+    name = f"RetLens-{v}-win64.zip"  # the release's own name, also inside its .sha256 (a browser may add " (1)")
     sha = None
     if check is not None and check.latest is not None and check.latest.version == v:
         sha = check.latest.sha256
-    side = path + ".sha256"
-    if sha is None and os.path.isfile(side):
-        try:
-            with open(side, encoding="ascii", errors="replace") as f:
-                sha = parse_sha256_file(f.read(2048), name)
-        except OSError:
-            pass
+    for side in dict.fromkeys((path + ".sha256", os.path.join(os.path.dirname(path), name + ".sha256"))):
+        if sha is not None:
+            break
+        if os.path.isfile(side):
+            try:
+                with open(side, encoding="ascii", errors="replace") as f:
+                    sha = parse_sha256_file(f.read(2048), name)
+            except OSError:
+                pass
     return Release(version=v, tag=f"v{v}", name=name, asset_name=name, size=os.path.getsize(path), sha256=sha,
                    local_zip=os.path.abspath(path))
 
@@ -1190,7 +1195,7 @@ def uninstall_purge_list() -> list[str]:
     if os.environ.get("RETLENS_USER_DIR") or not same_path(paths.user_dir(), default):
         return []
     u = paths.user_dir()
-    names = ("settings.json", "api.json", "update_result.json", "update_started.json", "update_pending.json",
+    names = ("settings.json", "settings.json.broken", "api.json", "update_result.json", "update_started.json", "update_pending.json",
              "cache", "logs", "downloads", "sessions")  # (updater\ holds the running helper: it stays)
     return [os.path.join(u, n) for n in names if os.path.lexists(os.path.join(u, n))]
 

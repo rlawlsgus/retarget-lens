@@ -38,6 +38,9 @@ import io
 import json
 import os
 import pickle
+import re
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -60,16 +63,16 @@ TPOSE_BODIES = (
 )
 
 # Joint names of common BVH / FBX exporters (MotionBuilder / CMU cgspeed / Mixamo,
-# Xsens MVN, OptiTrack Motive, Daz / Poser) and of SMPL / SMPL-X for each body.
-# Right side is derived from the left. A namespace ("mixamorig:") or a prefix that
-# every joint shares ("Skeleton1_") is ignored.
+# Xsens MVN, OptiTrack Motive, Daz / Poser, 3ds Max Biped) and of SMPL / SMPL-X for each
+# body. Right side is derived from the left. A namespace ("mixamorig:") or a prefix that
+# every joint shares ("Skeleton1_", Biped's "Bip001 ") is ignored.
 _LEFT_ALIASES = {
-    "UpLeg": ("LeftUpLeg", "LeftUpperLeg", "LeftThigh", "LThigh", "lThigh", "left_hip"),
-    "Leg": ("LeftLeg", "LeftLowerLeg", "LeftShin", "LShin", "lShin", "left_knee"),
-    "Foot": ("LeftFoot", "LFoot", "lFoot", "left_ankle"),
-    "Arm": ("LeftArm", "LeftUpperArm", "LUArm", "lShldr", "left_shoulder"),
-    "ForeArm": ("LeftForeArm", "LeftLowerArm", "LFArm", "lForeArm", "left_elbow"),
-    "Hand": ("LeftHand", "LHand", "lHand", "left_wrist"),
+    "UpLeg": ("LeftUpLeg", "LeftUpperLeg", "LeftThigh", "LThigh", "lThigh", "left_hip", "L Thigh"),
+    "Leg": ("LeftLeg", "LeftLowerLeg", "LeftShin", "LShin", "lShin", "left_knee", "L Calf"),
+    "Foot": ("LeftFoot", "LFoot", "lFoot", "left_ankle", "L Foot"),
+    "Arm": ("LeftArm", "LeftUpperArm", "LUArm", "lShldr", "left_shoulder", "L UpperArm"),
+    "ForeArm": ("LeftForeArm", "LeftLowerArm", "LFArm", "lForeArm", "left_elbow", "L Forearm"),
+    "Hand": ("LeftHand", "LHand", "lHand", "left_wrist", "L Hand"),
 }
 
 
@@ -80,16 +83,23 @@ def _right_alias(name: str) -> str:
         return "right_" + name[5:]
     if name.startswith("l"):
         return "r" + name[1:]  # Daz: lThigh -> rThigh
-    return "R" + name[1:]  # OptiTrack: LThigh -> RThigh
+    return "R" + name[1:]  # OptiTrack: LThigh -> RThigh, Biped: L Thigh -> R Thigh
 
 
 def _strip_common_prefix(names: list[str]) -> list[str]:
-    """Drop a namespace ("mixamorig:Hips") or a prefix every joint shares ("Skeleton1_Hips")."""
-    for sep in (":", "_"):
-        heads = {n.split(sep, 1)[0] for n in names}
-        if len(heads) == 1 and all(sep in n for n in names):
-            return [n.split(sep, 1)[1] for n in names]
-    return list(names)
+    """Drop a namespace ("mixamorig:Hips") or a prefix every joint shares ("Skeleton1_Hips", Biped's
+    "Bip001 Pelvis"), also one inside the other ("take:Bip001 Pelvis"). A joint named the prefix itself
+    (Biped's centre-of-mass bone "Bip001") keeps its name."""
+    names = list(names)
+    for _ in range(3):
+        for sep in (":", "_", " "):
+            heads = {n.split(sep, 1)[0] for n in names}
+            if len(heads) == 1 and any(sep in n for n in names):
+                names = [n.split(sep, 1)[1] if sep in n else n for n in names]
+                break
+        else:
+            break
+    return names
 _HIPS_ALIASES = ("Hips", "Hip", "Pelvis", "hip", "pelvis")
 
 # The robot's T-pose is built from its parts (robot_profile), matched to the human's reference
@@ -170,11 +180,30 @@ def limb_segments(prof: robot_profile.RobotProfile):
     return out
 
 
+_QUIET_LOCK = threading.Lock()
+_quiet_depth = 0
+_quiet_saved = None
+
+
 @contextlib.contextmanager
 def _quiet():
-    """GMR prints model tables and banners on import/construction; keep stdout clean."""
-    with contextlib.redirect_stdout(io.StringIO()):
+    """GMR prints model tables and banners on import / construction; keep stdout clean. sys.stdout is the
+    process's, so retargets on several threads share one redirect: the first in replaces it, the last out puts
+    it back (with contextlib.redirect_stdout on each, overlapping ones left it on a buffer for good and every
+    later print was lost). Prints of other threads meanwhile are dropped too, so it is kept short."""
+    global _quiet_depth, _quiet_saved
+    with _QUIET_LOCK:
+        if _quiet_depth == 0:
+            _quiet_saved = sys.stdout
+            sys.stdout = io.StringIO()
+        _quiet_depth += 1
+    try:
         yield
+    finally:
+        with _QUIET_LOCK:
+            _quiet_depth -= 1
+            if _quiet_depth == 0:
+                sys.stdout, _quiet_saved = _quiet_saved, None
 
 
 def _gmr():
@@ -269,15 +298,17 @@ class HumanClip:
 
 
 def bvh_joint_names(path: str) -> list[str]:
-    names = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    """The ROOT / JOINT names of a BVH, read as retlens.io.bvh reads them (names may hold spaces, a BOM is fine)."""
+    from .io.bvh import _tokens
+
+    head = []
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
-            tok = line.split()
-            if tok and tok[0].upper() in ("ROOT", "JOINT") and len(tok) > 1:
-                names.append(tok[1])
-            elif tok and tok[0].upper() == "MOTION":
+            if re.match(r"\s*MOTION\b", line, re.IGNORECASE):
                 break
-    return names
+            head.append(line)
+    tok = _tokens("".join(head))
+    return [tok[i + 1] for i in range(len(tok) - 1) if tok[i].upper() in ("ROOT", "JOINT")]
 
 
 def detect_format(path: str) -> str:
@@ -315,12 +346,17 @@ def _resolve_bvh_bodies(names: list[str], parents: np.ndarray) -> dict[str, int]
             if j is None:
                 raise ValueError(f"skeleton has no {side} {part} joint (tried {cands}); use --format or add an alias")
             idx[f"{side}{part}"] = j
-    # chest = the spine joint the arm hangs from (skip a clavicle/shoulder joint)
-    p = int(parents[idx["LeftArm"]])
-    if any(k in names[p].lower() for k in ("shoulder", "clavicle", "collar")):
-        p = int(parents[p])
-    idx["Spine2"] = p
+    idx["Spine2"] = _arm_chest(names, parents, idx["LeftArm"])
     return idx
+
+
+def _arm_chest(names: list[str], parents, arm: int) -> int:
+    """The chest: the spine joint an upper arm hangs from, up past clavicle / shoulder / collar joints and a
+    neck they hang from (3ds Max Biped's classic layout puts the clavicles under 'Bip001 Neck')."""
+    p = int(parents[arm])
+    while parents[p] >= 0 and any(k in names[p].lower() for k in ("shoulder", "clavicle", "collar", "neck")):
+        p = int(parents[p])
+    return p
 
 
 def _resample(P: np.ndarray, R: np.ndarray, fps_in: float, fps_out: float | None):
@@ -392,7 +428,20 @@ def load_fbx_tpose(path: str, ref: str | int = "auto", fps: float | None = 30.0,
     from .io.fbx import load_fbx
 
     m = load_fbx(path, with_rotations=True, drop_tpose=False, take=take)
-    idx = _resolve_bvh_bodies(m.joint_names, m.parents)
+    if len(m.joint_names) < 8:  # a prop's segment bones, not a person
+        raise ValueError(f"{os.path.basename(path)}: 관절이 {len(m.joint_names)}개뿐이라 사람 골격으로 리타게팅할 수 없습니다. "
+                         "물체만 든 FBX면 같은 촬영의 사람 모션 FBX를 여세요. 이름이 규칙에 맞으면 함께 그립니다"
+                         "(사용 설명서 '따로 받은 물체 FBX')")
+    try:
+        idx = _resolve_bvh_bodies(m.joint_names, m.parents)
+    except ValueError as e:
+        from .props import is_prop_folder, prop_head
+
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if prop_head(stem) is None and not is_prop_folder(os.path.dirname(os.path.abspath(path))):
+            raise
+        raise ValueError(f"{os.path.basename(path)}: 사람 골격이 아닙니다({e}). 물체만 든 FBX면 같은 촬영의 사람 모션 FBX를 "
+                         "여세요. 이름이 규칙에 맞으면 함께 그립니다(사용 설명서 '따로 받은 물체 FBX')") from e
     P, R = m.positions, m.rotations
     tpose0 = m.meta["tpose_frame0"]
     dropped = 0
@@ -479,10 +528,36 @@ def gmr_bvh_frames(path: str, fmt: str) -> tuple[list[dict], float, float]:
     return frames, 1.75, float(m.meta["file_fps"])
 
 
+def _upsample_frames(frames: list[dict], src_fps: float, fps: float) -> list[dict]:
+    """GMR human frames at a higher rate: between two source frames positions linearly, orientations by slerp
+    (picking the nearest frame held each target for several frames: stair-stepped motion)."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    N = len(frames)
+    r = fps / src_fps
+    step = 1.0 / round(r) if abs(r - round(r)) < 1e-3 else 1.0 / r  # 30.0003 fps (rounded frame time) x 2 -> 60
+    t = np.minimum(np.arange(int(np.floor((N - 1) / step + 1e-3)) + 1) * step, N - 1)  # in source frames
+    i0 = np.floor(t).astype(int)
+    i1 = np.minimum(i0 + 1, N - 1)
+    w = (t - i0)[:, None]
+    out = [{} for _ in t]
+    for k in frames[0]:
+        P = np.array([fr[k][0] for fr in frames], dtype=np.float64)
+        Q = np.array([fr[k][1] for fr in frames], dtype=np.float64)  # wxyz
+        p = (1.0 - w) * P[i0] + w * P[i1]
+        q = Slerp(np.arange(N), Rotation.from_quat(Q[:, [1, 2, 3, 0]]))(t).as_quat()[:, [3, 0, 1, 2]]
+        for j, fr in enumerate(out):
+            fr[k] = [p[j], q[j]]
+    return out
+
+
 def load_bvh_gmr(path: str, fmt: str, fps: float | None = 30.0) -> HumanClip:
-    """LAFAN1 / Nokov BVH in GMR's convention (gmr_bvh_frames), nearest-frame resampling."""
+    """LAFAN1 / Nokov BVH in GMR's convention (gmr_bvh_frames): to a lower rate by the nearest frame (GMR's way),
+    to a higher one interpolated (_upsample_frames)."""
     frames, height, src_fps = gmr_bvh_frames(path, fmt)
-    if fps and abs(fps - src_fps) > 1e-3 * src_fps:
+    if fps and fps > src_fps * (1 + 1e-3) and len(frames) > 1:
+        frames = _upsample_frames(frames, src_fps, fps)
+    elif fps and abs(fps - src_fps) > 1e-3 * src_fps:
         n = int(len(frames) / src_fps * fps)
         frames = [frames[min(int(round(k * src_fps / fps)), len(frames) - 1)] for k in range(n)]
     elif not fps:
@@ -1010,6 +1085,8 @@ def run_gmr(clip: HumanClip, robot: str, src_human: str, config: dict | None = N
         if not prof.builtin:
             raise ValueError(f"GMR's {src_human} config exists only for the Unitree G1; {prof.name} retargets "
                              "BVH / FBX / SMPL-X through its derived config (formats tpose / fbx / smplx)")
+        if prof.key not in gmr.IK_CONFIG_DICT.get(src_human, {}):
+            raise ValueError(f"GMR has no {src_human} config for {prof.name}")
         with open(gmr.IK_CONFIG_DICT[src_human][prof.key], encoding="utf-8") as f:
             config, height = json.load(f), clip.height_m
     else:
@@ -1035,14 +1112,12 @@ def run_gmr(clip: HumanClip, robot: str, src_human: str, config: dict | None = N
     q = ret.configuration.q.copy()
     q[:3], q[3:7] = root_pos, quat_normalize(np.asarray(root_quat))
     ret.configuration.update(q)
-    with _quiet():
-        for _ in range(warmup):
-            ret.retarget(copy_frame(clip.frames[0]))
+    for _ in range(warmup):  # GMR prints only while it is built, not here
+        ret.retarget(copy_frame(clip.frames[0]))
     qpos, targets = [], []
     t0 = time.perf_counter()
     for i, fr in enumerate(clip.frames):
-        with _quiet():
-            qpos.append(ret.retarget(copy_frame(fr)))
+        qpos.append(ret.retarget(copy_frame(fr)))
         targets.append([ret.scaled_human_data[h][0] for h, _ in bodies])
         if log and (i + 1) % 300 == 0:
             log(f"  {i + 1}/{len(clip.frames)} frames ({(i + 1) / (time.perf_counter() - t0):.0f} fps)")
@@ -1639,6 +1714,8 @@ class _SelfCollisionModel:
             b1, b2 = int(model.geom_bodyid[c.geom1]), int(model.geom_bodyid[c.geom2])
             if model.body_parentid[b1] == model.body_parentid[b2]:
                 continue
+            if any(b1 in h and b2 in h for h in self.parts.hand_bodies.values()):  # fingers / palm of one hand
+                continue
             if b1 in self.ancestors[b2] or b2 in self.ancestors[b1]:
                 top, low = (b1, b2) if b1 in self.ancestors[b2] else (b2, b1)
                 if self.part(top) != "trunk":
@@ -1874,6 +1951,34 @@ def separate_self_collisions(m: RobotMotion, robot: str = "unitree_g1", target: 
     return out, info
 
 
+def _retarget_fingers(motion: RobotMotion, path: str, fmt: str, up_axis: str, clip: HumanClip, prof) -> dict:
+    """retlens.fingers.retarget_fingers on the file's full skeleton (the IK clip has no finger joints): its info,
+    with the new motion under "_motion". The skeleton is read with every frame and offset by the frames the clip
+    dropped, so frame i of the motion pairs with the clip's."""
+    from .fingers import VERSION, retarget_fingers
+
+    try:
+        if fmt == "fbx":
+            from .io.fbx import load_fbx
+
+            human = load_fbx(path, drop_tpose=False)
+        elif fmt in ("tpose", "lafan1", "nokov"):
+            from .io.bvh import load_bvh
+
+            human = load_bvh(path, up_axis=up_axis, drop_tpose=False)
+        else:  # AMASS SMPL-X is read as its body only (retlens.io.smpl)
+            return {"version": VERSION, "fingers": {}, "notes": ["SMPL-X는 몸 관절만 읽어 손가락을 따르지 않음"]}
+        dropped = int(clip.info.get("dropped_leading_frames") or 0)
+        if dropped:
+            from dataclasses import replace
+
+            human = replace(human, positions=human.positions[dropped:])
+        out, info = retarget_fingers(motion, human, prof)
+    except Exception as e:  # the body's retarget stands without them
+        return {"version": VERSION, "fingers": {}, "error": f"{type(e).__name__}: {e}"}
+    return {**(info or {}), "_motion": out}
+
+
 def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: float | None = 30.0,
                   up_axis: str = "y", ref: str | int = "auto", smpl_model_dir: str | None = None,
                   velocity_limit: bool = False, smooth_hz: float = 0.0, swing_clearance: float = 0.0,
@@ -1917,6 +2022,8 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
     else:
         raise ValueError(f"unknown format {fmt!r}")
     log(f"{os.path.basename(path)}: {fmt}, {len(clip.frames)} frames @ {clip.fps:g} fps -> {prof.name}")
+    if smooth_hz and smooth_hz >= 0.5 * clip.fps:  # smooth_motion's check, before the IK rather than after it
+        raise ValueError(f"cutoff {smooth_hz} Hz must be below Nyquist ({0.5 * clip.fps:g} Hz at {clip.fps:g} fps)")
     t0 = time.perf_counter()
     qpos, track = run_gmr(clip, robot, src_human, config, ground, velocity_limit, log=log)
     elapsed = time.perf_counter() - t0
@@ -1926,11 +2033,20 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
     joints = robot_joint_names(model)
     motion = qpos_to_motion(qpos, joints, clip.fps, name, os.path.abspath(path))
     resid = position_residuals(model, qpos, track)
+    fingers = None
+    if prof.has_fingers():  # a hand with jointed fingers follows the person's (retlens.fingers); before the smoothing
+        fingers = _retarget_fingers(motion, path, fmt, up_axis, clip, prof)
+        motion = fingers.pop("_motion", motion)
     smoothing = None
-    if smooth_hz:
-        motion = smooth_motion(motion, smooth_hz, limits=robot_joint_ranges(model))
-        smoothing = {**motion.meta["smoothing"], "ik_position_residual_before": resid}
-        resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1), track)
+    if smooth_hz and smooth_hz > 0:
+        smoothed = smooth_motion(motion, smooth_hz, limits=robot_joint_ranges(model))
+        if smoothed is motion:  # under 4 frames: nothing to filter
+            notes.append(f"{motion.num_frames}프레임뿐이라 부드럽게 하지 않음 (4프레임 이상 필요)")
+        else:
+            motion = smoothed
+            smoothing = {**motion.meta["smoothing"], "ik_position_residual_before": resid}
+            resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1),
+                                       track)
     flat = None
     if foot_flat:
         motion, flat = flatten_stance_feet(motion, robot)
@@ -1945,6 +2061,11 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
             clearance["ik_position_residual_before"] = resid
             resid = position_residuals(model, np.concatenate([motion.root_pos, motion.root_quat, motion.dof_pos], 1),
                                        track)
+    if fingers and fingers.get("fingers"):  # how far they bend in the end (after the smoothing)
+        col = {n: i for i, n in enumerate(motion.joint_names)}
+        for fs in fingers["fingers"].values():
+            for f in fs.values():
+                f["max_deg"] = [round(float(np.degrees(np.abs(motion.dof_pos[:, col[n]]).max())), 1) for n in f["joints"]]
     separation = None
     if self_collision:  # last: it keeps standing legs still and moving feet off the floor, which a later pass could undo
         motion, separation = separate_self_collisions(motion, robot)
@@ -1968,6 +2089,7 @@ def retarget_file(path: str, robot: str = "unitree_g1", fmt: str = "auto", fps: 
         "foot_flat": flat,
         "swing_clearance": clearance,
         "self_collision": separation,
+        "fingers": fingers,
         "ik_seconds": round(elapsed, 1),
         "root_quat": "wxyz",
     }

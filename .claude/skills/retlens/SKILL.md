@@ -19,46 +19,56 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇으로 옮기고(리타�
 - **저장소(개발)에서:** `conda run -n retlens python tools\retlens_cli.py <명령> ...` (저장소 루트에서). 창은 `scripts\editor.bat`.
 - **설치판:** 설치 폴더의 `retlens-cli.exe <명령> ...`(`RetLens.exe` 옆).
 - 먼저 `retlens-cli info`로 환경을 확인하세요. 파일 위치, 각 기능에 필요한 외부 프로그램(Isaac Sim, Blender, SMPL-X 모델)이 있는지(`checks`), Isaac 라이선스 동의 여부(`isaac_eula_accepted`)가 나옵니다.
-- 출력은 stdout의 JSON 한 줄입니다(`--pretty`면 들여쓰기). 진행 메시지는 stderr로 나옵니다. 실패하면 종료 코드가 1이고 `{"error": "..."}`를 출력합니다.
+- 출력은 stdout의 JSON 한 줄입니다(`--pretty`면 들여쓰기, 명령 앞뒤 어디에 붙여도 됨). 진행 메시지는 stderr로 나옵니다.
+- 실패하면 종료 코드가 1이고 `{"error": "..."}`를 출력합니다. 명령이나 옵션을 잘못 써도 같습니다.
+  - `physics`와 `video --physics`는 물리 계산이 실패하거나 `--timeout`(기본 1200초) 안에 끝나지 않아도 1입니다(`physics`는 결과와 함께 `error`).
+  - 여러 모션을 다루는 `autolabel`·`summary`·`batch`·`export`·`c3d-qc`는 모두 실패하면 1, 일부만 실패하면 2입니다. 물리 검사가 실패한 모션은 `batch`에서는 2로 알리고, `export`에서는 실패로 셉니다(`--allow-falls`면 `phys_error`를 붙여 쓰고 2).
+  - 모션을 여는 명령(`inspect`·`metrics`·`compare`·`align`·`physics`·`video`·`retarget`)은 없는 파일이면 장면을 띄우기 전에 바로 `"없는 파일: …"` 오류(1)입니다.
 
 ## 2. 명령줄 `retlens-cli`
 
 | 명령 | 하는 일 | 주요 출력 |
 |---|---|---|
 | `info` | 버전, 파일 위치, 환경 점검 | `locations`, `checks[]`(key, ok, needed_for, hint), `isaac_eula_accepted` |
-| `robot [MODEL]` | 로봇 모델(기본은 환경 설정, 비면 G1)에서 리타게팅이 찾은 부위: 다리·팔의 관절(proximal / bend / distal, `*`는 비틀림), 무릎·팔꿈치 굽힘 방향(`flex_sign`), 손·발 몸체, IK 대상 몸체, 키·서 있는 골반 높이, `notes`(예: 허리 pitch 없음). 못 찾으면 `error`에 무엇을 못 찾았는지 | `robot`(name, dof, legs, arms, tasks, height_m, notes) |
+| `robot [MODEL]` | 로봇 모델(기본은 환경 설정, 비면 G1)에서 리타게팅이 찾은 부위: 다리·팔의 관절(proximal / bend / distal, `*`는 비틀림), 무릎·팔꿈치 굽힘 방향(`flex_sign`), 손·발 몸체, IK 대상 몸체, 키·서 있는 골반 높이, 손가락(`fingers`: 손가락마다 관절과 손을 오므리는 방향, 예 `left_hand_index_0_joint (-)`; 0은 벌림·비틀림이라 안 움직임; 비면 손가락 관절 없음), `notes`(예: 허리 pitch 없음, 토크 한계 없는 관절 수 "torque limits missing on N joints"). 못 찾으면 `error`에 무엇을 못 찾았는지 | `robot`(name, dof, legs, arms, tasks, height_m, fingers, notes) |
 | `library [--query Q] [--limit N]` | 모션 폴더의 파일 목록. Q는 파일 이름과 CMU 동작 설명에서 찾음(예: `143_11`, `walk`, `dance`) | `files[]`(path, folder, name, cmu_description) |
-| `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, foot_reference, self_collision, metrics, retarget_quality, c3d, objects) |
+| `inspect FILE...` | 열고(필요하면 리타게팅, 캐시) 모션 하나하나의 정보 | `motions[]`(id, kind, frames, fps, duration_s, qc, qc_notes, ik_position_residual, retarget, foot_flat, foot_reference, self_collision, fingers, metrics, retarget_quality, c3d, solved_motion, warnings, objects, prop_files) |
 | `metrics FILE... [--ref N]` | 창의 "분석" 표와 같은 표. 기준(ref, 기본은 첫 파일) 대비 RMSE 포함 | `rows`, `motions[].values`, `row_help` |
-| `compare A B [--tol 3] [--no-heading] [--align]` | 겹쳐 비교: B를 A의 골반에 맞춰 부위별 차이(cm) | `regions[]`(region, mean_cm, max_cm, max_at_s, beyond_tol_pct), `worst_moments[]` |
+| `compare A B [--tol 3] [--no-heading] [--align]` | 겹쳐 비교: B를 A의 골반에 맞춰 부위별 차이(cm). `worst_moments`의 `time_s`는 타임라인 시각이고, B 자신의 시각은 `time_s − offsets_s.b`. `tol_cm`은 실제로 쓴 값 | `regions[]`(region, mean_cm, max_cm, max_at_s, beyond_tol_pct), `worst_moments[]`, `offsets_s`(a, b), `tol_cm`, `--align`이면 `align_notes` |
 | `align REF FILE...` | 기준에 시간 자동 정렬(다리 관절각이 가장 잘 맞는 오프셋) | `offsets_s`, `notes` |
-| `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM] [--self-collision]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장 | `out`, `frames`, `fps`, `kind` |
-| `autolabel FILE... [--rules R.yaml] [--out DIR] [--summary]` | 자동 라벨: 규칙 파일대로 사람 동작을 보고 구간 라벨(리타게팅 없이). `--out`이면 라벨을 붙인 모션마다 그 폴더 안에 `<이름>.labels.csv`(구간이 없으면 열 이름만). 이름이 겹치면 원래 폴더 구조를 그 아래에, 같은 폴더의 `X.c3d`·`X.bvh`는 `c3d\`·`bvh\` 아래에 둠. 실패한 모션은 지난 실행의 CSV를 지움. 종료 코드 1 = 모두 실패, 2 = 일부 실패 | `rules`, `motions[]`(file, labels{auto, tracks, segments[], notes, error}, csv, csv_removed) |
-| `batch FILE\|DIR... [--physics] [--rules R.yaml] [--csv OUT.csv]` + 리타게팅 보정 옵션 | 데이터셋 일괄 처리: 폴더 아래 모션마다 리타게팅·측정한 한 줄(점수, QC, 주된 감점, 문제 구간 초, 품질·발 지표, 물체 닿음, 라벨, `--physics`면 MuJoCo 보조 힘 결과와 `phys_first_cause`(첫 넘어짐 원인)·`phys_fall_causes`(원인별 횟수, 클립 안)). 파일·설정별로 캐시되어 다시 돌리면 끝난 것은 바로 나옴. 종료 코드 2 = 일부 못 읽음 | `motions`, `read`, `errors`, `total_s`, `qc_fail`, `qc_warn`, `with_falls`, `first_fall_causes`({원인: 모션 수}), `labelled`, `rows[]`, `csv` |
-| `export FILE\|DIR... --out DIR [--qc PASS\|WARN\|FAIL] [--min-score N] [--physics] [--allow-falls] [--cut] [--cut-kinds K,K] [--pad S] [--min-piece S] [--range START END] [--formats npz,csv,pkl] [--no-labels]` + 리타게팅 보정 옵션 | 데이터셋 내보내기: `batch`(캐시 공유)를 거쳐 기준을 넘는 모션을 `--out`에 입력 폴더 구조대로 씀(모션마다 `<이름>.npz` 등 + `.labels.csv` + `.json`, 맨 위에 `manifest.json`·`manifest.csv`). `--qc`는 넣을 가장 나쁜 판정(기본 WARN). `--min-score`는 리타게팅 점수 하한(로봇 모션 파일은 점수가 없어 받지 않음). `--physics`면 넘어진 모션을 뺌(`--allow-falls`면 둠). `--cut`은 QC가 못 쓰는 프레임, `--cut-kinds`의 문제 구간(기본 `penetration,marker_gap`; `slip`, `swing_low`, `self_collision`, `joint_limit`도 됨), 넘어짐 1초 전–0.25초 뒤를 잘라 `--min-piece`초(기본 1) 이상 남은 조각을 `<이름>_<시작>-<끝>s`로 씀(조각마다 QC 다시 판정). `--range`는 모션 하나의 시간 범위만. 같은 폴더에 다시 내보내면 이전 manifest에 적힌 파일만 지우고 새로 씀. 한 폴더의 같은 촬영(`X.bvh`·`X.fbx`·`X_stageii.npz`·`X.c3d`)은 하나만. csv는 x y z qx qy qz qw + 관절각(머리글 없음), pkl은 GMR. 종료 코드 1 = 모두 못 읽음, 2 = 일부 | `out`, `manifest`, `totals`(motions, exported_motions, clips, seconds, cut_seconds, short_seconds, cut_by_kind, excluded, excluded_by_reason), `clips[]`(files, source, start_s, end_s, duration_s, qc, labels), `excluded[]`(source, reason) |
+| `retarget FILE --out OUT.npz [--smooth 6] [--foot-flat] [--swing-clearance CM] [--self-collision]` | 리타게팅해서 로봇 모션 npz(+ json)로 저장. `--out`은 `.npz`(확장자가 없으면 붙이고, `.NPZ`도 `.npz`로 씀). 다른 확장자나 입력 파일 자체면(경로를 8.3 짧은 이름 등으로 다르게 써도) 오류. 폴더는 먼저 만듦 | `out`, `frames`, `fps`, `kind` |
+| `autolabel FILE... [--rules R.yaml] [--out DIR] [--summary]` | 자동 라벨: 규칙 파일대로 사람 동작을 보고 구간 라벨(리타게팅 없이). `--out`이면 라벨을 붙인 모션마다 그 폴더 안에 `<이름>.labels.csv`(구간이 없으면 열 이름만). 이름이 겹치면 원래 폴더 구조를 그 아래에, 같은 폴더의 `X.c3d`·`X.bvh`는 `c3d\`·`bvh\` 아래에 둠. 실패한 모션은 지난 실행의 CSV를 지움. `--out`이 모션의 폴더이거나 같은 이름의 모션이 든 폴더면 아무것도 쓰거나 지우지 않고 종료 코드 1. 종료 코드 1 = 모두 실패, 2 = 일부 실패 | `rules`, `motions[]`(file, labels{auto, tracks, segments[], notes, error}, csv, csv_removed) |
+| `batch FILE\|DIR... [--physics] [--rules R.yaml] [--csv OUT.csv]` + 리타게팅 보정 옵션 | 데이터셋 일괄 처리: 폴더 아래 모션마다 리타게팅·측정한 한 줄(점수, QC, 주된 감점, 문제 구간 초, 품질·발 지표, 물체 닿음, 라벨, `--physics`면 MuJoCo 보조 힘 결과와 `phys_first_cause`(첫 넘어짐 원인)·`phys_fall_causes`(원인별 횟수, 클립 안)·`phys_torque_limits_missing`(토크 한계 없는 관절 수)). 그 밖의 행 키: `file_warnings`(읽을 때 뺀 것, `; `로 이음, CSV 열 "파일 주의"), C3D면 `solved_motion`(쓴 솔버 결과)·`solved_elsewhere`(true: 모션 폴더에서 찾음)·`take_warning`(다른 촬영일 수 있음, CSV 열 "촬영 주의"). C3D 행의 `objects`·물체 닿음은 솔버 결과의 물체. 파일·옆의 라벨 파일·설정(C3D는 솔버 결과와 그 물체 파일도)별로 캐시되어 다시 돌리면 끝난 것은 바로 나옴(옆의 라벨 파일을 더하거나 고치면 그 행은 다시. 폴더의 `labels.csv`·`labels.json`을 고치면 다시 재지 않고 라벨만 다시 읽음). 물리 검사를 하지 못한 행은 `phys_error`(CSV 열 "물리 오류")가 있고 다음에 다시 시도. 폴더에서는 라벨 파일, SMPL-X 체형 파일, Unitree 로봇 csv가 아닌 csv 표, 함께 처리하는 사람 FBX가 쓰는 물체 파일, 그 아래의 `retlens_export` 폴더(직접 주면 읽음)를 뺌. 종료 코드 1 = 모두 못 읽음, 2 = 일부 못 읽음 또는 물리 검사 실패 | `motions`, `read`, `errors`, `total_s`, `qc_fail`, `qc_warn`, `with_falls`, `first_fall_causes`({원인: 모션 수}), `phys_errors`, `labelled`, `rows[]`, `csv` |
+| `export FILE\|DIR... --out DIR [--qc PASS\|WARN\|FAIL] [--min-score N] [--physics] [--allow-falls] [--cut] [--cut-kinds K,K] [--pad S] [--min-piece S] [--range START END] [--formats npz,csv,pkl] [--no-labels]` + 리타게팅 보정 옵션 | 데이터셋 내보내기: `batch`(캐시 공유)를 거쳐 기준을 넘는 모션을 `--out`에 입력 폴더 구조대로 씀(모션마다 `<이름>.npz` 등 + `.labels.csv` + `.json`, 맨 위에 `manifest.json`·`manifest.csv`). `--qc`는 넣을 가장 나쁜 판정(기본 WARN). `--min-score`는 리타게팅 점수 하한(로봇 모션 파일은 점수가 없어 받지 않음). `--physics`면 넘어진 모션을 뺌(`--allow-falls`면 둠). `--cut`은 QC가 못 쓰는 프레임, `--cut-kinds`의 문제 구간(기본 `penetration,marker_gap`; `slip`, `swing_low`, `self_collision`, `joint_limit`도 됨), 넘어짐 1초 전–0.25초 뒤를 잘라 `--min-piece`초(기본 1) 이상 남은 조각을 `<이름>_<시작>-<끝>s`로 씀(조각마다 QC 다시 판정, 창의 QC처럼 정적 불균형 포함). `--range`는 모션 하나의 시간 범위만(조각처럼 QC 다시 판정). 통째로 쓰는 모션의 `qc`는 `batch` 행의 QC. 같은 폴더에 다시 내보내면 이전 manifest에 적힌 파일만 지우고 새로 씀. 한 폴더의 같은 촬영(`X.bvh`·`X.fbx`·`X_stageii.npz`·`X.c3d`)은 하나만: bvh → fbx → npz → csv → pkl → c3d 순으로 읽을 수 있는 첫 파일을 판정하고, 나머지는 `excluded`에 "같은 촬영: X로 내보냄"(X를 씀) 또는 "같은 촬영: X을(를) 씀"(X를 판정했지만 쓰지 않음). 입력 폴더 아래의 `retlens_export` 폴더는 읽지 않음(직접 주면 읽음). csv는 x y z qx qy qz qw + 관절각(머리글 없음, 늘 30 fps), pkl은 GMR. `--physics`면 물리 검사를 하지 못한 모션도 뺌(이유 "물리 검사 실패: …"). `--allow-falls`면 넣고(넘어짐은 보지도 자르지도 않음) 그 clip에 `phys_error`, `totals.phys_errors`에 셈. manifest의 clip에는 `phys_error`·`file_warnings`(없으면 null), csv로 쓴 것은 `csv_fps`·`csv_frames`도. 원본을 덮어쓰지 않음(경로를 8.3 짧은 이름·연결 드라이브·정션·심볼릭 링크로 다르게 써도 같은 파일로 봄): 내보내는 모션이 이번에 읽는 원본 모션이 든 폴더에 들어가게 되면(예: `--out`이 입력 폴더의 바로 위 폴더, 파일을 줄 때 그 파일의 폴더), 또는 없는 입력이 있으면 아무것도 지우거나 쓰지 않고 오류. `--out`이 입력 폴더 아래면 그 안의 파일과 이전 export가 쓴 파일은 모션으로 읽지 않음. Ctrl+C로 끊어도 거기까지를 manifest에 적음(`stopped`). 종료 코드 1 = 모두 실패(못 읽음, 내보내기 실패, 물리 검사 실패), 2 = 일부, 또는 `--allow-falls`로 물리 오류인 모션을 넣음 | `out`, `manifest`, `totals`(motions, exported_motions, clips, seconds, cut_seconds, short_seconds, cut_by_kind, excluded, excluded_by_reason, phys_errors), `clips[]`(files, source, start_s, end_s, duration_s, qc, labels, 있으면 phys_error·file_warnings), `excluded[]`(source, reason) |
 | `version` | 버전만(아무것도 불러오지 않아 빠름) | `app`, `version` |
 | `update` | 업데이트 확인만: GitHub 최신 릴리즈를 이 버전과 비교(설치하지 않고 실행한 RetLens면 이 버전과 이 PC에 설치된 버전 중 새것과 비교). 내려받거나 설치하지 않음; 설치·업데이트는 사용자가 창의 도움말 > 업데이트 확인에서. 종료 코드 1 = 확인 실패 | `current`, `latest`(version, sha256, asset_url, notes...), `newer`, `installed_version`(이 PC에 설치된 버전, 설치하지 않고 실행할 때만), `installed`(설치 폴더에서 실행 중), `portable`, `install_dir`, `releases_page`, `error` |
-| `summary FILE\|DIR... [--rules R.yaml] [--csv OUT.csv]` | 데이터셋 요약(리타게팅 없이): 폴더 아래 모션마다 길이, 라벨(옆의 라벨 파일, `--rules`면 자동 라벨) 트랙·라벨별 시간, FBX 물체. 폴더별·라벨별 합계. 종료 코드 2 = 일부 못 읽음 | `total_s`, `total_h`, `per_folder`, `per_label`(seconds, segments, share_pct), `files[]`(duration_s, labels, label_seconds, objects, error), `csv` |
-| `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이) | 마커 수, `missing_pct`, `most_missing`, `longest_gap_s`, `spike_frames` |
-| `physics FILE [--balance harness]` | 물리 검사. 기본은 MuJoCo 골반 보조 힘(클립당 몇 초, 라이선스 동의 불필요). `--balance pd`/`gmt`는 MuJoCo 제어기 없음 / GMT, `isaac [--assist 1]`은 Isaac PhysX(짧은 클립 약 1분, EULA 동의 필요) | `physics.metrics`(phys_falls, phys_fall_causes, phys_harness_pct, phys_saturated_pct, phys_body_error_cm, phys_ok), `physics.falls[]`(`time_s`, `cause`(한글), `cause_id`, `onset_s`, `rule`(MuJoCo 판정), `after_clip`, `evidence`, `others`), `physics.first_fall_cause` |
-| `video FILE [--out X.mp4] [--physics [--balance B]]` | Isaac으로 녹화(EULA 동의 필요). `--physics`면 그 균형 제어로 시뮬레이션한 결과를 녹화 | `video` 경로 |
+| `summary FILE\|DIR... [--rules R.yaml] [--csv OUT.csv]` | 데이터셋 요약(리타게팅 없이): 폴더 아래 모션마다 길이, 라벨(옆의 라벨 파일, `--rules`면 자동 라벨) 트랙·라벨별 시간, FBX 물체. 폴더별·라벨별 합계. 한 폴더의 같은 촬영(`X.bvh`·`X.fbx`)은 export처럼 읽을 수 있는 첫 파일로 하나만 세고(나머지 행은 `same_take`: 센 파일, 그 FBX의 물체는 센 행에 합침), 관절 8개 미만 FBX(물체 파일)는 `not_counted`. `warnings`는 읽을 때 뺀 것(예: FBX의 다른 사람 골격, 목록 또는 null; `--csv`에는 "error" 뒤 warnings 열). 아래의 `retlens_export` 폴더는 읽지 않음. `per_folder` 키는 입력들의 공통 상위 폴더 아래 경로(예: `day1/s01`). 종료 코드 1 = 모두 못 읽음, 2 = 일부 못 읽음 | `motions`, `failed`, `total_s`, `total_h`, `per_folder`, `per_label`(seconds, segments, share_pct), `files[]`(duration_s, labels, label_seconds, objects, error, warnings, same_take, not_counted), `csv` |
+| `c3d-qc FILE.c3d...` | C3D 원본 마커 QC만(리타게팅 없이). 결과는 파일 이름별(이름이 겹치면 경로별). 읽지 못한 파일은 `{"error"}`이고 나머지는 그대로 나옴. 종료 코드 1 = 모두 실패, 2 = 일부 | `{파일 이름: {markers(마커 수), missing_pct, most_missing, longest_gap_s, spike_frames, ...}}` |
+| `physics FILE [--balance harness]` | 물리 검사. 기본은 MuJoCo 골반 보조 힘(클립당 몇 초, 라이선스 동의 불필요). `--balance pd`/`gmt`는 MuJoCo 제어기 없음 / GMT, `isaac [--assist 1]`은 Isaac PhysX(짧은 클립 약 1분, EULA 동의 필요) | `physics.metrics`(phys_falls, phys_fall_causes, phys_harness_pct, phys_saturated_pct, phys_body_error_cm, phys_ok, 토크 한계 없는 관절이 있으면 phys_torque_limits_missing), `physics.falls[]`(`time_s`, `cause`(한글), `cause_id`, `onset_s`, `rule`(MuJoCo 판정), `after_clip`, `evidence`, `others`), `physics.first_fall_cause` |
+| `video FILE [--out X.mp4] [--physics [--balance B]]` | Isaac으로 녹화(EULA 동의 필요). `--physics`면 그 균형 제어로 시뮬레이션한 결과를 녹화(계산이 실패하면 녹화하지 않고 종료 코드 1) | `video` 경로 |
 | `setup [--offline]` | 설치 도우미 점검: Blender·GMT·Isaac Sim·SMPL-X가 이 PC에 있는지, 없으면 설치할 수 있는지(GPU·드라이버·디스크·인터넷·쓰기 권한) | `components[]`(key, state, action, found, detail, note, requirements[], license) |
 | `setup --install KEY [--accept-license] [--source ZIP]` | 그 구성 요소를 필요할 때만 설치. 이미 호환되는 것이 있으면 아무것도 받지 않음 | 설치 뒤 상태 |
 | `api` | 떠 있는 창의 HTTP API 주소와 토큰 | `url`, `token` |
 | `install-skill [--project DIR]` | 이 안내를 Claude Code 스킬 폴더에 복사 | `installed` |
 
 - **모션 파일:**
-  - 사람 모션: BVH, FBX(Blender 필요), AMASS SMPL-X `*_stageii.npz`(SMPL-X 모델 필요), C3D.
-  - 로봇 모션: npz, Unitree csv, GMR pkl.
-  - 사람 모션은 처음 열 때 리타게팅합니다. 처음에는 몇 초에서 수십 초가 걸리고, 다음부터는 캐시에서 바로 나옵니다.
+  - 사람 모션: BVH(관절 이름의 공백·UTF-8 BOM 됨), FBX(Blender 필요, 바이너리 FBX만), AMASS SMPL-X `*_stageii.npz`(SMPL-X 모델 필요), C3D.
+  - 로봇 모션: npz, Unitree csv(머리글 없이 숫자만 8열 이상. `#` 주석 줄·줄 끝 주석(`np.savetxt`의 `header=`)은 건너뜀. 다른 csv 표는 모션 목록·`batch`에서 빠짐), GMR pkl.
+  - 잘렸거나 손상된 로봇 csv는 "N번째 줄의 열이 …" / "N번째 줄 M번째 칸(…)을 숫자로 읽지 못했습니다"(N은 주석·빈 줄도 센 파일의 줄 번호), 깨졌거나 다른 형식의 pkl은 "GMR pkl 모션 파일이 아닙니다" 오류입니다.
+  - 사람 모션은 처음 열 때 리타게팅합니다. 처음에는 몇 초에서 수십 초가 걸리고, 다음부터는 캐시에서 바로 나옵니다. RetLens 업데이트로 리타게팅 방식이 바뀌면 한 번 다시 계산합니다.
+  - 파일 읽기에서 빠진 것이 있으면 `inspect`·`/api/motion`에 `warnings`(목록)가 나옵니다. 예: FBX의 다른 사람 골격, 사람이 아닌 큰 골격(관절 8개 이상).
 - **리타게팅 보정:** 모션을 여는 명령(`inspect`, `metrics`, `compare`, `align`, `retarget`, `batch`, `export`, `physics`, `video`)은 사람 모션을 어떻게 리타게팅할지 정하는 옵션을 받습니다. 로봇 모션은 그대로 엽니다.
-  - `--robot MODEL`: 리타게팅할 로봇. `unitree_g1` 또는 휴머노이드의 MJCF(.xml)·URDF(.urdf) 경로(기본은 환경 설정 > 로봇 모델, 비면 G1). 처음 쓰는 로봇은 `robot MODEL`로 부위가 맞게 찾아졌는지 먼저 봅니다. 결과 캐시는 모델 파일 내용으로 구분됩니다.
-  - `--smooth HZ`: 평활화(기본 6, 0 = 끔).
+  - `--robot MODEL`: 리타게팅할 로봇. `unitree_g1`, `unitree_g1_with_hands` 또는 휴머노이드의 MJCF(.xml)·URDF(.urdf) 경로(기본은 환경 설정 > 로봇 모델, 비면 G1). RetLens에 든 G1 모델 파일의 경로는 그 내장 모델로 봅니다(이전 버전에서 그 경로로 만든 모션·세션도 그 내장 G1의 것으로 봐 `robot_mismatch`가 없음). 처음 쓰는 로봇은 `robot MODEL`로 부위가 맞게 찾아졌는지 먼저 봅니다. 결과 캐시는 모델 파일 내용으로 구분됩니다.
+  - `--smooth HZ`: 평활화(기본 6, 0 = 끔). 0이 아니면 0보다 크고 15보다 작아야 합니다(30 fps의 절반).
   - `--foot-flat`: 디딤발 평평 보정.
-  - `--swing-clearance CM`: 스윙 발 보정(권장 2).
+  - `--swing-clearance CM`: 스윙 발 보정(권장 2, 0–10).
   - `--self-collision`: 자기 관통 보정. 바꾼 내용은 `self_collision`(바뀐 프레임 수, 3 cm 넘게 파고든 프레임 전→후, 가장 깊은 곳 전→후, 남은 부위 쌍과 그 프레임 수 `unresolved_pairs`)에 있습니다.
   - 설정마다 캐시가 따로 있어서 보정 전후를 각각 열 수 있습니다. 어떤 설정으로 만들었는지는 `retarget`(smooth_hz, foot_flat, swing_clearance_cm, self_collision)에 나옵니다. 디딤발 평평 보정이 바꾼 내용은 `foot_flat`(바뀐 프레임 수, 디딤 중 발 pitch·기울기 전→후, 골반을 낮춘 높이 `root_drop_cm`, 두 발 높이차 `two_feet_height_diff_cm`)에 있습니다.
-- **C3D:** 마커만으로는 로봇을 움직일 수 없습니다. 같은 이름의 솔버 결과(BVH → FBX → AMASS 순)를 찾아 그것을 리타게팅하고, 마커를 옆에 그립니다. 없으면 오류가 납니다.
+- **C3D:** 마커만으로는 로봇을 움직일 수 없습니다. 같은 이름의 솔버 결과(BVH → FBX → AMASS 순)를 C3D와 같은 폴더에서 먼저, 없으면 기본 모션 폴더에서 찾아 그것을 리타게팅하고, 마커를 옆에 그립니다. 없으면 오류가 납니다.
+  - 쓴 파일은 `solved_motion`입니다. `c3d.solved_elsewhere`가 true면 기본 모션 폴더에서 찾은 것입니다.
+  - `c3d.take_warning`이 있으면 다른 촬영일 수 있습니다. 마커 골반이 솔버 결과의 골반과 평균 20 cm 넘게 떨어져 있거나, 10 cm 넘게 떨어져 있고 C3D와 솔버 결과의 길이가 5% 넘게 다를 때입니다(이때는 두 길이도 적힘). 같은 촬영도 골격 루트 위치 때문에 11 cm 안팎 떨어질 수 있습니다. 보고할 때 함께 적습니다.
+  - C3D의 `objects`·`prop_files`와 손–물체 지표는 솔버 결과의 물체입니다(창의 3D 화면에는 그리지 않음).
+  - C3D도 솔버 골격과 비교한 `retarget_score`·품질 지표가 나옵니다(그 솔버 결과를 연 것과 같은 값).
 
 ## 3. 로컬 HTTP API (떠 있는 RetLens 창)
 
@@ -66,6 +76,9 @@ RetLens는 사람 모션캡처를 휴머노이드 로봇으로 옮기고(리타�
 - **주소와 토큰:** `retlens-cli api`, 또는 사용자 데이터 폴더의 `api.json`에서 읽습니다(설치판 `%LOCALAPPDATA%\RetLens\api.json`, 저장소 `data\api.json`). 토큰은 창을 켤 때마다 바뀝니다.
 - 모든 요청에 `Authorization: Bearer <token>` 헤더가 있어야 합니다. 웹 페이지의 요청(`Origin` 헤더)은 거부합니다.
 - 응답은 `{"ok": true, ...}` 또는 `{"ok": false, "error": "..."}`이고, 오류면 HTTP 코드도 4xx/5xx입니다.
+- **값 검사:** 참/거짓 값은 `true`/`false`, `1`/`0`, `"true"`/`"false"`/`"yes"`/`"no"`/`"on"`/`"off"`를 받습니다. `/api/labels`의 `auto`와, `/api/labels`·`/api/session`의 `"save": true`도 같습니다(`"save": "true"`, `?auto=1`). 그 밖의 값, 숫자가 아니거나 범위 밖의 숫자는 400이고 아무것도 바뀌지 않습니다.
+  - 쿼리 문자열에 같은 키를 여러 번 쓰면 목록입니다(`?paths=a&paths=b`는 둘 다 엶). 목록을 받지 않는 값이면 400(id는 404)입니다.
+  - 범위: `offset_s` ±600, `speed` 0.01–16, `tol_cm` 0.5–50, `time_s` 유한한 수, `problem` 1 또는 -1, `assist` 0 이상.
 
 ```powershell
 $api = Get-Content "$env:LOCALAPPDATA\RetLens\api.json" | ConvertFrom-Json      # 저장소에서는 data\api.json
@@ -78,37 +91,57 @@ Invoke-RestMethod "$($api.url)/api/open" -Method Post -Headers $h -ContentType "
 | 요청 | 내용 |
 |---|---|
 | `GET /api/help` | 모든 엔드포인트 |
-| `GET /api/status` | 시각, 재생 상태, 물리 모드, 겹쳐 비교, 열린 모션, `robot`(창의 로봇: name, builtin, model, digest, dof, height_m, notes). 모션에 `robot_mismatch`가 있으면 다른 로봇의 모션일 수 있다는 뜻(관절은 이름으로 맞추고 나머지는 0) |
+| `GET /api/status` | 시각, 재생 상태, 물리 모드, 겹쳐 비교, 열린 모션, `robot`(창의 로봇: name, builtin, model, digest, dof, height_m, notes). 모션에 `robot_mismatch`가 있으면 다른 로봇의 모션일 수 있다는 뜻(관절은 이름으로 맞추고 나머지는 0). 로봇 이름이 같은데 나오면 모델 파일이 바뀌었거나 이전 버전 RetLens에서 만든 모션(원본을 다시 리타게팅하면 없어짐) |
 | `GET /api/checks` | 환경 점검 |
 | `GET /api/library?query=walk` | 모션 파일 목록 |
-| `POST /api/open {"paths": [...]}` | 열기(창에 나타나고 선택됨) |
-| `POST /api/retarget {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 리타게팅 보정(창의 "리타게팅" 메뉴). 다음에 여는 사람 모션부터 적용되고, 이미 연 모션은 그대로입니다. 지금 설정은 `/api/status`의 `retarget` |
+| `POST /api/open {"paths": [...]}` | 열기(창에 나타나고 선택됨). `paths`는 목록 또는 경로 하나. 먼저 모든 파일을 검사해, 없는 파일이면 404, 작업 세션(`.retlens`, `/api/session {"open"}`으로)이나 라벨 파일(`/api/labels {"id", "path"}`로)이면 422이고 아무것도 열지 않음. 같은 촬영의 물체 FBX는 열지 않고 `skipped[]`(path, why)에 적음(사람 FBX와 함께 주면 그 모션에 그려짐. 그 사람이 쓰지 않는 같은 이름의 사본이면 why가 "another copy of this take's prop file is drawn with the person's motion (같은 이름의 <폴더> 파일을 씀)". 물체 FBX만 주면 422). 그다음 하나씩 열고 열지 못한 파일은 `failed[]`(path, error)에 적으므로 꼭 확인. 하나도 못 열었을 때만 오류(모두 읽을 수 없는 파일이면 422, 그 밖은 500) |
+| `POST /api/retarget {"foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 리타게팅 보정(창의 "리타게팅" 메뉴). 다음에 여는 사람 모션부터 적용되고, 이미 연 모션은 그대로입니다. `swing_clearance_cm`이 0–10 밖이거나 숫자가 아니면 400이고 아무 보정도 바뀌지 않음. 지금 설정은 `/api/status`의 `retarget` |
 | `POST /api/remove {"id", "discard_edits"?}` | 닫기. 라벨에 저장하지 않은 편집이 있으면 409(`discard_edits: true`는 사용자가 버려도 된다고 했을 때만) |
 | `GET /api/motion?id=...` | 모션 하나의 QC·지표·C3D·물리·구간 라벨 |
 | `POST /api/item {"id", "visible"?, "offset_s"?, "show_human"?}` | 보이기, 시간 오프셋, 사람 스켈레톤 |
 | `POST /api/labels {"id", "path"?}` | 구간 라벨: `path` 파일을 붙임 / `"path": null`이면 뺌 / `path`가 없으면 다시 읽음(모션 옆에서 찾은 라벨은 열 때처럼 다시 찾고, 고른 파일은 그 파일을) |
 | `POST /api/labels {"id", "auto": true, "rules"?}` | 자동 라벨: 규칙 파일(`rules`, 없으면 사용자가 고른 설정)대로 붙임. 붙일 수 없으면(로봇 모션, 깨진 규칙) 422이고 라벨은 그대로. 저장하지 않은 편집이 있으면 위 둘과 함께 409(`discard_edits: true`) |
-| `POST /api/labels {"id", "edit", "index"?, "expect"?, ...}` | 라벨 편집(창과 같은 한 단계, Ctrl+Z로 되돌림): `bounds {"start_s"?, "end_s"?}`, `rename {"label"}`, `split {"time_s"}`, `delete`, `merge {"with": "next"\|"prev"}`, `add {"track", "time_s", "label"}`(그 시각의 빈칸을 채움), `undo`, `redo`. `index`는 `labels.segments`의 순서, `expect {"label", "start_s"}`가 다르면 409(그사이 바뀜). 시간은 모션 초, 프레임에 맞춰짐. 답의 `segment`는 편집한/새 구간의 순서. `labels.unsaved_edits`, `undo`, `redo` |
+| `POST /api/labels {"id", "edit", "index"?, "expect"?, ...}` | 라벨 편집(창과 같은 한 단계, Ctrl+Z로 되돌림): `bounds {"start_s"?, "end_s"?}`, `rename {"label"}`, `split {"time_s"}`, `delete`, `merge {"with": "next"\|"prev"}`, `add {"track", "time_s", "label"}`(그 시각의 빈칸을 채움), `undo`, `redo`. `index`는 `labels.segments`의 순서, `expect {"label", "start_s"}`가 다르면 409(그사이 바뀜). 시간은 모션 초, 프레임에 맞춰짐. 시간이 숫자가 아니면 422. 답의 `segment`는 편집한/새 구간의 순서. `labels.unsaved_edits`, `undo`, `redo` |
 | `POST /api/labels {"id", "save": true \| "D:/x.labels.csv", "overwrite"?}` | 라벨을 CSV로 저장(`true`: 모션 옆 `<이름>.labels.csv`). 있는 파일은 `overwrite: true`일 때만(무엇을 잃는지 409 메시지에), 폴더의 여러 모션 표·라벨 파일이 아닌 파일에는 저장하지 않음 |
-| `GET /api/session` | 작업 세션: 열린 세션 파일(`path`), 바뀜(`dirty`), 여는 중이면 `restoring {done, total, current}`, 열지 못한 모션(`unresolved`) |
-| `POST /api/session {"save": true \| "C:/x.retlens", "overwrite"?}` / `{"open": PATH, "mode": "replace"\|"add", "discard_changes"?}` | 작업 세션 저장 / 열기(열린 모션, 보정, 시간 오프셋, 보이기, 라벨(고친 것 포함), 겹쳐 비교, 씬 설정, 물리 모드, 재생 위치). 여는 것은 바로 돌아오고 `GET /api/session`의 `restoring`이 없어질 때까지 기다린 뒤 `last_open`(열린 모션, `failed`, `notes`)을 봅니다. 모션이 열려 있으면 `mode`가 필요(409). `replace`는 열린 세션에 저장하지 않은 변경이 있거나, 세션 파일이 없는 작업에 저장하지 않은 라벨 편집이 있으면 409(`discard_changes`). `add`는 모션만 더하고(씬 설정·물리·겹쳐 비교는 그대로), API로 열면 물리 모드는 MuJoCo 보조 힘·없음만 다시 켭니다(GMT·Isaac은 꺼진 채, `notes`에 나옴) |
-| `POST /api/playback {"play"?, "time_s"?, "speed"?, "loop"?}` | 재생/정지, 시각 이동 |
+| `GET /api/session` | 작업 세션: 열린 세션 파일(`path`), 바뀜(`dirty`), 여는 중이면 `restoring {done, total, current}`, 열지 못한 모션(`unresolved`: 그 파일을 창이나 `/api/open`으로 열면 빠짐) |
+| `POST /api/session {"save": true \| "C:/x.retlens", "overwrite"?}` / `{"open": PATH, "mode": "replace"\|"add", "discard_changes"?}` | 작업 세션 저장 / 열기(열린 모션, 보정, 시간 오프셋, 보이기, 라벨(고친 것 포함), 겹쳐 비교, 씬 설정, 물리 모드, 재생 위치). 저장은 파일을 쓸 수 없으면 500(이유 포함, 창에 대화 상자는 뜨지 않음), 세션을 여는 중이면 409. 여는 것은 바로 돌아오고 `GET /api/session`의 `restoring`이 없어질 때까지 기다린 뒤 `last_open`(열린 모션, `failed`, `notes`: 다른 로봇이나 바뀐 모델 파일로 저장한 세션이면 그 알림도)을 봅니다. 모션이 열려 있으면 `mode`가 필요(409). `replace`는 열린 세션에 저장하지 않은 변경이 있거나, 세션 파일이 없는 작업에 저장하지 않은 라벨 편집이 있으면 409(`discard_changes`). `add`는 모션만 더하고(씬 설정·물리·겹쳐 비교는 그대로), API로 열면 물리 모드는 MuJoCo 보조 힘·없음만 다시 켭니다(GMT·Isaac은 꺼진 채, `notes`에 나옴) |
+| `POST /api/playback {"play"?, "time_s"?, "speed"?, "loop"?}` | 재생/정지, 시각 이동(`speed` 0.01–16) |
 | `GET /api/metrics?ref=...` | 분석 표 |
 | `POST /api/align {"ref"}` | 시간 자동 정렬 |
-| `POST /api/compare {"a", "b", "heading"?, "tol_cm"?}` / `{"on": false}` | 겹쳐 비교를 켜고 수치 받기 / 끄기 |
+| `POST /api/compare {"a", "b", "heading"?, "tol_cm"?}` / `{"on": false}` | 겹쳐 비교를 켜고 수치 받기 / 끄기. `tol_cm`은 0.5–50. 답은 `compare`와 같고 `offsets_s` {a, b}(두 모션의 시간 오프셋: `worst_moments`의 `time_s`는 타임라인 시각, B 자신의 시각은 `time_s − offsets_s.b`) |
 | `POST /api/playback {"problem": 1 \| -1, "id"?}` | 다음 / 이전 문제 시작으로(그 모션, 없으면 보이는 모든 모션). `GET /api/motion`의 `problems`는 종류별 `[시작, 끝]`(slip·penetration·swing_low·self_collision·joint_limit·marker_gap·fall) |
-| `GET/POST /api/batch` | 창의 데이터셋 탭에서 일괄 처리: `{"folders", "physics"?, "auto_labels"?}`로 시작, `{"stop": true}`, GET은 진행(`running`)·합계·지금까지의 행 |
+| `GET/POST /api/batch` | 창의 데이터셋 탭에서 일괄 처리: `{"folders", "physics"?, "auto_labels"?}`로 시작(`folders`는 폴더·모션 파일의 목록 또는 하나, 없는 것이 있으면 404), `{"stop": true}`, GET은 진행(`running`)·합계(`phys_errors` 포함)·지금까지의 행 |
 | `GET/POST /api/segments` | 유형별 재생: 열린 모션들의 "트랙: 라벨" 목록(구간 수·초). `{"key", "solo"?, "play"?}`로 그 라벨 구간을 차례로 재생, `{"step": ±1}`, `{"stop": true}` |
-| `POST /api/retarget {"id", "foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 그 모션만 다른 보정으로 다시 리타게팅해 같은 자리에(`score_before`, `score`). `{"id", "recommend": true}`는 보정 조합 8가지의 리타게팅 점수 순위(처음엔 몇 분) |
+| `POST /api/retarget {"id", "foot_flat"?, "swing_clearance_cm"?, "self_collision"?}` | 그 모션만 다른 보정으로 다시 리타게팅해 같은 자리에(`score_before`, `score`). 라벨, 시간 오프셋, 겹쳐 비교의 A·B 자리는 그대로. `swing_clearance_cm`이 0–10 밖이거나 숫자가 아니면 400(아무것도 바뀌지 않음). `{"id", "recommend": true}`는 보정 조합 8가지의 리타게팅 점수 순위(처음엔 몇 분) |
 | `POST /api/physics {"on", "assist"?, "balance"?}` | 물리 모드. `balance`: `harness`(MuJoCo 보조 힘, 기본) / `pd`(MuJoCo 제어기 없음) / `gmt`(MuJoCo GMT 추적 정책) / `isaac`(Isaac 보조 힘, `assist` 배율, EULA 동의 필요). 결과는 `/api/jobs`·`/api/motion`으로 확인 |
 | `POST /api/video {"id"}` | 동영상 저장(대기열) |
 | `GET /api/jobs` | 물리(Isaac·MuJoCo)·동영상 작업 상태와 결과 경로 |
 | `POST /api/camera {"fit": true}` | 카메라 맞추기 |
 | `POST /api/screenshot {"path"?}` | 창 스크린샷 PNG(경로를 돌려줌, 이미지로 읽어 확인 가능) |
 
-- `id`는 모션 라벨(`"cmu_bvh/02_01"` 처럼 폴더/파일 이름, 한 장면에서 유일)입니다. 순서 번호(0부터)나 파일 이름도 됩니다.
+- `id`는 모션 라벨(`"cmu_bvh/02_01"` 처럼 폴더/파일 이름, 한 장면에서 유일)입니다. 순서 번호(0부터), 파일 이름, 절대 경로(슬래시 방향·대소문자, 8.3 짧은 이름 `C:\Users\ABCDEF~1\...` 무관)도 됩니다. 파일 이름이나 경로가 열린 모션 여럿에 맞으면(같은 파일을 두 번 열었거나 다른 폴더의 같은 이름 파일) 409이니 라벨을 씁니다. 404·409 메시지에는 보낸 id가 그대로 나옵니다.
 
 ## 4. 알아야 할 개념
+
+- **손가락:** 로봇 손에 손가락 관절이 있으면(예: 내장 `unitree_g1_with_hands`), 리타게팅이 사람 골격의 손가락 굽힘을 로봇 손가락에 옮깁니다. 손가락 관절이 없는 모델은 손이 모델 모양 그대로입니다(한 덩어리). AMASS SMPL-X는 손가락을 따르지 않습니다.
+  - 결과는 `inspect`·`/api/motion`의 `fingers`에 나옵니다. `rest`는 굽힘 기준입니다: "rest pose"(rest 자세에서 펴진 사람 손가락 마디), "clip"(클립에서 가장 편 값), "mixed"(마디마다 다름: rest 자세에서 굽은 마디만 클립 값). `rest_joints` {rest, clip}는 각 기준을 쓴 마디 수입니다.
+  - 로봇 손가락별 결과는 `fingers.fingers.<left|right>.<로봇 손가락>`에 있습니다: `from`(따른 사람 손가락), `joints`, `max_deg`(관절마다 최대 굽힘, 도, 평활화 뒤).
+  - `notes`에는 맞는 사람 손가락이 없거나 오므리는 관절을 찾지 못한 경우가 나오고, 따르지 못했으면 `error`가 나옵니다.
+  - 손가락 관절은 "관절 한계 걸림"에서, 같은 손 안의 접촉은 "자기 충돌"에서 빠집니다.
+
+- **물체(FBX):** 사람 FBX 안의 물체에 더해, 같은 촬영의 물체만 든 FBX도 함께 그립니다. 예: `Takes_Raw\M1\pick_010_M1.fbx`에 `Prop_Raw\pick_010_Prop.fbx`. 찾는 규칙은 사용 설명서 "따로 받은 물체 FBX"에 있습니다.
+  - 요약: 물체 파일은 이름이 `_Prop`(`_Props`, `_Prop2`, `_Prop_1`)로 끝나는 FBX이고, 그 앞이 촬영 이름입니다. 사람 파일 이름 그대로, 없으면 마지막 `_부분`(배우)을 뗀 이름과 맞춥니다.
+  - 찾는 곳은 사람 파일 폴더와 위 두 단계, 그 바로 아래의 prop 폴더입니다.
+  - prop 폴더 안이나 같은 촬영의 사람 파일 옆에 있는 물체 파일은 모션 목록·일괄 처리에서 빠집니다. `batch`·`export`·`summary`는 다른 곳에 있어도 함께 처리하는 사람 FBX가 쓰는 물체 파일을 뺍니다.
+  - 그런 물체 파일은 창이나 `/api/open`으로 열어도 모션으로 열지 않습니다(`/api/open`은 `skipped`에 적고, 그것만 주면 422). 같은 이름의 물체 파일이 여러 폴더에 있으면(`Prop_Raw`, `Prop_Clean`) 사람 쪽 폴더와 이름이 맞는 것(`Takes_Clean` → `Prop_Clean`) 하나만 쓰고, 쓰지 않는 사본은 `skipped`의 why에 "another copy …"로 나옵니다. 그 밖의 물체만 든 FBX를 열면 사람 골격이 아니라는 오류가 납니다.
+  - 사람 FBX 안에 작은 골격(관절 8개 미만, 움직임)으로 든 물체(`Ball_1` > `Ball_1:root`)도 `objects[]`에 나옵니다. 골격이 매달린 빈 노드(`reference` 등)는 물체가 아닙니다.
+  - `objects[]`에는 따로 받은 물체마다 `file`·`group`(물체 이름)·`parent`(`objects` 안의 위 마디 번호)·`shape`가, `prop_files[]`에는 읽은 파일·쓴 take·`overlap_pct`(모션과 시간 겹침 %)·모양 파일(`shapes`)·오류·쓰지 않은 파일(`skipped`)이 나옵니다. C3D는 솔버 결과의 것이 나옵니다.
+  - 이런 파일에는 대개 모양이 없습니다. `shape`는 이렇게 읽습니다.
+    - "(기본값)"으로 끝나면 추정한 모양입니다(이름에 ball → 지름 10 cm 구).
+    - "(모양 파일)"이면 사용자의 `props.yaml` 모양이고, "파일의 메시"로 시작하면 파일의 메시입니다.
+    - `vertices`가 0이면(`shape`가 비었거나 "모양 파일 오류: …") 모양이 없어 원점까지의 거리만 씁니다.
+    - 손–물체 수치를 보고할 때는 어느 경우인지 함께 적습니다. `overlap_pct`가 낮으면 물체가 멈춘 채 측정된 것입니다.
+  - 실제 모양은 사용자가 `props.yaml`에 적습니다(사용 설명서 "따로 받은 물체 FBX"). 그 파일은 사용자의 데이터이므로 대신 만들거나 고치지 말고, 필요하면 제안만 합니다.
 
 - **구간 라벨:** 모션에 라벨 파일이 있을 수도 없을 수도 있습니다. 열 때 모션 옆의 `<이름>.labels.csv`·`.labels.json`·`_labels.csv`·`_subtask.csv`, 또는 폴더의 `labels.csv`(`seq` 열이 그 모션인 행. 이름이 다르면 같은 촬영 `02_01_stageii` = `02_01`. 이 표에 `seq` 열이 없으면 오류)를 찾습니다. C3D는 솔버 결과 폴더의 라벨도 찾습니다. CSV 열은 `label`(필수), `start_s`·`end_s`(초, 끝 제외) 또는 `start_frame`·`end_frame`(끝 포함, `fps` 열이 없으면 RetLens에 보이는 fps: 리타게팅한 사람 모션은 보통 30이라 원본 프레임 번호면 `fps` 열 필요), 선택 `track`·`name`·`object`·`note`·`color`·`seq`입니다.
   - `inspect`·`/api/motion`의 `labels`가 `null`이면 라벨 파일이 없는 것입니다. 있으면 `file`, `tracks`, `segments[]`(label, start_s, end_s, track), `now`(지금 시각의 라벨), `error`(쓸 수 없는 파일의 이유), `notes`(뺀 행, 잘린 구간)가 나옵니다. `/api/status`에는 `segments`를 뺀 요약만 나옵니다.
@@ -150,10 +183,10 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | `retarget_grade` (`retarget_score`) | 리타게팅 점수 | 0–100점과 등급(85 이상 좋음, 70 이상 보통, 그 밖 나쁨). 사람 모션을 리타게팅한 것만 | 아래 품질 지표와 발 미끄러짐·정적 불균형·바닥 관통이 기준을 넘은 만큼 깎음. 무엇이 깎였는지는 `retarget_quality.score_lost` |
 | `pose_err_deg` | 자세 재현 오차 (°) | 허벅지·정강이·위팔·아래팔(좌우)과 몸통(골반 → 양 어깨 가운데)이 사람과 다른 방향을 가리키는 각도 평균 | 로봇 크기·비율과 무관. 8° 이하 좋음, 25° 이상 나쁨. 부위별 값은 `retarget_quality.segments_deg` |
 | `contact_mismatch_pct` | 발 접촉 불일치 (%) | 사람과 로봇 중 한쪽 발만 바닥에 닿은 프레임(발마다) | `contact_lost_pct`(사람은 딛는데 로봇 발은 뜸)·`contact_extra_pct`(로봇 발만 붙어 있음)로 나뉨 |
-| `joint_limit_pct` | 관절 한계 걸림 (%) | 어느 관절이든 가동 범위 끝(1° 안)에 붙은 프레임 | 로봇 관절이 동작을 따라갈 만큼 못 돎. 어떤 관절인지는 `retarget_quality.pinned_joints_pct` |
-| `self_collision_pct` | 자기 충돌 (%) | 로봇 몸끼리 3 cm 넘게 파고든 프레임(충돌 형상 기준) | 대개 손이 엉덩이·몸통·다른 손을 뚫음. 부위는 `retarget_quality.collision_pairs_pct`. `--self-collision`으로 다시 봄 |
-| `hand_obj_reach_pct` | 물체 닿음 재현 (%) | FBX에 물체가 있을 때만. 사람 손바닥이 물체 표면 6 cm 안인 프레임 중 로봇 같은 손도 6 cm 안인 비율 | 낮으면 리타겟된 손이 물체를 못 잡음(팔 길이·비율). 물체별은 `objects[]`(contact_s, robot_distance_cm) |
-| `hand_obj_err_cm` | 손–물체 거리 (cm) | 같은 프레임들에서 로봇 손–물체 표면 평균 거리 | 물체 위치는 사람 스켈레톤처럼 로봇 크기로 옮긴 근삿값, 크기는 실제 그대로 |
+| `joint_limit_pct` | 관절 한계 걸림 (%) | 어느 관절이든(손가락 관절은 뺌) 가동 범위 끝(1° 안)에 붙은 프레임 | 로봇 관절이 동작을 따라갈 만큼 못 돎. 어떤 관절인지는 `retarget_quality.pinned_joints_pct` |
+| `self_collision_pct` | 자기 충돌 (%) | 로봇 몸끼리 3 cm 넘게 파고든 프레임(충돌 형상 기준, 같은 손 안끼리는 뺌) | 대개 손이 엉덩이·몸통·다른 손을 뚫음. 부위는 `retarget_quality.collision_pairs_pct`. `--self-collision`으로 다시 봄 |
+| `hand_obj_reach_pct` | 물체 닿음 재현 (%) | FBX에 물체가 있을 때만(C3D는 솔버 결과의 물체). 사람 손(손바닥 가운데나 손가락 뿌리 중 하나)이 물체 표면 6 cm 안인 프레임 중 로봇 같은 손(손바닥 점: 손가락 관절이 있으면 손 몸체와 손가락 뿌리의 가운데, 없으면 손 몸체)도 닿은 비율. 로봇 손은 6 cm + 사람의 손바닥 여유(사람 손바닥 점이 물체에 가장 가까운 손 점보다 물체에서 더 먼 만큼, 로봇 크기에 맞춤) 안이면 닿음. 손바닥으로 쥐면 여유 0, 손가락으로 쥔 공은 그만큼 더 | 낮으면 리타겟된 손이 물체를 못 잡음(팔 길이·비율). 물체별은 `objects[]`(contact_s, robot_distance_cm) |
+| `hand_obj_err_cm` | 손–물체 거리 (cm) | 같은 프레임들에서 로봇 손바닥 점–물체 표면 평균 거리(여유를 빼지 않은 값) | 물체 위치는 사람 스켈레톤처럼 로봇 크기로 옮긴 근삿값, 크기는 실제 그대로 |
 | `acc_mean` | 관절 가속도 (rad/s²) | 관절 각가속도 크기 평균 | 같은 동작끼리 비교. 클수록 떨림 |
 | `jerk_mean` | 관절 저크 (rad/s³) | 각가속도 변화율 평균 | 떨림에 가장 민감 |
 | `vel_max` | 최대 관절속도 (rad/s) | 가장 빠른 관절 속도 | 모터 한계(대략 20–30 rad/s) 근처면 의심 |
@@ -170,6 +203,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | `phys_fall_causes` | 물리: 넘어짐 원인 | 1차 원인별 횟수, 많은 순(같으면 발끝 걸림·발 미끄러짐·자기충돌 근접·토크 포화·지지면 이탈·보조 힘 급증 순. 예: `지지면 이탈 7 · 발끝 걸림 1 · 토크 포화 1`, Isaac은 앞 20회만이면 `(앞 20회)`) | 넘어짐 직전 0.75초에 먼저 시작된 조건. `toe_catch`(발끝 걸림) → 스윙 발 보정, `support_exit`(지지면 이탈)이고 `evidence.clip_com_margin_cm` < 0이면 원본 자체가 불균형(디딤발 평평 보정·`static_unbalanced_pct`), `self_collision` → 자기 관통 보정, `torque_saturation` → `evidence.joint`, `foot_slip` → `planted_slip_pct`. GMT에서는 정책이 발을 일부러 디디고 있어도 발끝 걸림으로 나올 수 있음 |
 | `phys_body_error_cm` | 물리: 몸 위치 오차 (cm) | MuJoCo 결과만: 골반 기준 몸통·무릎·발목·팔꿈치·손 위치가 원본과 다른 평균 | CMU 17클립에서 GMT 3–7 cm, 제어기 없음 7–11 cm |
 | `phys_saturated_pct` | 물리: 토크 한계 초과 (%) | 관절 토크가 모터 한계를 넘은 프레임 | |
+| `phys_torque_limits_missing` | (분석 표에 없음) | G1이 아닌 로봇의 MuJoCo 결과만: 토크 한계가 없는 관절 수(결과 json의 `torque_limits_missing`) | 그 관절은 1000 N·m로 두어 토크 포화를 판정하지 않음. 그만큼 `phys_saturated_pct`·토크 포화 원인이 덜 나옴. 창의 물리 결과 줄 끝에 "토크 한계 없는 관절 n개(토크 포화 판정 안 함)" |
 | `phys_ok` | 물리 판정 | "통과" 또는 걸린 기준 | 넘어짐 없음, 보조 힘 > 체중 20% 프레임 5% 이하, 토크 초과 5% 이하 |
 
 `ik_position_residual`은 리타게팅 IK가 목표 위치를 못 맞춘 정도(cm, pelvis/feet/hands)입니다. 손은 로봇 팔이 짧아 10 cm 안팎도 흔합니다. `c3d`는 원본 마커 QC입니다(빠짐 %, 가장 긴 공백, 튐 = 두 샘플 사이 10 m/s 넘는 이동, 마커 라벨 뒤바뀜이나 유령 점).
@@ -215,7 +249,7 @@ QC(`qc`)는 PASS / WARN / FAIL입니다. 사람 모션의 hard 플래그 프레�
 | 401 | 토큰이 틀림. 창을 다시 켜면 바뀌므로 `api.json`을 다시 읽음 |
 | FBX·SMPL-X를 못 엶 | `info`의 `checks`(blender / smpl), `setup`. 사용자가 환경 설정이나 설치 도우미에서 지정·설치 |
 | 균형 제어 GMT "설치 필요" | `setup`의 `gmt`. 연구용 라이선스에 사용자가 동의하면 설치 도우미(또는 `setup --install gmt --accept-license`)로 받음. PyTorch는 필요 없음 |
-| 물리 "실행할 수 없음" | Isaac(`balance` `isaac`, 녹화)이면 Isaac Sim 경로(`checks.isaac`)와 라이선스 동의 확인. 로봇 USD는 기본으로 NVIDIA 에셋 서버에서 받으므로 인터넷이 필요. MuJoCo면 G1 모델(설치판에 들어 있음, 저장소는 `..\GMT`). G1이 아닌 로봇이면 harness / pd는 그 로봇의 모델로 돌고(G1 게인 × 로봇 질량 / G1 질량, 그 로봇의 토크 한계; 결과 json의 `model`에 적힘), gmt는 G1 전용, isaac은 그 로봇의 USD(환경 설정 > 로봇 USD)가 있어야 됩니다 |
+| 물리 "실행할 수 없음" | Isaac(`balance` `isaac`, 녹화)이면 Isaac Sim 경로(`checks.isaac`)와 라이선스 동의 확인. 로봇 USD는 기본으로 NVIDIA 에셋 서버에서 받으므로 인터넷이 필요. MuJoCo면 G1 모델(설치판에 들어 있음, 저장소는 `..\GMT`). G1이 아닌 로봇이면 harness / pd는 그 로봇의 모델로 돌고(G1 게인 × 로봇 질량 / G1 질량; 결과 json의 `model`에 적힘), gmt는 G1 전용, isaac은 그 로봇의 USD(환경 설정 > 로봇 USD)가 있어야 됩니다. 토크 한계는 관절 자체의 한계(`actuatorfrcrange`, URDF `effort`)가 먼저이고, 없을 때만 모터의 한계(`forcerange` × `gear`, 또는 모터의 `ctrlrange` × `gain` × `gear`, 둘 다 있으면 작은 값)를 씁니다. -1..1로 정규화된 명령(`gain` × `gear` ≤ 1)은 토크가 아니라 보지 않습니다. 둘 다 없는 관절은 1000 N·m로 두어 토크 포화를 판정하지 않습니다. 그 수는 결과의 `torque_limits_missing`, 지표 `phys_torque_limits_missing`(`batch` 행에도), 로봇 `notes`("torque limits missing on N joints", `robot`·`/api/status`)에 나옵니다. 물리는 2프레임 이상, fps가 0보다 큰 모션만 됩니다 |
 | 비교 `frames: 0` | 두 모션이 같이 재생되는 구간이 없음. 오프셋을 확인하거나 `--align` |
 
 자세한 설명은 사용 설명서(설치판: 설치 폴더의 `_internal\docs\manual.md`, 저장소: `docs/manual.md`)에, 지표 정의는 `metrics` 결과의 설명(저장소: `retlens/app/scene.py`의 `METRIC_HELP`)에 있습니다.

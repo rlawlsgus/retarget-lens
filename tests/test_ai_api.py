@@ -167,6 +167,11 @@ def test_http_api(tmp_path, monkeypatch):
         assert _call(f"{u}/api/status", t)[1]["retarget"]["foot_flat"] is True
         assert _call(f"{u}/api/retarget", t, {"swing_clearance_cm": 50})[0] == 400
         assert _call(f"{u}/api/retarget", t, {"foot_flat": False})[1]["retarget"]["foot_flat"] is False
+        for bad in (50, -1, "abc", True):  # refused whole: no correction switched on for the motions opened next
+            code, out = _call(f"{u}/api/retarget", t, {"foot_flat": True, "self_collision": True,
+                                                        "swing_clearance_cm": bad})
+            assert code == 400 and "'swing_clearance_cm'" in out["error"], (bad, out)
+        assert _call(f"{u}/api/status", t)[1]["retarget"] == st["retarget"]  # as before: all off
         out = _call(f"{u}/api/retarget", t, {"self_collision": True})[1]["retarget"]
         assert out["self_collision"] is True and out["foot_flat"] is False
         assert _call(f"{u}/api/retarget", t, {"self_collision": False})[1]["retarget"]["self_collision"] is False
@@ -189,7 +194,7 @@ def test_http_api(tmp_path, monkeypatch):
         code, out = _call(f"{u}/api/labels", t, {"id": a, "auto": True, "rules": str(rules)})
         assert code == 422 and "로봇 모션" in out["error"]  # no skeleton: said, and its labels stay
         assert [s["label"] for s in _call(f"{u}/api/motion?id={a}", t)[1]["labels"]["segments"]] == ["idle", "walk"]
-        assert _call(f"{u}/api/labels", t, {"id": a, "auto": "false"})[0] == 400
+        assert _call(f"{u}/api/labels", t, {"id": a, "auto": "maybe"})[0] == 400  # "false" / 1 are flags (help)
         assert _call(f"{u}/api/labels", t, {"id": a, "auto": True, "path": str(typed)})[0] == 400
         assert _call(f"{u}/api/labels", t, {"id": a, "rules": str(rules)})[0] == 400
         # label editing: one undo step each, unsaved until saved; nothing replaces unsaved edits without saying so

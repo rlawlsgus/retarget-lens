@@ -6,7 +6,7 @@ the window draws, so every number matches what the window shows. The guide for A
 .claude/skills/retlens/SKILL.md.
 
 Motions are named by their label ("cmu_bvh/02_01": folder/file name, unique in a scene); an
-index (0, 1, ...) or a file name also works (find_item).
+index (0, 1, ...), a file name or its absolute path also works (find_item).
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ import time
 
 import numpy as np
 
-from .. import cmu_labels, paths, settings
-from ..compare import Item, library_files
+from .. import cmu_labels, objects, paths, settings
+from ..compare import Item, file_warnings, library_files, measured_human
 from .scene import BALANCE, METRIC_DESC, METRIC_ROWS, MotionScene, SceneOptions, load_robot_drawing
 
 API_VERSION = 1
@@ -59,25 +59,49 @@ def headless_scene(log=None, mesh_cell: float = 0.004, **opts) -> MotionScene:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
-    s = settings.load()
-    opts = {"robot": settings.robot_spec(s), **opts}
-    opts = SceneOptions(smpl_model_dir=settings.find_smpl(s).path or paths.smpl_model_dir(), video_dir=settings.video_dir(s),
-                        **opts)
-    return MotionScene(server, load_robot_drawing(opts.robot, opts.urdf, mesh_cell, log=log), opts, log=log)
+    try:
+        s = settings.load()
+        opts = {"robot": settings.robot_spec(s), **opts}
+        opts = SceneOptions(smpl_model_dir=settings.find_smpl(s).path or paths.smpl_model_dir(),
+                            video_dir=settings.video_dir(s), **opts)
+        return MotionScene(server, load_robot_drawing(opts.robot, opts.urdf, mesh_cell, log=log), opts, log=log)
+    except BaseException:  # stopped now: left running, viser's exit message lands on stdout after the JSON
+        server.stop()
+        raise
+
+
+class AmbiguousItem(KeyError):
+    """A file name or path that several open motions share (the same file opened twice)."""
+
+
+def path_key(path: str) -> str:
+    """A path as the file it names, for comparing two: any slashes and case, 8.3 short names (C:\\Users\\ABCDEF~1)
+    and links resolved (os.path.realpath; a part that does not exist stays as written)."""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except (OSError, ValueError):  # not a path a file can have (a NUL in it)
+        return os.path.normcase(path)
 
 
 def find_item(scene: MotionScene, key) -> Item:
-    """A motion by label ("cmu_bvh/02_01"), index (0 / "0") or file name ("02_01.bvh")."""
+    """A motion by label ("cmu_bvh/02_01"), index (0 / "0"), file name ("02_01.bvh") or absolute path (any
+    slashes and case, long or 8.3 short names: path_key); AmbiguousItem when a file name or path fits several
+    open motions."""
     items = list(scene.items)
     if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
         i = int(key)
         if 0 <= i < len(items):
             return items[i]
-    for it in items:
-        if key in (it.label, os.path.basename(it.source), os.path.abspath(str(key)) if isinstance(key, str) else None,
-                   it.source):
-            return it
-    raise KeyError(f"no motion {key!r}; open ones: {[it.label for it in items]}")
+    hits = [it for it in items if key == it.label]  # labels are unique
+    if not hits and isinstance(key, str):
+        kp = path_key(key) if os.path.isabs(key) else None
+        hits = [it for it in items if key == os.path.basename(it.source) or
+                (kp is not None and kp == path_key(it.source))]
+    if len(hits) > 1:  # the key as sent, in quotes (its repr doubles a path's backslashes)
+        raise AmbiguousItem(f"'{key}' is several open motions: {[it.label for it in hits]}; give the label or index")
+    if hits:
+        return hits[0]
+    raise KeyError(f"no motion '{key}'; open ones: {[it.label for it in items]}")
 
 
 def falls_info(scene, shown, details: bool = True) -> list[dict]:
@@ -118,6 +142,8 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
                                                    "leg_change_deg", "root_drop_cm", "two_feet_height_diff_cm")}
     if item.info.get("foot_reference"):  # T-pose formats: the feet levelled as the clip stands (retarget._canonical_feet)
         out["foot_reference"] = item.info["foot_reference"]
+    if item.info.get("fingers"):  # a robot hand with jointed fingers following the person's (retlens.fingers)
+        out["fingers"] = item.info["fingers"]
     if item.info.get("self_collision"):  # 자기 관통 보정 (retarget.separate_self_collisions)
         sc = item.info["self_collision"]
         out["self_collision"] = {k: sc.get(k) for k in ("frames_changed", "frames_deeper_than_target",
@@ -126,13 +152,18 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
     if item.info.get("c3d"):
         out["c3d"] = item.info["c3d"]
         out["solved_motion"] = item.info.get("solved_motion")
+    warn = file_warnings(item)
+    if warn:  # what the file reader left out, e.g. another person's skeleton in an FBX (retlens.io.fbx)
+        out["warnings"] = warn
     # objects captured with the person (FBX props, retlens.objects): None = none; per object its kind, whether it
-    # moves, the seconds a human hand touches it and the robot hand's mean distance meanwhile
-    objs = item.human.objects if item.human is not None else []
+    # moves, the seconds a human hand touches it and the robot hand's mean distance meanwhile. A C3D's come from its
+    # solved skeleton (its human part is the markers), as its metrics do
+    human = measured_human(item)
+    objs = human.objects if human is not None else []
     per = m.get("_objects")
-    out["objects"] = (per if isinstance(per, list) else
-                      [{"name": o.name, "kind": o.kind, "moves": o.moves, "vertices": int(len(o.vertices))} for o in objs]
-                      ) if objs else None
+    out["objects"] = (per if isinstance(per, list) else [objects.describe(o) for o in objs]) if objs else None
+    if human is not None and human.meta.get("props"):  # the take's prop files (retlens.props)
+        out["prop_files"] = human.meta["props"]
     # labelled time segments (retlens.motion_labels): None = no label file; "now" at the scene's time
     labels = item.labels  # read once: the window's threads may replace it meanwhile
     out["labels"] = labels.summary(scene.t - item.offset, segments=metrics) if labels is not None else None
@@ -216,8 +247,10 @@ def compare(scene: MotionScene, a: Item, b: Item, heading: bool = True, tol_cm: 
     the moments where the whole body differs most."""
     scene.set_compare(on=True, ref=a, item=b, heading=heading, tol_cm=tol_cm)
     s = scene.compare_series()
-    out = {"a": a.label, "b": b.label, "heading": heading, "tol_cm": tol_cm, "frames": 0, "regions": [],
-           "worst_moments": []}
+    # tol_cm: the one used (set_compare keeps it at least 0.1); offsets_s: the two motions' time offsets (an
+    # alignment's result): worst_moments are in timeline time, B's own time is time_s - offsets_s["b"]
+    out = {"a": a.label, "b": b.label, "heading": heading, "tol_cm": scene.compare.tol_cm,
+           "offsets_s": {"a": a.offset, "b": b.offset}, "frames": 0, "regions": [], "worst_moments": []}
     if s is None or not len(s["t"]):
         out["note"] = "the two motions never play at the same time (check their time offsets)"
         return jsonable(out)

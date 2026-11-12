@@ -1,6 +1,7 @@
 # Vendored from GMR (github.com/YanjieZe/GMR @ bb1bbe40774794fceb2a7c579a3464a28e68c844,
 # general_motion_retargeting/params.py, MIT, see LICENSE in this folder). Changed here:
-# - only the Unitree G1 entries (the robot RetLens ships);
+# - only the Unitree G1 entries (the robot RetLens ships); bvh_nokov also for unitree_g1_with_hands
+#   (its body names are the G1's, as for bvh_lafan1);
 # - ASSET_ROOT comes from retlens.paths: the GMR checkout's assets/ next to the repository
 #   when developing, the program's own assets/ folder when installed.
 
@@ -29,6 +30,7 @@ IK_CONFIG_DICT = {
     },
     "bvh_nokov": {
         "unitree_g1": IK_CONFIG_ROOT / "bvh_nokov_to_g1.json",
+        "unitree_g1_with_hands": IK_CONFIG_ROOT / "bvh_nokov_to_g1.json",
     },
     "bvh_xsens": {
         "unitree_g1": IK_CONFIG_ROOT / "bvh_xsens_to_g1.json",

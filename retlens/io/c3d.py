@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 
 import numpy as np
 
@@ -12,15 +14,49 @@ from ..rotations import to_z_up
 _UNITS = {"mm": 0.001, "cm": 0.01, "m": 1.0, "in": 0.0254}
 
 
+def _ascii_temp_dir() -> str:
+    """A new temporary folder whose path is plain ASCII (the user's %TEMP% under a Korean user name is not)."""
+    bases = (tempfile.gettempdir(), os.environ.get("PUBLIC"),
+             os.path.join(os.environ.get("SystemRoot", "C:\\Windows"), "Temp"))
+    for base in bases:
+        if base and base.isascii() and os.path.isdir(base):
+            try:
+                return tempfile.mkdtemp(prefix="retlens_c3d_", dir=base)
+            except OSError:  # not writable here: try the next
+                continue
+    raise OSError("C3D를 읽을 임시 폴더(영문 경로)를 만들지 못했습니다")
+
+
+def _read(path: str):
+    """ezc3d's reading of a C3D file. ezc3d opens the path as narrow characters, so a path with Korean (or other
+    non-ASCII) letters cannot be opened on Windows: such a file is read from a copy in an ASCII temporary folder."""
+    import ezc3d  # optional dependency (conda-forge::ezc3d)
+
+    if not os.path.isfile(path):
+        raise FileNotFoundError(2, "No such file or directory", path)
+    tmp = None
+    try:
+        src = path
+        if not os.path.abspath(path).isascii():
+            tmp = _ascii_temp_dir()
+            src = os.path.join(tmp, "take.c3d")
+            shutil.copyfile(path, src)  # (a failed copy still removes the folder below)
+        try:
+            return ezc3d.c3d(src)
+        except (OSError, RuntimeError, ValueError) as e:  # ezc3d: "could not be opened" / a bad header or block
+            raise ValueError(f"{os.path.basename(path)}: C3D 파일을 읽지 못했습니다 (손상되었거나 C3D 파일이 아님)") from e
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def load_c3d(path: str, up_axis: str = "z") -> SkeletonMotion:
     """Load marker trajectories. Occluded/missing samples become NaN.
 
     Vicon writes Z-up C3D; OptiTrack Motive defaults to Y-up, so pass
     ``up_axis="y"`` for those.
     """
-    import ezc3d  # optional dependency (conda-forge::ezc3d)
-
-    c = ezc3d.c3d(path)
+    c = _read(path)
     pts = np.asarray(c["data"]["points"], dtype=np.float64)  # (4, M, T)
     xyz = np.transpose(pts[:3], (2, 1, 0))  # (T, M, 3)
     params = c["parameters"]["POINT"]

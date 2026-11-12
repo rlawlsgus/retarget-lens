@@ -8,8 +8,9 @@ this folder; Yanjie Ze et al.):
   limit; same output, IK 22-39 % faster), and that the constructor also takes a compiled MuJoCo
   model and the IK config as a dict (``model=``, ``ik_config=``): RetLens retargets to any robot
   with a config derived from the robot (retlens.robot_profile), without the module-level tables
-  below; the velocity limit is keyed by joint name, as mink expects;
-- params.py: robot model and IK-config tables, Unitree G1 only, asset path from retlens.paths
+  below; the velocity limit is keyed by joint name, as mink expects; it prints nothing unless verbose;
+- params.py: robot model and IK-config tables, Unitree G1 only (bvh_nokov added for the G1 with
+  hands, as GMR has bvh_lafan1), asset path from retlens.paths
   (GMR's own fixed-config formats, lafan1 / nokov / smplx-gmr, use them);
 - ik_configs/*_to_g1.json: the G1 IK configs, unchanged.
 

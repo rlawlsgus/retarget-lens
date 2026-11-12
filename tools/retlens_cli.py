@@ -1,6 +1,8 @@
 """retlens-cli: RetLens without a window, for scripts and AI agents. Every command prints one
-JSON object on stdout (progress goes to stderr); exit code 0 = ok, 1 = error ({"error": ...});
-autolabel / summary / batch: 1 = no motion done, 2 = some not (their rows say why).
+JSON object on stdout (progress goes to stderr; --pretty, before or after the command, indents it);
+exit code 0 = ok, 1 = error ({"error": ...}, also for a mistyped command or option);
+autolabel / summary / batch / export / c3d-qc: 1 = no motion done, 2 = some not (their rows say why;
+batch / export: also a physics check that failed).
 
     retlens-cli info                        # version, file locations, 환경 점검
     retlens-cli version                     # just the version (fast: nothing else is loaded)
@@ -19,7 +21,7 @@ autolabel / summary / batch: 1 = no motion done, 2 = some not (their rows say wh
     retlens-cli batch FILE|DIR ... [--physics] [--rules R.yaml] [--csv OUT.csv]   # 일괄 처리: retarget + measure each
     retlens-cli export FILE|DIR ... --out DIR [--qc WARN] [--physics] [--cut] [--formats npz,csv,pkl]
                                             # 데이터셋 내보내기: the motions that pass, in pieces with --cut, + manifest
-    retlens-cli c3d-qc FILE.c3d             # raw marker QC only (no retargeting)
+    retlens-cli c3d-qc FILE.c3d [...]       # raw marker QC only (no retargeting), by file name
     retlens-cli physics FILE [--balance harness]   # physics check: MuJoCo with the pelvis harness (seconds);
                                             # --balance pd / gmt (MuJoCo), isaac [--assist 1] (needs the EULA accepted)
     retlens-cli video FILE --out X.mp4 [--physics [--balance B]]   # Isaac recording (needs the EULA accepted)
@@ -49,11 +51,26 @@ def _log(msg) -> None:
     print(f"[retlens-cli] {msg}", file=sys.stderr, flush=True)
 
 
+def _err(e: BaseException) -> str:
+    """'<type>: <why>' of an exception, a path in it as it is (the str() of a KeyError, or of an OSError that names
+    its file, gives it quoted with its backslashes doubled)."""
+    why = e
+    if isinstance(e, KeyError) and e.args:
+        why = e.args[0]
+    elif isinstance(e, OSError) and e.filename is not None and e.strerror:
+        why = f"{e.strerror}: {e.filename}" + (f" -> {e.filename2}" if e.filename2 is not None else "")
+    return f"{type(e).__name__}: {why}"
+
+
+def _check_swing(args) -> None:
+    if not 0.0 <= args.swing_clearance <= 10.0:
+        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+
+
 def _scene(args):
     from retlens.app import api_core
 
-    if not 0.0 <= args.swing_clearance <= 10.0:
-        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    _check_swing(args)
     extra = {"robot": args.robot} if getattr(args, "robot", None) else {}
     return api_core.headless_scene(log=_log, smooth=args.smooth, foot_flat=args.foot_flat,
                                    swing_clearance_cm=args.swing_clearance, self_collision=args.self_collision, **extra)
@@ -130,11 +147,23 @@ def run(args) -> dict:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
         return {"installed": dst, "from": src}
-    if c == "c3d-qc":
+    if c == "c3d-qc":  # {file name (its path when two have that name): QC or {"error"}}; 1 = all failed, 2 = some
+        from retlens.dataset import path_key
         from retlens.io.c3d import load_c3d
         from retlens.markers import marker_qc
 
-        return api_core.jsonable({os.path.basename(f): marker_qc(load_c3d(f)) for f in args.files})
+        files = list({path_key(f): f for f in args.files}.values())  # each file once, however it is spelled
+        names = [os.path.basename(f).lower() for f in files]
+        out, failed = {}, 0
+        for f, n in zip(files, names):
+            key = os.path.basename(f) if names.count(n) == 1 else os.path.abspath(f)
+            try:
+                out[key] = marker_qc(load_c3d(f))
+            except Exception as e:  # one bad file never loses the others' results
+                failed += 1
+                out[key] = {"error": _err(e)}
+        out = api_core.jsonable(out)
+        return _Exit(out, 1) if failed and failed == len(files) else _Exit(out, 2) if failed else out
     if c == "autolabel":
         return autolabel(args)
     if c == "summary":
@@ -146,16 +175,31 @@ def run(args) -> dict:
     if c == "retarget":
         from retlens import settings
         from retlens.compare import load_item
+        from retlens.dataset import path_key
 
+        _check_swing(args)
+        out, ext = os.path.abspath(args.out), os.path.splitext(args.out)[1].lower()
+        if ext and ext != ".npz":
+            raise ValueError(f"--out must be a .npz file (csv / pkl: use export --formats): {args.out}")
+        out = os.path.splitext(out)[0] + ".npz"  # the name numpy writes (it adds .npz to any other ending, .NPZ too)
+        if not os.path.exists(args.file):
+            raise FileNotFoundError(f"없는 파일: {args.file}")
+        if path_key(out) == path_key(args.file):  # however either is spelled (8.3 short name, mapped drive)
+            raise ValueError(f"--out is the motion file itself: {out}")
+        os.makedirs(os.path.dirname(out), exist_ok=True)  # before retargeting, as export does
         item = load_item(args.file, robot=args.robot or settings.robot_spec(), smooth=args.smooth,
                          swing_clearance=args.swing_clearance / 100.0,
                          foot_flat=args.foot_flat, self_collision=args.self_collision, smpl_model_dir=_smpl(), log=_log)
-        item.robot.save_npz(args.out)
-        with open(os.path.splitext(args.out)[0] + ".json", "w", encoding="utf-8") as f:
+        item.robot.save_npz(out)
+        with open(os.path.splitext(out)[0] + ".json", "w", encoding="utf-8") as f:
             json.dump(api_core.jsonable(item.info), f, ensure_ascii=False, indent=1)
-        return {"out": os.path.abspath(args.out), "frames": item.robot.num_frames, "fps": item.robot.fps,
-                "kind": item.kind}
+        return {"out": out, "frames": item.robot.num_frames, "fps": item.robot.fps, "kind": item.kind}
 
+    named = {"inspect": lambda: args.files, "metrics": lambda: args.files, "align": lambda: [args.ref, *args.files],
+             "compare": lambda: [args.a, args.b], "physics": lambda: [args.file], "video": lambda: [args.file]}
+    missing = [p for p in named.get(c, list)() if not os.path.exists(p)]
+    if missing:  # said before the 3D scene starts (seconds)
+        raise FileNotFoundError(f"없는 파일: {', '.join(missing)}")
     scene = _scene(args)
     try:
         if c == "inspect":
@@ -169,9 +213,9 @@ def run(args) -> dict:
             return api_core.align(scene, items[0])
         if c == "compare":
             a, b = _open(scene, [args.a, args.b])
-            if args.align:
-                scene.auto_align(a)
-            return api_core.compare(scene, a, b, heading=not args.no_heading, tol_cm=args.tol)
+            notes = scene.auto_align(a) if args.align else None
+            out = api_core.compare(scene, a, b, heading=not args.no_heading, tol_cm=args.tol)
+            return {**out, "align_notes": notes} if notes is not None else out
         if c in ("physics", "video"):
             isaac = c == "video" or args.balance == "isaac"  # videos are Isaac recordings
             if isaac:
@@ -192,10 +236,14 @@ def run(args) -> dict:
                 _log("waiting for Isaac (about a minute for a short clip)" if args.balance == "isaac"
                      else "waiting for MuJoCo (a few seconds per clip)")
                 done = api_core.wait_jobs(scene, args.timeout)
-                return {"finished": done, **api_core.item_info(scene, item)}
+                why = _physics_failed(scene, item, done, args.timeout)
+                out = {"finished": done, **api_core.item_info(scene, item)}
+                return _Exit({**out, "error": why}, 1) if why else out
             scene.set_physics(bool(args.physics), "cli")
             if args.physics:
-                api_core.wait_jobs(scene, args.timeout)
+                why = _physics_failed(scene, item, api_core.wait_jobs(scene, args.timeout), args.timeout)
+                if why:  # never a recording of the motion as it is, passed off as the simulated one
+                    raise RuntimeError(why)
             if args.out:
                 scene.opts.video_dir = os.path.dirname(os.path.abspath(args.out)) or "."
             job = scene.save_video(item)
@@ -211,6 +259,22 @@ def run(args) -> dict:
         scene.server.stop()
 
 
+def _physics_failed(scene, item, done: bool, timeout: float) -> str | None:
+    """Why the physics run of item gave no result (None: it did, or item is a simulated motion already)."""
+    if not done:
+        return f"physics did not finish within {timeout:g} s"
+    if scene.is_sim_result(item):
+        return None
+    job = item.handles.get("phys_jobs", {}).get(scene.phys_key)
+    end = time.time() + 30.0  # a finished run's result is read on the worker right after the job ends
+    while job is not None and job.state == "done" and scene.shown(item) is item and time.time() < end:
+        time.sleep(0.1)
+    if scene.shown(item) is not item:
+        return None
+    said = job.message if job is not None and job.state != "done" else ""
+    return "physics failed: " + (said or scene.phys_error or "no result")
+
+
 def _smpl():
     from retlens import paths, settings
 
@@ -221,7 +285,7 @@ def batch(args) -> dict:
     """데이터셋 일괄 처리 (retlens.batch): every motion retargeted with the given corrections and measured, a row
     each (cached: a run again, or after a stop, skips what is done); --physics adds the MuJoCo harness check,
     --rules 자동 라벨 for motions without a label file. --csv writes the table. Exit code 1 when no motion
-    could be read, 2 when some could not."""
+    could be read, 2 when some could not or their physics check failed (phys_error)."""
     from retlens import batch as bt
     from retlens.app import api_core
 
@@ -229,8 +293,7 @@ def batch(args) -> dict:
         from retlens import autolabel
 
         autolabel.check_rules(args.rules)  # a broken rule file stops here, not once per motion
-    if not 0.0 <= args.swing_clearance <= 10.0:
-        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    _check_swing(args)
     from retlens import settings
 
     opts = bt.BatchOptions(robot=args.robot or settings.robot_spec(), smooth=args.smooth, smpl_model_dir=_smpl(),
@@ -246,7 +309,7 @@ def batch(args) -> dict:
     if args.csv:
         out["csv"] = bt.write_csv(rows, args.csv)
     errors = sum(bool(r.get("error")) for r in rows)
-    return _Exit(out, 1) if rows and errors == len(rows) else _Exit(out, 2) if errors else out
+    return _Exit(out, 1) if rows and errors == len(rows) else _Exit(out, 2) if errors or out["phys_errors"] else out
 
 
 def export(args) -> dict:
@@ -254,7 +317,8 @@ def export(args) -> dict:
     --qc / --min-score / falls written into --out with their labels and manifest.json / manifest.csv. --cut takes
     out the QC frames that cannot be used, the --cut-kinds problem spans and the time around each fall (--physics),
     leaving pieces of --min-piece seconds or more; --range START END exports that time range of one motion. Exit
-    code 1 when no motion could be read, 2 when some could not."""
+    code 1 when no motion could be read, 2 when some could not or their physics check failed (with --allow-falls
+    they are written, phys_error in their clips)."""
     from retlens import batch as bt
     from retlens import dataset, settings
     from retlens.app import api_core
@@ -264,8 +328,7 @@ def export(args) -> dict:
         from retlens import autolabel
 
         autolabel.check_rules(args.rules)
-    if not 0.0 <= args.swing_clearance <= 10.0:
-        raise ValueError("--swing-clearance must be 0 (off) to 10 cm")
+    _check_swing(args)
     kinds = tuple(k.strip() for k in args.cut_kinds.split(",") if k.strip())
     bad = [k for k in kinds if k not in KINDS]
     if bad:
@@ -282,22 +345,27 @@ def export(args) -> dict:
         args.inputs, progress=lambda done, total, name: _log(f"{done}/{total} {name}"))
     out = {"out": os.path.abspath(args.out), "manifest": os.path.join(os.path.abspath(args.out), dataset.MANIFEST),
            "totals": m["totals"], "excluded": m["excluded"],
-           "clips": [{k: c.get(k) for k in ("files", "source", "start_s", "end_s", "duration_s", "qc", "labels")}
-                     for c in m["clips"]]}
-    errors = sum(e["reason"].startswith(("읽지 못함", "내보내기 실패")) for e in m["excluded"])
+           "clips": [{**{k: c.get(k) for k in ("files", "source", "start_s", "end_s", "duration_s", "qc", "labels")},
+                      **{k: c[k] for k in ("phys_error", "file_warnings") if c.get(k)}} for c in m["clips"]]}
+    errors = sum(e["reason"].startswith(("읽지 못함", "내보내기 실패", "물리 검사 실패")) for e in m["excluded"])
+    unchecked = m["totals"].get("phys_errors") or 0  # let in by --allow-falls although physics could not say
     out = api_core.jsonable(out)
-    return _Exit(out, 1) if errors and errors == m["totals"]["motions"] else _Exit(out, 2) if errors else out
+    return _Exit(out, 1) if errors and errors == m["totals"]["motions"] else _Exit(out, 2) if errors or unchecked else out
 
 
 def summary(args) -> dict:
     """데이터셋 요약 without retargeting: every motion's length, its labels (the label file next to it, or
     자동 라벨 by --rules) and the objects captured with it (FBX); totals per folder and per label (seconds of
     each track's segments, clipped to the motion). --csv writes one row per motion. C3D files are left out
-    (their take's solved file counts). Exit code 1 when no motion could be read, 2 when some could not."""
+    (their take's solved file counts), and so is every other file of a take in the same folder (X.bvh + X.fbx:
+    the one export takes counts, the first of TAKE_ORDER that can be read, the objects of the take's FBX with it;
+    "same_take" in their row), and an FBX of fewer than 8 joints (a prop file: "not_counted"). "warnings": what
+    the file's reader left out (a second person's skeleton in an FBX). Folders are named from the inputs' common
+    parent (day1/s01). Exit code 1 when no motion could be read, 2 when some could not."""
     import csv
 
     from retlens import autolabel as al
-    from retlens import motion_labels
+    from retlens import dataset, motion_labels
     from retlens.compare import human_format, load_skeleton
     from retlens.io import load_motion
 
@@ -306,42 +374,80 @@ def summary(args) -> dict:
         al.check_rules(rules)
     from retlens.batch import motion_files
 
-    files = [f for f in motion_files(args.inputs) if not f.lower().endswith(".c3d")]
-    rows, total, per_folder, per_label, failed = [], 0.0, {}, {}, 0
-    for f in files:
-        _log(f"reading {f}")
-        row = {"file": os.path.abspath(f), "folder": os.path.basename(os.path.dirname(os.path.abspath(f)))}
-        try:
-            human = load_skeleton(f, smpl_model_dir=_smpl()) if human_format(f) else None
-            fps, dur = (human.fps, human.duration) if human else (lambda m: (m.fps, m.duration))(load_motion(f))
-            lab = al.label_motion(human, rules, dur) if rules and human else motion_labels.load_for(f, fps, dur)
-            if lab is not None and lab.error:
-                row["labels_error"] = lab.error
-                lab = None
-        except Exception as e:
-            failed += 1
-            rows.append({**row, "error": f"{type(e).__name__}: {e}"})
-            continue
-        secs = {}
-        for s in lab.segments if lab is not None else []:
-            key = f"{s.track}: {s.label}" if s.track else s.label
-            secs[key] = secs.get(key, 0.0) + max(0.0, min(s.end, dur) - max(s.start, 0.0))
-        objs = human.objects if human else []
-        row.update({"duration_s": round(dur, 3), "labels": ("auto" if lab.auto else "file") if lab is not None else None,
-                    "label_seconds": {k: round(v, 3) for k, v in secs.items()},
-                    "objects": [o.name for o in objs], "moving_objects": sum(o.moves for o in objs)})
-        rows.append(row)
-        total += dur
-        fo = per_folder.setdefault(row["folder"], {"motions": 0, "seconds": 0.0, "labelled": 0, "with_objects": 0})
-        fo["motions"] += 1
-        fo["seconds"] += dur
-        fo["labelled"] += lab is not None
-        fo["with_objects"] += bool(objs)
-        for k, v in secs.items():
-            pl = per_label.setdefault(k, {"seconds": 0.0, "segments": 0})
-            pl["seconds"] += v
-            pl["segments"] += sum(1 for s in lab.segments if (f"{s.track}: {s.label}" if s.track else s.label) == k)
-    out = {"motions": len(rows) - failed, "failed": failed, "total_s": round(total, 2), "total_h": round(total / 3600, 3),
+    listed, seen, real = [], set(), {}
+    for f in motion_files(args.inputs):  # each file once, however it is spelled
+        k = None if f.lower().endswith(".c3d") else dataset.path_key(f, real)
+        if k is not None and k not in seen:
+            seen.add(k)
+            listed.append(os.path.abspath(f))
+    files, same = dataset.pick_takes(listed)  # one file per take and folder, as export takes it
+    takes = {f: [f] for f in files}  # the take's files in TAKE_ORDER: the first that can be read counts
+    for f in sorted(same, key=dataset.take_rank):
+        takes[same[f]].append(f)
+    names = dataset.relative_folders(listed, args.inputs)
+
+    def folder_of(f):
+        rel = names[f].replace("\\", "/")
+        return os.path.basename(os.path.dirname(os.path.abspath(f))) if rel == "." else rel
+
+    rows_of, total, per_folder, per_label, failed, counted = {}, 0.0, {}, {}, 0, 0
+    for take in takes.values():
+        used = None  # the take's file counted
+        for f in take:
+            row = rows_of[f] = {"file": os.path.abspath(f), "folder": folder_of(f)}
+            if used is not None:
+                row["same_take"] = os.path.abspath(used)
+                continue
+            _log(f"reading {f}")
+            try:
+                if not os.path.exists(f):
+                    raise FileNotFoundError("없는 파일·폴더입니다")
+                human = load_skeleton(f, smpl_model_dir=_smpl()) if human_format(f) else None
+                if human is not None and f.lower().endswith(".fbx") and len(human.joint_names) < 8:
+                    row["not_counted"] = f"관절이 {len(human.joint_names)}개뿐인 FBX(물체 파일): 모션으로 세지 않음"
+                    continue
+                fps, dur = (human.fps, human.duration) if human else (lambda m: (m.fps, m.duration))(load_motion(f))
+                lab = al.label_motion(human, rules, dur) if rules and human else motion_labels.load_for(f, fps, dur)
+                if lab is not None and lab.error:
+                    row["labels_error"] = lab.error
+                    lab = None
+            except Exception as e:  # the take's next file is tried
+                failed += 1
+                row["error"] = _err(e)
+                continue
+            used = f
+            secs = {}
+            for s in lab.segments if lab is not None else []:
+                key = f"{s.track}: {s.label}" if s.track else s.label
+                secs[key] = secs.get(key, 0.0) + max(0.0, min(s.end, dur) - max(s.start, 0.0))
+            objs = list(human.objects) if human else []
+            for o in take:  # the take's objects come with its FBX (X.bvh counted, X.fbx not)
+                if o != f and o.lower().endswith(".fbx") and not rows_of.get(o, {}).get("error"):
+                    _log(f"reading {o} (objects of the same take)")
+                    try:
+                        extra = load_skeleton(o, smpl_model_dir=_smpl()).objects
+                    except Exception as e:
+                        row["same_take_error"] = f"{os.path.basename(o)}: {_err(e)}"
+                        continue
+                    objs += [ob for ob in extra if ob.name not in {x.name for x in objs}]
+            row.update({"duration_s": round(dur, 3),
+                        "labels": ("auto" if lab.auto else "file") if lab is not None else None,
+                        "label_seconds": {k: round(v, 3) for k, v in secs.items()},
+                        "objects": [o.name for o in objs], "moving_objects": sum(o.moves for o in objs),
+                        "warnings": (list(human.meta.get("warnings") or []) or None) if human else None})
+            counted += 1
+            total += dur
+            fo = per_folder.setdefault(row["folder"], {"motions": 0, "seconds": 0.0, "labelled": 0, "with_objects": 0})
+            fo["motions"] += 1
+            fo["seconds"] += dur
+            fo["labelled"] += lab is not None
+            fo["with_objects"] += bool(objs)
+            for k, v in secs.items():
+                pl = per_label.setdefault(k, {"seconds": 0.0, "segments": 0})
+                pl["seconds"] += v
+                pl["segments"] += sum(1 for s in lab.segments if (f"{s.track}: {s.label}" if s.track else s.label) == k)
+    rows = [rows_of[f] for f in listed]  # in the order found
+    out = {"motions": counted, "failed": failed, "total_s": round(total, 2), "total_h": round(total / 3600, 3),
            "rules": rules or None,
            "per_folder": {k: {**v, "seconds": round(v["seconds"], 2)} for k, v in sorted(per_folder.items())},
            "per_label": {k: {**v, "seconds": round(v["seconds"], 2),
@@ -353,11 +459,14 @@ def summary(args) -> dict:
         os.makedirs(os.path.dirname(os.path.abspath(args.csv)) or ".", exist_ok=True)
         with open(args.csv, "w", newline="", encoding="utf-8-sig") as fh:  # BOM: Excel reads the Korean labels
             w = csv.writer(fh)
-            w.writerow(["file", "folder", "duration_s", "labels", "objects", "moving_objects", "error", *labels])
+            w.writerow(["file", "folder", "duration_s", "labels", "objects", "moving_objects", "error", "warnings",
+                        *labels])
             for r in rows:
+                if r.get("same_take") or r.get("not_counted"):  # not motions of their own (in the JSON's files)
+                    continue
                 w.writerow([r["file"], r["folder"], r.get("duration_s", ""), r.get("labels") or "",
                             ";".join(r.get("objects", [])), r.get("moving_objects", ""), r.get("error", ""),
-                            *[r.get("label_seconds", {}).get(k, 0.0) for k in labels]])
+                            "; ".join(r.get("warnings") or []), *[r.get("label_seconds", {}).get(k, 0.0) for k in labels]])
         out["csv"] = os.path.abspath(args.csv)
     if not out["motions"] and failed:
         out = _Exit(out, 1)
@@ -393,9 +502,9 @@ def autolabel(args) -> dict:
                 if src is None:
                     raise ValueError("C3D에는 마커만 있습니다. 같은 촬영의 BVH·FBX·AMASS가 같은 폴더에 있어야 합니다")
                 row["solved_motion"] = src
-            lab = al.label_motion(load_skeleton(src, smpl_model_dir=_smpl()), rules)
+            lab = al.label_motion(load_skeleton(src, smpl_model_dir=_smpl(), props=False), rules)
         except Exception as e:
-            lab = motion_labels.MotionLabels(path=rules, error=f"{type(e).__name__}: {e}",
+            lab = motion_labels.MotionLabels(path=rules, error=_err(e),
                                              auto=checked["name"] or os.path.splitext(os.path.basename(rules))[0])
         row["labels"] = lab.summary(segments=not args.summary)
         if args.out:
@@ -425,10 +534,16 @@ def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
     of the same name (AMASS: 0000_treadmill_norm_stageii in every subject's folder) keep their folders
     below <out>, from where their paths part (on other drives or shares: from the drive); the same name in
     the same folder (X.c3d and X.bvh) goes one folder further down, by extension (<out>/c3d/X.labels.csv).
-    Every path is inside <out>: nothing is written next to the motions."""
-    from retlens.dataset import _folder_below
+    Every path is inside <out>, and none is a label file of a motion: raises when <out> is a motion's folder
+    (its hand-made <stem>.labels.csv) or holds another motion of that name, before anything is written."""
+    from retlens import motion_labels
+    from retlens.compare import is_motion_file
+    from retlens.dataset import _folder_below, path_key
 
     root = os.path.abspath(out)
+    real: dict = {}  # each folder resolved once: a label file however its path is spelled
+    theirs = {path_key(p, real) for f in files for p in motion_labels.candidates(f)}
+    listed: dict[str, dict[str, list[str]]] = {}  # {folder: {lower-case stem: its files}}
     by: dict[str, list[str]] = {}
     for f in dict.fromkeys(files):
         by.setdefault(os.path.splitext(os.path.basename(f))[0].lower(), []).append(f)
@@ -447,8 +562,27 @@ def _label_csv_names(files: list[str], out: str) -> dict[str, str]:
             path = os.path.abspath(os.path.join(root, sub, f"{stem}.labels.csv"))
             if os.path.commonpath([os.path.normcase(path), os.path.normcase(root)]) != os.path.normcase(root):
                 raise ValueError(f"--out 밖에 쓰게 됩니다: {path}")  # a guard: label files next to motions are the user's
+            folder = os.path.dirname(path)
+            if folder not in listed:  # each folder listed once, by stem (a few thousand motions into one <out>)
+                listed[folder] = {}
+                for n in os.listdir(folder) if os.path.isdir(folder) else []:
+                    listed[folder].setdefault(os.path.splitext(n)[0].lower(), []).append(n)
+            beside = [n for n in listed[folder].get(stem.lower(), ()) if is_motion_file(os.path.join(folder, n))]
+            if path_key(path, real) in theirs or beside:
+                raise ValueError(f"--out이 모션 폴더라 모션의 라벨 파일을 덮어쓰게 됩니다: {path} (모션이 없는 폴더를 고르세요)")
             names[f] = path
     return names
+
+
+def _smooth_hz(text: str) -> float:
+    """--smooth: 0 (off) or a cutoff below 15 Hz (half the 30 fps of the retargeted motion)."""
+    try:
+        hz = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text}") from None
+    if not (hz == 0.0 or 0.0 < hz < 15.0):
+        raise argparse.ArgumentTypeError(f"{text}: must be 0 (off) or above 0 and below 15 Hz (half of 30 fps)")
+    return hz
 
 
 def _retarget_options(p) -> None:
@@ -456,7 +590,8 @@ def _retarget_options(p) -> None:
     p.add_argument("--robot", default=None, metavar="MODEL",
                    help="the robot: unitree_g1 or any humanoid's MJCF / URDF path (default: 환경 설정 > 로봇 모델, "
                         "else unitree_g1)")
-    p.add_argument("--smooth", type=float, default=6.0, metavar="HZ", help="smoothing (0 = off; default 6)")
+    p.add_argument("--smooth", type=_smooth_hz, default=6.0, metavar="HZ",
+                   help="smoothing cutoff below 15 Hz (0 = off; default 6)")
     p.add_argument("--foot-flat", action="store_true",
                    help="디딤발 평평 보정: feet standing still flat on the floor, through legs and pelvis height "
                         "(heel-standing retargets)")
@@ -472,9 +607,19 @@ def dataset_cut_kinds() -> tuple[str, ...]:
     return CUT_KINDS
 
 
+class _Usage(Exception):
+    """A mistyped command line (argparse's error): printed as {"error": ...} with exit code 1."""
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):  # argparse would exit 2 with no JSON, the code batch / export use for "some failed"
+        self.print_usage(sys.stderr)
+        raise _Usage(f"{self.prog}: {message}")
+
+
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="retlens-cli", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pretty", action="store_true", help="indented JSON")
+    ap = _Parser(prog="retlens-cli", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--pretty", action="store_true", help="indented JSON (before or after the command)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info", help="version, file locations, environment check")
     sub.add_parser("version", help="the version only (fast)")
@@ -580,25 +725,36 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    if [a for a in (sys.argv[1:] if argv is None else argv) if a != "--pretty"] == ["version"]:  # nothing heavy
+    argv = list(sys.argv[1:] if argv is None else argv)
+    pretty = "--pretty" in argv  # before or after the command
+    argv = [a for a in argv if a != "--pretty"]
+    if argv == ["version"]:  # nothing heavy
         from retlens import __version__
 
-        sys.stdout.buffer.write(json.dumps({"app": "RetLens", "version": __version__}).encode("utf-8") + b"\n")
+        text = json.dumps({"app": "RetLens", "version": __version__}, indent=1 if pretty else None)
+        sys.stdout.buffer.write(text.encode("utf-8") + b"\n")
         sys.stdout.flush()
         return 0
-    args = parser().parse_args(argv)
+    try:
+        args = parser().parse_args(argv)
+    except _Usage as e:
+        sys.stdout.buffer.write((json.dumps({"error": str(e)}, ensure_ascii=False, indent=1 if pretty else None)
+                                 + "\n").encode("utf-8"))
+        sys.stdout.flush()
+        return 1
+    pretty = pretty or args.pretty
     real_stdout = sys.stdout
     sys.stdout = sys.stderr  # stdout carries the JSON only: banners and prints (viser, GMR) go to stderr
     try:
         out = run(args)
         code = getattr(out, "code", 0)
     except Exception as e:
-        out, code = {"error": f"{type(e).__name__}: {e}"}, 1
+        out, code = {"error": _err(e)}, 1
     finally:
         sys.stdout = real_stdout
     from retlens.app.api_core import jsonable
 
-    text = json.dumps(jsonable(out), ensure_ascii=False, indent=1 if args.pretty else None)
+    text = json.dumps(jsonable(out), ensure_ascii=False, indent=1 if pretty else None)
     sys.stdout.buffer.write((text + "\n").encode("utf-8"))
     sys.stdout.flush()
     return code

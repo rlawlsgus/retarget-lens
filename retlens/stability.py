@@ -93,10 +93,20 @@ def com_from_links(link_pos: np.ndarray, link_quat: np.ndarray, com_local: np.nd
 
 
 def lowpass(x: np.ndarray, fps: float, cutoff_hz: float = 6.0) -> np.ndarray:
-    """Zero-phase low-pass along time (axis 0); a centred moving average without scipy."""
+    """Zero-phase low-pass along time (axis 0); a centred moving average without scipy. Frames with a NaN stay
+    NaN, and the filter runs over them interpolated, so one bad frame does not spread to the whole clip."""
     x = np.asarray(x, float)
     if len(x) < 8 or cutoff_hz <= 0 or cutoff_hz >= 0.5 * fps:
         return x
+    bad = ~np.isfinite(x).reshape(len(x), -1).all(1)
+    if bad.any() and not bad.all():  # (every column then has a finite frame)
+        flat = x.reshape(len(x), -1).copy()
+        for i in range(flat.shape[1]):
+            ok = np.isfinite(flat[:, i])
+            flat[:, i] = np.interp(np.arange(len(flat)), np.flatnonzero(ok), flat[ok, i])
+        y = lowpass(flat.reshape(x.shape), fps, cutoff_hz)
+        y[bad] = np.nan
+        return y
     try:
         from scipy.signal import butter, filtfilt
 

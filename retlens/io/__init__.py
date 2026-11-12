@@ -25,6 +25,7 @@ __all__ = [
     "load_motion",
     "load_robot_npz",
     "load_unitree_csv",
+    "npz_keys",
     "urdf_joint_limits",
 ]
 
@@ -45,18 +46,33 @@ def load_motion(path: str, **kwargs) -> SkeletonMotion | RobotMotion:
     if ext == ".c3d":
         return load_c3d(path, **_pick(kwargs, "up_axis"))
     if ext == ".npz":
-        with np.load(path, allow_pickle=False) as d:
-            keys = set(d.files)
+        keys = npz_keys(path)
         if "dof_pos" in keys:
             return load_robot_npz(path)
         if "poses" in keys:
             return load_amass_npz(path, **_pick(kwargs, "model_dir", "gender", "body_only"))
-        raise ValueError(f"{path}: unrecognised npz layout (keys: {sorted(keys)})")
+        raise ValueError(f"{os.path.basename(path)}: 모르는 npz 구성입니다 (로봇 npz도 AMASS도 아님, 배열: "
+                         f"{', '.join(sorted(keys)) or '없음'})")
     if ext == ".csv":
         return load_unitree_csv(path, **_pick(kwargs, "fps", "joint_names"))
     if ext == ".pkl":
         return load_gmr_pkl(path, **_pick(kwargs, "joint_names"))
-    raise ValueError(f"unsupported motion file type: {ext}")
+    raise ValueError(f"{os.path.basename(path)}: 지원하지 않는 모션 파일 형식입니다 ({ext or '확장자 없음'})")
+
+
+def npz_keys(path: str) -> set[str]:
+    """The array names in a .npz file. ValueError when it is not one (empty, cut short, or another kind of file)
+    instead of numpy's advice to unpickle it."""
+    try:
+        d = np.load(path, allow_pickle=False)
+    except FileNotFoundError:
+        raise
+    except Exception as e:  # not a zip (numpy then tries a pickle), a broken zip, an empty file
+        raise ValueError(f"{os.path.basename(path)}: 올바른 .npz 모션 파일이 아닙니다 (비었거나 잘렸거나 다른 형식)") from e
+    if not hasattr(d, "files"):  # a single .npy array under an .npz name
+        raise ValueError(f"{os.path.basename(path)}: 올바른 .npz 모션 파일이 아닙니다 (배열 하나뿐인 .npy 형식)")
+    with d:
+        return set(d.files)
 
 
 def _pick(kwargs: dict, *names: str) -> dict:

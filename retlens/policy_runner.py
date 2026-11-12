@@ -299,13 +299,22 @@ class PolicyRunner:
         job.result = job.out_npz
         self._finish(job, "done", "완료")
 
+    def _config_id(self) -> tuple:
+        """The physics config by its content: a sim reads gains, fall rules and diagnosis settings once, so an edited
+        config makes a new one (as key() keys results by the config's text)."""
+        try:
+            with open(self.physics_config, "rb") as f:
+                return self.physics_config, hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            return self.physics_config, None
+
     def _sim_key(self, controller: str) -> tuple:
         if self.robot is not None:
             from .robot_profile import load
 
-            return (controller, "robot", self.robot, load(self.robot).digest, self.physics_config)
+            return (controller, "robot", self.robot, load(self.robot).digest, self._config_id())
         files = self.files()
-        return (controller, files["model"], files["policy"] if controller == "gmt" else "", self.physics_config)
+        return (controller, files["model"], files["policy"] if controller == "gmt" else "", self._config_id())
 
     def _simulate_mujoco(self, motion: RobotMotion, controller: str, progress) -> pr.Result:
         k = self._sim_key(controller)

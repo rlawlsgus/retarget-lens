@@ -182,16 +182,19 @@ class UpdateDialog(QDialog):
         self._busy(True)
         self.state.setText("GitHub에서 최신 릴리즈를 확인하는 중...")
         sig = _Signals()
-        sig.done.connect(lambda chk, err: (self._busy(False), self._checked(chk)))
+        sig.done.connect(lambda chk, err: (self._busy(False), self._checked(chk, err)))
         self.worker = _run(lambda: self.ctl.check(force=True), sig)
         self._keep = sig
 
-    def _checked(self, chk: install.Check | None) -> None:
+    def _checked(self, chk: install.Check | None, err: BaseException | None = None) -> None:
         self.check = chk
         self.release = chk.latest if chk else None
         self._show_head()
         if chk is None or chk.error:
-            self.state.setText(f"<span style='color:#e66'>확인하지 못했습니다: {escape(chk.error if chk else '?')}</span>")
+            why = chk.error if chk else (_error_text(err) if err is not None else "알 수 없는 오류")
+            if chk is None and err is not None:
+                print(f"[update] check failed: {type(err).__name__}: {err}")
+            self.state.setText(f"<span style='color:#e66'>확인하지 못했습니다: {escape(why)}</span>")
             self.state.setTextFormat(Qt.RichText)
             self.notes.setMarkdown("")
             self.b_main.setEnabled(False)
@@ -279,7 +282,7 @@ class UpdateDialog(QDialog):
             QMessageBox.information(self, f"{APP} 업데이트", "설치판에서만 씁니다.")
             return
         path, _ = QFileDialog.getOpenFileName(self, "RetLens 릴리즈 zip", os.path.expanduser("~/Downloads"),
-                                              "RetLens zip (RetLens-*-win64.zip)")
+                                              "RetLens zip (RetLens-*win64*.zip)")
         if not path:
             return
         try:
@@ -531,9 +534,32 @@ class UpdateController(QObject):
         else:  # nothing open yet: what this copy was started with (still opening in the background)
             args = [p for p in getattr(self.win, "startup_inputs", []) if os.path.exists(p)]
         install.AFTER_EXIT.append(lambda: install.spawn(exe, args))
-        if not self.win.close():
+
+        def undo():
             install.AFTER_EXIT.clear()
             self.win.status("창을 닫지 않아 설치된 RetLens를 열지 않았습니다", 8000)
+
+        self._close_for(undo, "데이터셋 작업이 지금 모션에서 멈추면 창을 닫고 설치된 RetLens로 다시 엽니다")
+
+    _on_close_withdrawn = None  # what _close_for armed, undone if the window's deferred close is taken back
+
+    def _close_for(self, undo, waiting: str) -> None:
+        """Close the window for what was just armed to run after it; undo() it when a question in closeEvent was
+        answered 취소. While the 데이터셋 tab ends its motion the close is only put off (EditorWindow._close_pending,
+        close() says False): it stays armed, and is undone only if that close is taken back (close_withdrawn)."""
+        if self.win.close():
+            return
+        if getattr(self.win, "_close_pending", False):
+            self._on_close_withdrawn = undo
+            self.win.status(waiting, 10000)
+            return
+        undo()
+
+    def close_withdrawn(self) -> None:
+        """EditorWindow.closeEvent: a close the window was waiting for was answered 취소 after all."""
+        undo, self._on_close_withdrawn = self._on_close_withdrawn, None
+        if undo is not None:
+            undo()
 
     # ---------------------------------------------------------- checking
     def check(self, force: bool = False) -> install.Check:
@@ -653,9 +679,13 @@ class UpdateController(QObject):
         if not now:
             self.win.status(f"RetLens를 끌 때 {rel.version}(으)로 업데이트합니다", 10000)
             return
-        if not self.win.close():  # a question in closeEvent answered 취소: keep working, apply at quit
-            self.armed.set(relaunch=False)
+        armed = self.armed
+
+        def undo():  # a question in closeEvent answered 취소: keep working, apply at quit
+            armed.set(relaunch=False)
             self.win.status(f"창을 닫지 않았습니다. RetLens를 끌 때 {rel.version}(으)로 업데이트합니다", 10000)
+
+        self._close_for(undo, f"데이터셋 작업이 지금 모션에서 멈추면 창을 닫고 {rel.version}(으)로 업데이트해 다시 시작합니다")
 
     def busy(self) -> bool:
         d = self.dialog
@@ -696,11 +726,16 @@ class UpdateController(QObject):
         if earlier is not None:
             earlier.cancel()  # an update waiting for the exit has nothing left to update
         install.HARD_EXIT = True
-        if not self.win.close():
-            self.armed.cancel()
-            self.armed = None
+        armed = self.armed
+
+        def undo():
+            armed.cancel()
+            if self.armed is armed:
+                self.armed = None
             install.HARD_EXIT = False
             self.win.status("창을 닫지 않아 제거하지 않았습니다", 8000)
+
+        self._close_for(undo, "데이터셋 작업이 지금 모션에서 멈추면 창을 닫고 RetLens를 제거합니다")
 
 
 def _confirm_uninstall(parent) -> bool | None:

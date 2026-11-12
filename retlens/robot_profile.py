@@ -14,7 +14,10 @@ with MuJoCo) with a floating base; :func:`load` reads it and :func:`derive` find
 - joint centres as points, where the joint axes meet (body origins can sit centimetres off
   them), and which way the knee and elbow flex (the sign that brings the foot back / the hand
   forward), so a symmetric joint range needs no guessing;
-- the feet (sole geometry, its up direction) and the hands (the last moving body of the arm).
+- the feet (sole geometry, its up direction) and the hands (the last moving body of the arm);
+- the fingers, when the hand has jointed ones (:func:`_fingers`): each chain of joints below the hand,
+  what finger it is (by name: thumb / index / middle / ring / pinky, else by place), and per joint the
+  sign that closes the hand, worked out in the palm's frame (a spread or a twist is 0 and left alone).
 
 Robot frame: MuJoCo's z up; the robot faces +x with its left at +y at the zero pose (checked:
 the knees must bend the feet backwards). The parts become GMR's task table (the LAFAN1 task list and
@@ -62,6 +65,17 @@ HUMAN_SIDE = {"left": "Left", "right": "Right"}
 
 TWIST_COS = 0.8  # |cos(axis, limb)| above this: the joint turns the limb about itself
 MAX_WRIST = 3  # joints after the elbow that are the wrist (more: a finger chain, left out)
+FINGER_KINDS = ("thumb", "index", "middle", "ring", "pinky")
+# finger names in robot models (Unitree Dex3 / Inspire: left_hand_index_0_joint; Shadow: FFJ3, THJ2, ...)
+# (a word starts the name or follows a non-letter: Shadow's rfmiddle body is the ring finger's, not a middle finger)
+FINGER_WORDS = {"thumb": r"(?<![a-z])(?:thumb|pollex|thj?\d)", "index": r"(?<![a-z])(?:index|ffj?\d)",
+                "middle": r"(?<![a-z])(?:middle|mfj?\d)", "ring": r"(?<![a-z])(?:ring|rfj?\d)",
+                "pinky": r"(?<![a-z])(?:pinky|little|lfj?\d)"}
+CLOSE_COS = 0.3  # a thumb joint whose tip motion points this much towards the palm closes the hand
+FLEX_ALONG = 0.5  # a thumb joint whose tip motion runs this much along the palm normal closes it
+AXIS_COS = 0.7  # a finger joint whose axis lies this much across the palm (perpendicular to the normal) flexes it
+TWIST_RATIO = 0.2  # tip motion below this share of the lever: the joint turns the finger about itself
+PALM_LIFT_M = 0.03  # where a thumb closes to: the other fingertips, this far towards the palm side
 MIDLINE = 0.02  # m: a body this close to the robot's middle plane is on the midline
 LATERAL = 0.03  # m: a limb starts this far to the side
 
@@ -110,6 +124,16 @@ class Limb:
 
 
 @dataclass
+class Finger:
+    """One jointed finger of a robot hand: its joints proximal -> distal below the hand body."""
+
+    kind: str  # thumb / index / middle / ring / pinky
+    joints: list  # joint ids, proximal -> distal
+    close: list  # per joint: +1 / -1 the sign that closes the hand, 0 a joint that does not (left alone)
+    root_body: int
+
+
+@dataclass
 class Parts:
     root: int  # body with the free joint
     chest: int  # body the arms hang from (== root when the robot has no waist)
@@ -127,6 +151,8 @@ class Parts:
     leg_length: float  # m: hip centre -> ankle centre, straight leg
     region: dict = field(default_factory=dict)  # body -> (side, "leg" / "arm", "upper" / "lower"); trunk bodies absent
     notes: list = field(default_factory=list)
+    fingers: dict = field(default_factory=dict)  # side -> [Finger] (empty: a hand without jointed fingers)
+    hand_bodies: dict = field(default_factory=dict)  # side -> set of bodies of the hand (its body and all below)
 
 
 # --------------------------------------------------------------------------- geometry
@@ -235,10 +261,12 @@ def kinematic_spec(path: str):
 
 def model_digest(path: str) -> str:
     """sha1 (12 hex) of the model as MuJoCo reads it (files it includes too): a changed model
-    is a different robot to the caches. Without MuJoCo, of the file's bytes."""
+    is a different robot to the caches. Without MuJoCo, of the file's bytes. The meshes'
+    content_type attributes are left out: MuJoCo writes them only for meshes it decodes first in
+    the process, so the digest of one file depended on which robot was loaded before it."""
     h = hashlib.sha1()
     try:
-        h.update(kinematic_spec(path).to_xml().encode("utf-8"))
+        h.update(re.sub(r'\s+content_type="[^"]*"', "", kinematic_spec(path).to_xml()).encode("utf-8"))
     except ImportError:
         with open(path, "rb") as f:
             h.update(f.read())
@@ -269,17 +297,39 @@ def _collides(model, g: int) -> bool:
     return bool(model.geom_contype[g] or model.geom_conaffinity[g])
 
 
+def _geom_z(model, data, g: int) -> np.ndarray:
+    """World z of the points that bound a geom from below and above: a mesh's vertices, a sphere's, a capsule's
+    and a cylinder's lowest / highest points, else the corners of its bounding box. The box corners of a mesh are
+    no bound: a mesh sits in its inertia frame, so a tilted one's corners reach centimetres below its lowest
+    vertex (the floor then came out below every sole point of a robot with mesh feet)."""
+    mj = _mj()
+    t, s = model.geom_type[g], model.geom_size[g]
+    R, c = data.geom_xmat[g].reshape(3, 3), data.geom_xpos[g]
+    if t == mj.mjtGeom.mjGEOM_MESH and model.geom_dataid[g] >= 0:
+        m = model.geom_dataid[g]
+        v = model.mesh_vert[model.mesh_vertadr[m]:model.mesh_vertadr[m] + model.mesh_vertnum[m]].astype(float)
+        if len(v):
+            return (v @ R.T + c)[:, 2]
+    if t == mj.mjtGeom.mjGEOM_SPHERE:
+        return np.array([c[2] - s[0], c[2] + s[0]])
+    if t == mj.mjtGeom.mjGEOM_CAPSULE:
+        ends = c[2] + np.array([-1.0, 1.0]) * s[1] * R[2, 2]
+        return np.concatenate([ends - s[0], ends + s[0]])
+    if t == mj.mjtGeom.mjGEOM_CYLINDER:  # its end discs' rims: a tilted one's box corners reach below them too
+        e = s[1] * abs(R[2, 2]) + s[0] * np.sqrt(max(0.0, 1.0 - R[2, 2] ** 2))
+        return np.array([c[2] - e, c[2] + e])
+    ac, h = model.geom_aabb[g, :3], model.geom_aabb[g, 3:]
+    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * h + ac
+    return (corners @ R.T + c)[:, 2]
+
+
 def _geom_low(model, data, g: int) -> float:
-    """Lowest world z of a geom (its bounding box corners)."""
-    c, h = model.geom_aabb[g, :3], model.geom_aabb[g, 3:]
-    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * h + c
-    return float((corners @ data.geom_xmat[g].reshape(3, 3).T + data.geom_xpos[g])[:, 2].min())
+    """Lowest world z of a geom (_geom_z)."""
+    return float(_geom_z(model, data, g).min())
 
 
 def _geom_high(model, data, g: int) -> float:
-    c, h = model.geom_aabb[g, :3], model.geom_aabb[g, 3:]
-    corners = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]) * h + c
-    return float((corners @ data.geom_xmat[g].reshape(3, 3).T + data.geom_xpos[g])[:, 2].max())
+    return float(_geom_z(model, data, g).max())
 
 
 FOOT_BAND = 0.005  # m: bodies whose colliding geometry is this close to the lowest at the zero pose stand on it
@@ -404,6 +454,10 @@ def derive(model) -> Parts:
         feet[side] = b
         sole_geoms[side] = [g for x in subtree(b) for z, g in low.get(x, []) if z < floor + SOLE_BAND]
     sole_points = {s: _sole_points(model, data, sole_geoms[s], floor) for s in feet}
+    for s in feet:  # the foot metrics and the physics stand the robot on these
+        if not sole_points[s]:
+            raise RobotError(f"the {s} foot has no sole points: none of its collision geometry reaches the floor "
+                             "at the zero pose")
     R_f = {s: data.xmat[feet[s]].reshape(3, 3) for s in feet}
     sole_local = {s: np.array([R_f[s].T @ (data.geom_xpos[g] + data.geom_xmat[g].reshape(3, 3) @ p - data.xpos[feet[s]])
                                for g, p, _ in sole_points[s]]).reshape(-1, 3) for s in feet}
@@ -479,11 +533,172 @@ def derive(model) -> Parts:
                         break
                     x = parent[x]
                 region[b] = (side, limb.kind, "lower" if lower or b == limb.lower_body else "upper")
+    fingers, hand_bodies = {}, {}
+    for side in SIDES:
+        hand_bodies[side] = set(subtree(arms[side].tip_body))
+        fingers[side] = _fingers(model, data, arms[side], children, body_joints, subtree)
+        if fingers[side]:
+            notes.append(f"{side} hand: fingers " + ", ".join(f"{f.kind} ({len(f.joints)})" for f in fingers[side]))
     return Parts(root=root, chest=chest, waist=waist, waist_pitch=waist_pitch, legs=legs, arms=arms,
                  foot_up=foot_up, sole_geoms=sole_geoms, sole_points=sole_points, sole_local=sole_local,
                  ankle_height=ankle_h,
                  standing_height=float(data.xpos[root][2] - floor), top_height=float(top),
-                 leg_length=leg_len, region=region, notes=notes)
+                 leg_length=leg_len, region=region, notes=notes, fingers=fingers, hand_bodies=hand_bodies)
+
+
+def _open_side(model, j) -> int:
+    """+1 / -1 when a joint's range opens much further one way than the other (a finger's flexion), else 0."""
+    lo, hi = model.jnt_range[j] if model.jnt_limited[j] else (0.0, 0.0)
+    return 1 if hi > 1.5 * abs(lo) + 1e-6 else -1 if -lo > 1.5 * abs(hi) + 1e-6 else 0
+
+
+def _fingers(model, data, arm: Limb, children, body_joints, subtree) -> list:
+    """The jointed fingers below an arm's hand (module docstring), [] when it has none.
+
+    Chains: from the hand down; a body with joints whose subtree branches into several jointed fingers is part of
+    the palm (its own joints are left out) and each branch starts a finger. Kinds: by joint names, then body names
+    (FINGER_WORDS); no thumb by name: the unnamed finger whose base is nearest the hand, when nearer than every named
+    one's; the rest in order of their bases' distance from the thumb's. Closing signs, in the palm's frame at the
+    zero pose: long axis hand -> the other fingers' bases, across axis along those bases, normal = long x across
+    turned to the palm side (the side the fingers' one-sided joint ranges open to, else the thumb's side). A joint of
+    the other fingers flexes when its axis lies across the palm (AXIS_COS; sign: the turn that brings the long axis
+    towards the palm), so a finger modelled curled reads like a straight one; an axis along the normal spreads the
+    fingers, one along the finger twists it: both left alone (0). A thumb joint (and a jaw of a two-finger gripper)
+    closes when its tip moves towards a point over the palm (the others' fingertips, PALM_LIFT_M towards the palm
+    side; a jaw: the thumb's tip) or along the normal; a turn about the thumb itself (tip motion < TWIST_RATIO of its
+    lever) is 0."""
+    mj = _mj()
+    arm_joints = set(arm.joints)
+
+    def hinged(b):
+        return [j for j in sorted(body_joints[b]) if j not in arm_joints]
+
+    def hinge_count(b):
+        return sum(len(hinged(x)) for x in subtree(b))
+
+    def jointed(b):
+        return [c for c in children[b] if hinge_count(c) > 0]
+
+    roots, stack = [], list(children[arm.tip_body])
+    if arm.tip_body != arm.end_body:  # fixed palm bodies hang below the last arm joint's body too (not on its way down)
+        tip_tree = set(subtree(arm.tip_body))
+        stack += [c for c in children[arm.end_body] if c not in tip_tree and arm.tip_body not in subtree(c)]
+    while stack:  # finger roots: the first bodies with joints below the hand, past any palm body that branches
+        b = stack.pop()
+        if hinge_count(b) == 0:
+            continue
+        if len(jointed(b)) >= 2:  # a palm part (with or without a joint of its own) holding several fingers
+            stack.extend(jointed(b))
+        elif hinged(b):
+            roots.append(b)
+        else:
+            stack.extend(children[b])
+    chains, roots = [], sorted(set(roots))
+    while roots:
+        r = roots.pop(0)
+        chain, b = [r], r
+        while True:
+            below = jointed(b)
+            if len(below) != 1:  # the end, or a branch: each branch is a finger of its own
+                roots.extend(below)
+                break
+            b = below[0]
+            chain.append(b)
+        joints = [j for x in chain for j in hinged(x)]
+        if not joints:
+            continue
+        # the fingertip: the point of the finger (body origins, geom centres and capsule ends) farthest from its base
+        base = data.xanchor[joints[0]].copy()
+        own = set(chain) | {x for x in subtree(chain[-1])}
+        pts = [data.xpos[x].copy() for x in own]
+        for g in range(model.ngeom):
+            if int(model.geom_bodyid[g]) in own:
+                c, R = data.geom_xpos[g], data.geom_xmat[g].reshape(3, 3)
+                pts.append(c.copy())
+                if model.geom_type[g] in (mj.mjtGeom.mjGEOM_CAPSULE, mj.mjtGeom.mjGEOM_CYLINDER):
+                    pts += [c + R @ (0.0, 0.0, z) for z in (-model.geom_size[g][1], model.geom_size[g][1])]
+        tip = max(pts, key=lambda p: float(np.linalg.norm(p - base)))
+        jnames = " ".join(mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, j) or "" for j in joints).lower()
+        bnames = " ".join(mj.mj_id2name(model, mj.mjtObj.mjOBJ_BODY, x) or "" for x in chain).lower()
+        kind = next((k for text in (jnames, bnames) for k, rx in FINGER_WORDS.items() if re.search(rx, text)), None)
+        chains.append({"root": r, "joints": joints, "tip": tip, "base": base, "kind": kind})
+    if not chains:
+        return []
+    hand = data.xpos[arm.tip_body].copy()
+    taken = set()
+    for c in chains:  # one finger per kind by name; a second of a kind is unnamed
+        if c["kind"] in taken:
+            c["kind"] = None
+        taken.add(c["kind"])
+    thumb = next((c for c in chains if c["kind"] == "thumb"), None)
+    unnamed = [c for c in chains if c["kind"] is None]
+    if thumb is None and len(chains) >= 2 and unnamed:  # the unnamed finger whose base is nearest the hand, when it
+        # is nearer than every named one's
+        near = min(unnamed, key=lambda c: float(np.linalg.norm(c["base"] - hand)))
+        named_d = [float(np.linalg.norm(c["base"] - hand)) for c in chains if c["kind"]]
+        if not named_d or float(np.linalg.norm(near["base"] - hand)) < min(named_d):
+            thumb = near
+            thumb["kind"] = "thumb"
+    free = [k for k in FINGER_KINDS[1:] if k not in {c["kind"] for c in chains}]
+    unnamed = [c for c in chains if c["kind"] is None]
+    if thumb is not None:
+        unnamed.sort(key=lambda c: float(np.linalg.norm(c["base"] - thumb["base"])))
+    for c in unnamed:
+        c["kind"] = free.pop(0) if free else "finger"
+
+    others = [c for c in chains if c is not thumb]
+    # the palm frame
+    normal = None
+    if others:
+        bases = np.array([c["base"] for c in others])
+        long_ = bases.mean(0) - hand
+        long_ /= max(float(np.linalg.norm(long_)), 1e-9)
+        if len(others) >= 2:
+            centred = bases - bases.mean(0)
+            across = np.linalg.svd(centred - np.outer(centred @ long_, long_), full_matrices=False)[2][0]
+        elif thumb is not None:
+            across = thumb["base"] - bases[0]
+            across = across - (across @ long_) * long_
+        else:
+            across = np.cross(long_, [0.0, 0.0, 1.0])
+        n0 = np.cross(long_, across)
+        if float(np.linalg.norm(n0)) > 1e-9:
+            n0 /= np.linalg.norm(n0)
+            w0 = np.cross(long_, n0)  # turning about it brings the long axis towards n0
+            vote = 0.0
+            for c in others:  # the side the fingers' one-sided ranges close to
+                for j in c["joints"]:
+                    u = float(data.xaxis[j] @ w0)
+                    if abs(u) >= AXIS_COS:
+                        vote += _open_side(model, j) * np.sign(u)
+            if vote == 0 and thumb is not None:  # no ranges to tell: the palm faces the thumb
+                vote = float((thumb["tip"] - bases.mean(0)) @ n0)
+            normal = n0 * (1.0 if vote >= 0 else -1.0)
+            flex_axis = np.cross(long_, normal)  # a finger joint turning about this (+) closes towards the palm
+    out = []
+    for c in chains:
+        close = []
+        for j in c["joints"]:
+            lever = c["tip"] - data.xanchor[j]
+            d = np.cross(data.xaxis[j], lever)  # fingertip motion for a small turn
+            nd = float(np.linalg.norm(d))
+            if nd < TWIST_RATIO * float(np.linalg.norm(lever)) or nd < 1e-9:
+                close.append(0)  # turns the finger about itself
+            elif normal is None:  # one finger alone: its range says which way it bends
+                close.append(_open_side(model, j))
+            elif c is thumb or len(others) == 1:  # a thumb, or the jaws of a two-finger gripper: towards the other
+                to = ((np.mean([o["tip"] for o in others], axis=0) + PALM_LIFT_M * normal) if c is thumb
+                      else thumb["tip"] if thumb is not None else c["tip"] + normal) - c["tip"]
+                cos = float(d @ to) / (nd * max(float(np.linalg.norm(to)), 1e-9))
+                along = float(d @ normal) / nd
+                close.append(int(np.sign(cos)) if abs(cos) >= CLOSE_COS else
+                             int(np.sign(along)) if abs(along) >= FLEX_ALONG else 0)  # a thumb lying in the palm
+            else:  # by the joint's axis, so a finger modelled curled is read as well as a straight one
+                u = float(data.xaxis[j] @ flex_axis)
+                close.append(int(np.sign(u)) if abs(u) >= AXIS_COS else 0)  # else a spread (or a twist)
+        out.append(Finger(kind=c["kind"], joints=c["joints"], close=close, root_body=c["root"]))
+    order = {k: i for i, k in enumerate(FINGER_KINDS)}
+    return sorted(out, key=lambda f: (order.get(f.kind, len(order)), f.root_body))
 
 
 def _limb(model, data, side, kind, start, end, path_to, children, body_joints, notes) -> Limb:
@@ -674,6 +889,26 @@ def _limb(model, data, side, kind, start, end, path_to, children, body_joints, n
                 tip_body=int(tip), distal_roll=roll)
 
 
+def _torque_limits_missing(model) -> int:
+    """How many hinge joints have no torque limit for the physics (policy_replay.RobotSim): neither their own
+    (actuatorfrcrange; MuJoCo reads a URDF's effort into it) nor a motor's that is a torque
+    (policy_replay._motor_limits)."""
+    mj = _mj()
+    from .policy_replay import _motor_limits
+
+    motor = _motor_limits(model)
+    n = 0
+    for j in range(model.njnt):
+        if model.jnt_type[j] == mj.mjtJoint.mjJNT_FREE:
+            continue
+        if model.jnt_actfrclimited[j] and float(np.abs(model.jnt_actfrcrange[j]).max()) > 0:
+            continue
+        if (motor.get(mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, j)) or 0) > 0:
+            continue
+        n += 1
+    return n
+
+
 # --------------------------------------------------------------------------- the profile
 @dataclass
 class RobotProfile:
@@ -686,6 +921,7 @@ class RobotProfile:
     urdf: str | None  # a URDF to draw, when there is one
     digest: str
     builtin: bool
+    limits_urdf: str | None = None  # a URDF with the joint limits (velocity too) when the drawn one (urdf) is not it
     _model: object = None
     _parts: Parts | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -718,6 +954,14 @@ class RobotProfile:
                 return self._parts
         model = m if m is not None else self.model()
         p = derive(model)
+        if not self.builtin:  # the built-in G1's physics has a torque table of its own (policy_replay.G1Sim)
+            try:
+                n = _torque_limits_missing(model)
+            except Exception:  # only a note: never in the way of the parts
+                n = 0
+            if n:
+                p.notes.append(f"torque limits missing on {n} joint{'s' if n > 1 else ''} (physics assumes 1000 N m "
+                               "there and does not judge torque saturation)")
         with self._lock:
             self._parts = p
         return p
@@ -741,8 +985,8 @@ class RobotProfile:
 
     def limits(self, urdf: str | None = None) -> dict[str, tuple[float, float, float]]:
         """Joint limits name -> (lower, upper, max velocity) for QC: the model's ranges, with the
-        URDF's (``urdf`` or the robot's own) where it has the joint (velocity limits are only in
-        URDFs; MJCF has none, inf)."""
+        URDF's (``urdf``, the robot's own or its limits_urdf) where it has the joint (velocity limits
+        are only in URDFs; MJCF has none, inf)."""
         mj = _mj()
         model = self.model()
         out = {}
@@ -750,7 +994,7 @@ class RobotProfile:
             j = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, n)
             lo, hi = model.jnt_range[j] if model.jnt_limited[j] else (-np.inf, np.inf)
             out[n] = (float(lo), float(hi), float("inf"))
-        path = urdf or self.urdf
+        path = urdf or self.urdf or self.limits_urdf
         if path and os.path.isfile(path):
             from .io import urdf_joint_limits
 
@@ -806,6 +1050,13 @@ class RobotProfile:
         """Hip ... ankle joint names of one leg, proximal -> distal."""
         return [self.joint(j) for j in self.parts.legs[side].joints]
 
+    def finger_joints(self) -> set[str]:
+        """Names of the hand's finger joints (both hands); empty for hands without jointed fingers."""
+        return {self.joint(j) for fs in self.parts.fingers.values() for f in fs for j in f.joints}
+
+    def has_fingers(self) -> bool:
+        return any(self.parts.fingers.values())
+
     def describe(self) -> dict:
         """The parts by name, for logs and `retlens-cli robot`."""
         p = self.parts
@@ -827,6 +1078,10 @@ class RobotProfile:
             "standing_height_m": round(p.standing_height, 3), "height_m": round(p.top_height, 3),
             "leg_length_m": round(p.leg_length, 3), "ankle_height_m": round(p.ankle_height, 3),
             "tasks": self.task_bodies(), "notes": list(p.notes),
+            # per finger its joints with the sign that closes the hand (+ / -; 0: a spread or twist, left alone)
+            "fingers": {s: [{"kind": f.kind, "joints": [f"{self.joint(j)} ({'+' if c > 0 else '-' if c < 0 else '0'})"
+                                                        for j, c in zip(f.joints, f.close)]}
+                            for f in p.fingers.get(s, [])] for s in SIDES},
         }
 
 
@@ -835,23 +1090,33 @@ _CACHE: dict = {}
 _CACHE_LOCK = threading.Lock()
 
 
+# the built-in models: registry key -> (file in <robot assets>\unitree_g1, display name, file-name tag)
+BUILTIN_FILES = {
+    "unitree_g1": ("g1_mocap_29dof.xml", "Unitree G1", "g1"),
+    "unitree_g1_with_hands": ("g1_mocap_29dof_with_hands.xml", "Unitree G1 (hands)", "g1_hands"),
+}
+# the model names in the built-in files (<mujoco model="...">) -> their keys: the name recorded for such a file chosen
+# by its path before 2026-11-11 (_builtin_key)
+_LEGACY_NAMES = {"g1_mocap": "unitree_g1", "g1_29dof_with_hands_scene": "unitree_g1_with_hands"}
+
+
 def _builtin(key: str) -> RobotProfile:
     from . import paths
 
     root = paths.robot_assets_dir()
-    files = {
-        "unitree_g1": ("g1_mocap_29dof.xml", "Unitree G1", "g1"),
-        "unitree_g1_with_hands": ("g1_mocap_29dof_with_hands.xml", "Unitree G1 (hands)", "g1_hands"),
-    }
+    files = BUILTIN_FILES
     if key not in files:
         raise RobotError(f"unknown robot {key!r}: give the path of its MJCF or URDF, or one of {', '.join(files)}")
     xml, name, tag = files[key]
     path = os.path.join(root, "unitree_g1", xml)
     if not os.path.isfile(path):
         raise RobotError(f"no robot model for {key} ({path}; scripts\\install_gmr.ps1 puts it next to the repository)")
-    urdf = paths.robot_urdf() if key == "unitree_g1" else None
-    return RobotProfile(key=key, name=name, tag=tag, mjcf=path, urdf=urdf if urdf and os.path.isfile(urdf) else None,
-                        digest=model_digest(path), builtin=True)
+    urdf = paths.robot_urdf()
+    urdf = urdf if urdf and os.path.isfile(urdf) else None
+    # the hands model is drawn from its MJCF (the URDF has no fingers), but its body joints are the G1's: their
+    # limits, velocity included, come from the G1's URDF too
+    return RobotProfile(key=key, name=name, tag=tag, mjcf=path, urdf=urdf if key == "unitree_g1" else None,
+                        digest=model_digest(path), builtin=True, limits_urdf=urdf)
 
 
 def _slug(s: str) -> str:
@@ -880,15 +1145,37 @@ def _from_file(path: str) -> RobotProfile:
                         digest=digest, builtin=False)
 
 
+def canonical(spec: str | None) -> str:
+    """The registry key of a robot spec: a path to one of the built-in models' own files (a user who browses to
+    the G1 model RetLens ships chose the built-in G1) is that model's key; '' / None the built-in G1; any other
+    spec as it is."""
+    if not spec:
+        return BUILTIN
+    if spec in BUILTIN_FILES:
+        return spec
+    name = os.path.basename(spec).lower()
+    for key, (xml, _, _) in BUILTIN_FILES.items():
+        if name == xml.lower():
+            from . import paths
+
+            try:
+                if os.path.samefile(spec, os.path.join(paths.robot_assets_dir(), "unitree_g1", xml)):
+                    return key
+            except OSError:  # either file missing
+                pass
+    return spec
+
+
 def is_builtin(spec: str | None) -> bool:
-    return not spec or spec in ("unitree_g1", "unitree_g1_with_hands")
+    return canonical(spec) in BUILTIN_FILES
 
 
 def load(spec: str | None = None) -> RobotProfile:
-    """The robot named by a registry key or a model path (None / '' = the built-in G1).
-    Cached per key and file state; the parts are derived on first use."""
-    spec = spec or BUILTIN
-    if is_builtin(spec):
+    """The robot named by a registry key or a model path (None / '' = the built-in G1; the path of a built-in
+    model's own file = that model, :func:`canonical`). Cached per key and file state; the parts are derived on
+    first use."""
+    spec = canonical(spec)
+    if spec in BUILTIN_FILES:
         k = (spec,)
         builder = lambda: _builtin(spec)  # noqa: E731
     else:
@@ -908,9 +1195,28 @@ def load(spec: str | None = None) -> RobotProfile:
     return prof
 
 
+def _builtin_key(ident: dict) -> str | None:
+    """The registry key of a recorded identity of a built-in model, None for any other robot: by its key, else (motion
+    files record none) by its name. Until 2026-11-11 a built-in file chosen by its path (찾아보기...) was recorded as a
+    robot of its own: key = the file's name, name = the model's name in it (_LEGACY_NAMES); both still name it."""
+    key, name = ident.get("key"), ident.get("name")
+    legacy = _LEGACY_NAMES.get(name) if isinstance(name, str) else None  # a session's json may hold anything
+    if key:
+        if isinstance(key, str) and key in BUILTIN_FILES:
+            return key
+        base = os.path.basename(str(key)).lower()
+        return legacy if legacy and base == BUILTIN_FILES[legacy][0].lower() else None
+    return next((k for k, (_, n, _) in BUILTIN_FILES.items() if n == name), None) or legacy
+
+
 def same_robot(a: dict | None, b: dict | None) -> bool:
     """Do two recorded robot identities (RobotProfile.ident) name the same model? Unknown
-    (None) matches anything: motions from before identities were recorded."""
+    (None) matches anything: motions from before identities were recorded. A built-in model is
+    itself whatever its digest: the digest of one shipped file changes with the MuJoCo version, and
+    until 2026-11-11 it changed with the robot the process had loaded first (model_digest)."""
     if not a or not b:
         return True
-    return a.get("digest") == b.get("digest") or (a.get("name") == b.get("name") and not a.get("digest"))
+    if a.get("digest") == b.get("digest") or (a.get("name") == b.get("name") and not a.get("digest")):
+        return True
+    key = _builtin_key(a)
+    return key is not None and key == _builtin_key(b)

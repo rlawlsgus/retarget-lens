@@ -31,20 +31,51 @@ class _Joint:
         self.is_end = is_end
 
 
+_NAMED = re.compile(r"[ \t]*(ROOT|JOINT)[ \t]+(.*?)[ \t]*(\{)?[ \t]*$", re.IGNORECASE)
+_KEYWORDS = {"OFFSET", "CHANNELS"}  # or a brace: more on the name's line (a compact file); "Root", "End" may be names
+
+
+def _tokens(text: str) -> list[str]:
+    """Whitespace tokens of a BVH, except that a ROOT / JOINT name is the rest of its line, inner spaces kept
+    ("JOINT Bip001 Pelvis", as Blender's importer reads it). The MOTION block is split on whitespace."""
+    m = re.search(r"^[ \t]*MOTION\b", text, re.MULTILINE | re.IGNORECASE)
+    head, tail = (text[:m.start()], text[m.start():]) if m else (text, "")
+    tokens: list[str] = []
+    for line in head.splitlines():
+        nm = _NAMED.match(line)
+        if nm and nm.group(2) and not re.search(r"[{}]", nm.group(2)) \
+                and not any(w.upper() in _KEYWORDS for w in nm.group(2).split()):
+            tokens += [nm.group(1), nm.group(2)] + (["{"] if nm.group(3) else [])
+        else:  # one-word names, or a compact file with more on the line
+            tokens += line.split()
+    return tokens + tail.split()
+
+
 def _parse(text: str):
-    tokens = text.split()
+    tokens = _tokens(text.lstrip("\ufeff"))  # a UTF-8 BOM read as text (some Windows exporters write one)
     i = 0
     joints: list[_Joint] = []
     stack: list[int] = []
 
     def take() -> str:
         nonlocal i
+        if i >= len(tokens):
+            raise ValueError("BVH 파일이 비었거나 잘렸습니다 (MOTION 부분이 없거나 중간에 끊김)")
         tok = tokens[i]
         i += 1
         return tok
 
+    def number(kind=float):
+        tok = take()
+        try:
+            return kind(tok)
+        except ValueError:
+            raise ValueError(f"BVH 숫자 부분이 손상되었습니다 ({tok!r})") from None
+
+    if not tokens:
+        raise ValueError("BVH 파일이 비었습니다")
     if take().upper() != "HIERARCHY":
-        raise ValueError("not a BVH file (missing HIERARCHY)")
+        raise ValueError("BVH 파일이 아닙니다 (HIERARCHY로 시작하지 않음)")
 
     while i < len(tokens):
         tok = take()
@@ -54,33 +85,48 @@ def _parse(text: str):
             joints.append(_Joint(name, stack[-1] if stack else -1))
         elif up == "END":
             take()  # "Site"
+            if not stack:
+                raise ValueError("BVH 계층 구조가 손상되었습니다 (End Site가 관절 밖에 있음)")
             parent = stack[-1]
             joints.append(_Joint(f"{joints[parent].name}_end", parent, is_end=True))
         elif tok == "{":
             stack.append(len(joints) - 1)
         elif tok == "}":
+            if not stack:
+                raise ValueError("BVH 계층 구조가 손상되었습니다 ('}'가 남음)")
             stack.pop()
+        elif up in ("OFFSET", "CHANNELS") and not stack:
+            raise ValueError(f"BVH 계층 구조가 손상되었습니다 ({tok}가 관절 밖에 있음)")
         elif up == "OFFSET":
-            joints[stack[-1]].offset = np.array([float(take()) for _ in range(3)])
+            joints[stack[-1]].offset = np.array([number() for _ in range(3)])
         elif up == "CHANNELS":
-            n = int(take())
+            n = number(int)
             joints[stack[-1]].channels = [take() for _ in range(n)]
         elif up == "MOTION":
             break
         else:
-            raise ValueError(f"unexpected BVH token {tok!r}")
+            raise ValueError(f"BVH 파일에 알 수 없는 내용이 있습니다 ({tok!r})")
+    else:
+        raise ValueError("BVH 파일이 잘렸습니다 (MOTION 부분이 없음)")
+    if not joints:
+        raise ValueError("BVH 파일에 관절이 없습니다")
 
     take()  # "Frames:"
-    n_frames = int(take())
+    n_frames = number(int)
     take()  # "Frame"
     take()  # "Time:"
-    frame_time = float(take())
+    frame_time = number()
     n_channels = sum(len(j.channels) for j in joints)
-    values = np.asarray(tokens[i : i + n_frames * n_channels], dtype=np.float64)
+    try:
+        values = np.asarray(tokens[i : i + n_frames * n_channels], dtype=np.float64)
+    except ValueError:
+        raise ValueError("BVH 동작 부분의 숫자가 손상되었습니다 (파일이 중간에 잘렸을 수 있음)") from None
     if values.size != n_frames * n_channels:
         raise ValueError(
-            f"BVH motion block truncated: expected {n_frames * n_channels} values, got {values.size}"
+            f"BVH 동작 부분이 잘렸습니다: 값 {n_frames * n_channels}개 중 {values.size}개만 있음"
         )
+    if n_frames == 0:
+        raise ValueError("BVH 파일에 프레임이 없습니다 (Frames: 0)")
     return joints, frame_time, values.reshape(n_frames, n_channels)
 
 
@@ -216,7 +262,7 @@ def load_bvh(
         fps: frame rate. "auto" = the file's frame time, except cgspeed CMU files
             of 60 Hz trials (see :func:`cmu_capture_fps`), which say 120.
     """
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         joints, frame_time, data = _parse(f.read())
     tpose0 = _cgspeed_tpose(joints, data)
     file_fps = 1.0 / frame_time if frame_time > 0 else 0.0
@@ -266,7 +312,7 @@ def bvh_rest_pose(
     meters, same joint order as :func:`load_bvh`. ``scale="auto"`` guesses from
     the first motion frame, like load_bvh, so both agree.
     """
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         joints, _, data = _parse(f.read())
     s = _auto_scale(_forward_kinematics(joints, data[:1])[0]) if scale == "auto" else float(scale)
     raw, raw_rot = _forward_kinematics(joints, _rest_data(joints))

@@ -95,9 +95,9 @@
 | 형식 | 열면 | 비고 |
 |---|---|---|
 | BVH | 리타게팅 후 재생 | CMU, Vicon, OptiTrack, Xsens, Rokoko 등 |
-| FBX | 리타게팅 후 재생 | MotionBuilder, Shogun, Motive, Mixamo 등. Blender 4.5 필요 |
+| FBX | 리타게팅 후 재생 | MotionBuilder, Shogun, Motive, Mixamo, 3ds Max Biped 등의 바이너리 FBX. Blender 4.5 필요 |
 | AMASS SMPL-X (`.npz`) | 리타게팅 후 재생 | SMPL-X 모델 필요 |
-| C3D | 마커 + 같은 촬영의 리타겟 | 같은 이름의 BVH·FBX·AMASS 파일을 찾아 씀 |
+| C3D | 마커 + 같은 촬영의 리타겟 | 같은 이름의 BVH·FBX·AMASS 파일을 C3D 폴더에서 먼저 찾아 씀 |
 | 로봇 모션 (`.npz`, Unitree `.csv`, GMR `.pkl`) | 그대로 재생 | 물리 결과(`*_sim.npz`)도 지표와 함께 열림 |
 
 ## AI·스크립트로 쓰기
@@ -128,6 +128,7 @@
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
 conda activate retlens
+powershell -ExecutionPolicy Bypass -File scripts\install_gmt.ps1   # MuJoCo 물리 모드의 G1 모델(GMT, 연구용 라이선스)
 python tools\editor.py                       # RetLens 창 (scripts\editor.bat도 같음)
 python -m pytest tests                       # 테스트
 python tools\fetch_samples.py cmu            # 예제 CMU BVH -> data\raw\cmu_bvh

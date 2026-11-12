@@ -104,11 +104,14 @@ def smoothness(m: RobotMotion) -> dict:
     if m.num_frames < 4:
         return {}
     vel = np.abs(np.diff(q, axis=0)) * fps
+    if not np.isfinite(vel).any():
+        return {}
+    # nan-aware: a bad sample (NaN) drops only the differences that touch it
     return {
-        "acc_mean": float((np.abs(np.diff(q, 2, axis=0)) * fps ** 2).mean()),
-        "jerk_mean": float((np.abs(np.diff(q, 3, axis=0)) * fps ** 3).mean()),
-        "vel_p99": float(np.percentile(vel, 99)),
-        "vel_max": float(vel.max()),
+        "acc_mean": float(np.nanmean(np.abs(np.diff(q, 2, axis=0)) * fps ** 2)),
+        "jerk_mean": float(np.nanmean(np.abs(np.diff(q, 3, axis=0)) * fps ** 3)),
+        "vel_p99": float(np.nanpercentile(vel, 99)),
+        "vel_max": float(np.nanmax(vel)),
     }
 
 

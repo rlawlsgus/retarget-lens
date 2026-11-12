@@ -8,6 +8,7 @@ pkl) are loaded as they are.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import analysis, objects, paths, problems
-from .io import load_motion
+from .io import load_motion, npz_keys
 from .io.bvh import load_bvh
 from .io.fbx import load_fbx
 from .io.smpl import load_amass_npz
@@ -30,9 +31,10 @@ HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
 MARKER_EXT = (".c3d",)  # raw optical markers: shown on the same take's retargeted robot
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
-PIPELINE_VERSION = 8  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
+PIPELINE_VERSION = 9  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
 # 5: feet levelled from the clip's stance, foot-flat through legs and pelvis height; 6: the robot's
-# parts from its model (robot_profile: joint centres, flex signs), any robot
+# parts from its model (robot_profile: joint centres, flex signs), any robot; 9: BVH names with spaces and a BOM,
+# classic Biped chest / bare root bone, interpolated LAFAN1 / Nokov above the source fps, mesh / round sole points
 MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",) + MARKER_EXT
 # folders the viewer lists motions from (dev: data/raw, data/samples, data/retargeted,
 # data/uploads, reports; installed: see retlens.paths); uploads land in UPLOADS
@@ -40,17 +42,53 @@ LIBRARY_ROOTS = tuple(paths.library_roots())
 UPLOADS = paths.uploads_dir()
 
 
-def is_motion_file(path: str) -> bool:
+def is_motion_file(path: str, entry: os.DirEntry | None = None) -> bool:
     """A file the viewer can open: motion extensions, minus AMASS body-shape files
     (*_stagei.npz), label files (*.labels.csv, retlens.motion_labels), anything under a cache
-    folder, and report tables (only the physics results *_sim.npz count under the repository's
-    reports/)."""
+    folder, report tables (only the physics results *_sim.npz count under the repository's
+    reports/) and .csv tables that are not a Unitree robot csv (a header or words: batch tables,
+    dataset manifests, metadata; see _robot_csv). entry: the file's os.scandir entry when the
+    caller lists a folder (its size and time come with the listing)."""
     rel = paths.rel(path, ROOT).replace(os.sep, "/").lower()
     name = os.path.basename(rel)
     if (not name.endswith(MOTION_EXT) or name.endswith("_stagei.npz") or is_label_name(name)
             or "/cache/" in f"/{rel}"):
         return False
+    if name.endswith(".fbx"):
+        from .props import is_prop_file
+
+        if is_prop_file(path):  # props of a take, drawn with its people (retlens.props)
+            return False
+    if name.endswith(".csv") and not _robot_csv(path, entry):
+        return False
     return not rel.startswith("reports/") or name.endswith("_sim.npz")
+
+
+def _robot_csv(path: str, entry: os.DirEntry | None = None) -> bool:
+    """A Unitree robot csv by its first line: no header, at least 8 numbers (root x y z, quaternion, a joint)."""
+    try:
+        st = os.stat(path) if entry is None else entry.stat()
+    except OSError:
+        return False
+    return _numeric_first_line(os.path.normcase(os.path.abspath(path)), st.st_mtime_ns, st.st_size)
+
+
+@functools.lru_cache(maxsize=None)  # per csv version: a folder of thousands of csvs is read once, not per listing
+def _numeric_first_line(path: str, stamp: int, size: int) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    for line in head.splitlines():
+        line = line.split(b"#", 1)[0].strip()  # '#' comments, as np.loadtxt skips them (np.savetxt's header=)
+        if line:
+            cells = line.split(b",")
+            try:
+                return len(cells) >= 8 and all(np.isfinite(float(c)) for c in cells)
+            except ValueError:
+                return False
+    return False
 
 
 def library_files(roots=None) -> dict[str, list[str]]:
@@ -59,12 +97,32 @@ def library_files(roots=None) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for root in LIBRARY_ROOTS if roots is None else roots:
         top = os.path.normpath(root if os.path.isabs(root) else os.path.join(ROOT, root))
-        for d, dirs, files in os.walk(top):
-            dirs[:] = sorted(x for x in dirs if x.lower() != "cache")
-            found = [os.path.join(d, f) for f in sorted(files) if is_motion_file(os.path.join(d, f))]
+        for d, files in _walk(top):
+            found = [e.path for e in files if is_motion_file(e.path, e)]
             if found:
                 out[paths.rel(d, ROOT).replace(os.sep, "/")] = found
     return out
+
+
+def _walk(top: str):
+    """(folder, its files as os.DirEntry) like os.walk: top-down, names sorted, symlinked folders and cache
+    folders not entered. The entries carry each file's size and time from the listing (no stat call per file)."""
+    try:
+        with os.scandir(top) as it:
+            entries = sorted(it, key=lambda e: e.name)
+    except OSError:
+        return
+    files, dirs = [], []
+    for e in entries:
+        try:
+            is_dir = e.is_dir()
+        except OSError:
+            is_dir = False
+        (dirs if is_dir else files).append(e)
+    yield top, files
+    for e in dirs:
+        if e.name.lower() != "cache" and not e.is_symlink():
+            yield from _walk(e.path)
 
 
 def save_upload(name: str, content: bytes, folder: str = UPLOADS) -> str:
@@ -102,6 +160,20 @@ class Item:
     handles: dict = field(default_factory=dict)  # viewer state
     retarget: dict = field(default_factory=dict)  # human inputs: the settings it was retargeted with
     labels: object = None  # retlens.motion_labels.MotionLabels: labelled time segments; None = no label file
+    solved_human: SkeletonMotion | None = None  # C3D: the solved skeleton its robot was retargeted from (human = markers)
+
+
+def measured_human(item: Item) -> SkeletonMotion | None:
+    """The skeleton an item's numbers are measured against: its human skeleton, or for a C3D (human = markers) the
+    solved skeleton its robot was retargeted from, whose objects and props its hand-object numbers use too."""
+    return item.solved_human if item.solved_human is not None else item.human
+
+
+def file_warnings(item: Item) -> list[str]:
+    """What the motion file's reader left out (meta['warnings'], e.g. another person's skeleton in an FBX); for a
+    C3D, its solved skeleton's."""
+    h = measured_human(item)
+    return list(h.meta.get("warnings") or []) if h is not None else []
 
 
 def human_format(path: str) -> str | None:
@@ -112,16 +184,16 @@ def human_format(path: str) -> str | None:
     if ext in HUMAN_EXT:
         return detect_format(path)
     if ext == ".npz":
-        with np.load(path, allow_pickle=False) as d:
-            keys = set(d.files)
+        keys = npz_keys(path)
         if "pose_body" in keys:
             return "smplx"
         if "dof_pos" in keys:
             return None
-        raise ValueError(f"{path}: neither a robot npz (dof_pos) nor AMASS SMPL-X (pose_body)")
+        raise ValueError(f"{os.path.basename(path)}: 로봇 npz(dof_pos)도 AMASS SMPL-X(pose_body)도 아닌 npz입니다")
     if ext in ROBOT_EXT:
         return None
-    raise ValueError(f"unsupported file type: {path}")
+    raise ValueError(f"{os.path.basename(path)}: 지원하지 않는 파일 형식입니다 (BVH / FBX / AMASS SMPL-X npz / C3D / "
+                     "로봇 npz·csv·pkl)")
 
 
 def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance: float = 0.0,
@@ -139,6 +211,10 @@ def cache_path(path: str, robot: str, smooth: float, fps: float, swing_clearance
         key.append(["foot_flat", True])
     if self_collision:
         key.append(["self_collision", True])
+    if prof.has_fingers():  # its fingers follow the person's (retlens.fingers): only robots with jointed fingers
+        from .fingers import VERSION as FINGERS
+
+        key.append(["fingers", FINGERS])
     key = json.dumps(key)
     h = hashlib.sha1(key.encode()).hexdigest()[:10]
     stem = os.path.splitext(os.path.basename(path))[0]
@@ -195,6 +271,13 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
             json.dump(info, f, indent=1, ensure_ascii=False, default=float)
         m = load_motion(cached)
     human = load_skeleton(path, fmt, smpl_model_dir)
+    for w in human.meta.get("warnings") or []:  # e.g. a second person's skeleton in the FBX, not read (retlens.io.fbx)
+        log(f"{name}: {w}")
+    for e in human.meta.get("props") or []:  # the take's prop files (retlens.props): say why one is not drawn
+        if e.get("error"):
+            log(f"{name}: 물체 파일 {os.path.basename(e['file'])}을(를) 읽지 못함: {e['error']}")
+        elif e.get("overlap_pct") is not None and e["overlap_pct"] < 50:
+            log(f"{name}: 물체 파일 {os.path.basename(e['file'])}의 시간이 모션과 {e['overlap_pct']:g}%만 겹침")
     label_fmt = {"tpose": "BVH", "fbx": "FBX", "lafan1": "BVH LAFAN1", "nokov": "BVH Nokov", "smplx": "SMPL-X"}[fmt]
     smooth_txt = f", smooth {smooth:g} Hz" if smooth else ""
     if foot_flat:
@@ -209,13 +292,20 @@ def load_item(path: str, robot: str = "unitree_g1", smooth: float = 6.0, fps: fl
                                                   "self_collision": bool(self_collision)})
 
 
-def load_skeleton(path: str, fmt: str | None = None, smpl_model_dir: str | None = None) -> SkeletonMotion:
-    """The human skeleton of a BVH / FBX / AMASS SMPL-X file, as drawn next to its robot."""
+def load_skeleton(path: str, fmt: str | None = None, smpl_model_dir: str | None = None,
+                  props: bool = True) -> SkeletonMotion:
+    """The human skeleton of a BVH / FBX / AMASS SMPL-X file, as drawn next to its robot. props: an FBX also gets
+    the props its take has in a file of their own (retlens.props) among its objects."""
     fmt = fmt or human_format(path)
     if fmt == "smplx":
         return load_amass_npz(path, model_dir=smpl_model_dir or os.environ.get("SMPL_MODEL_DIR"), body_only=True)
     if fmt == "fbx":
-        return load_fbx(path)
+        human = load_fbx(path)
+        if props:
+            from . import props as prop_files
+
+            prop_files.attach(human)
+        return human
     if fmt is None:
         raise ValueError(f"{os.path.basename(path)}: 사람 모션 파일이 아닙니다")
     return load_bvh(path)
@@ -223,13 +313,17 @@ def load_skeleton(path: str, fmt: str | None = None, smpl_model_dir: str | None 
 
 def find_take(path: str, files: list[str] | None = None) -> str | None:
     """The same take's solved motion for a marker file: same name as BVH (first), FBX, or AMASS
-    SMPL-X (<name>_stageii.npz / _poses.npz), from the library folders and the file's own folder.
+    SMPL-X (<name>_stageii.npz / _poses.npz), from the file's own folder first, else the library
+    folders (another session's take of the same name there never beats the one beside the C3D).
     FBX converted from BVH (cmu_fbx_from_bvh) comes last."""
     stem = os.path.splitext(os.path.basename(path))[0].lower()
+    here = os.path.dirname(os.path.abspath(path))
     if files is None:
+        local = find_take(path, [os.path.join(here, f) for f in os.listdir(here)])
+        if local is not None:  # one beside the C3D always wins: the motion folders need not be listed
+            return local
         files = [f for fs in library_files().values() for f in fs]
-        here = os.path.dirname(os.path.abspath(path))
-        files += [os.path.join(here, f) for f in os.listdir(here)]
+    here = os.path.normcase(here)
     best = None
     for f in files:
         s, ext = os.path.splitext(os.path.basename(f).lower())
@@ -238,14 +332,37 @@ def find_take(path: str, files: list[str] | None = None) -> str | None:
         if rank is None:
             continue
         rank += 3 * ("from_bvh" in f.replace(os.sep, "/").lower())
-        if best is None or rank < best[0]:
-            best = (rank, os.path.abspath(f))
+        key = (os.path.normcase(os.path.dirname(os.path.abspath(f))) != here, rank)
+        if best is None or key < best[0]:
+            best = (key, os.path.abspath(f))
     return best[1] if best else None
 
 
+# C3D pelvis markers this far (mean) from the solved skeleton's root: likely another take. A solve whose root is not
+# at the pelvis-marker centre sits up to ~11 cm off on its own take (CMU FBX, the subject turning), another take's
+# >= 25 cm; between 10 and 20 cm it is another take only when the lengths differ too (own takes: the same length)
+TAKE_RESIDUAL_CM = 20.0
+TAKE_LENGTH_RESIDUAL_CM = 10.0
+TAKE_LENGTH_TOL = 0.05  # solve / markers length ratio this far from 1: not the same recording
+
+
+def _take_warning(residual_cm: float, markers_s: float, solve_s: float, solve: str) -> str | None:
+    """Why the solve found for a C3D is likely another take (TAKE_RESIDUAL_CM ...), or None."""
+    if not np.isfinite(residual_cm):
+        return None
+    where = f"마커 골반이 솔버 결과({os.path.basename(solve)})의 골반과 평균 {residual_cm:.0f} cm 떨어져 있"
+    if residual_cm > TAKE_RESIDUAL_CM:
+        return f"{where}어 다른 촬영일 수 있습니다"
+    if residual_cm > TAKE_LENGTH_RESIDUAL_CM and abs(solve_s / max(markers_s, 1e-6) - 1) > TAKE_LENGTH_TOL:
+        return f"{where}고 길이도 달라(마커 {markers_s:.1f}초, 솔버 결과 {solve_s:.1f}초) 다른 촬영일 수 있습니다"
+    return None
+
+
 def _load_marker_item(path: str, log, **opts) -> Item:
-    """A C3D take: the robot from the same take's solved skeleton (retargeted, cached), the
-    markers as its human part, turned into that skeleton's frame; marker QC in info['c3d']."""
+    """A C3D take: the robot from the same take's solved skeleton (retargeted, cached; kept as
+    solved_human, which its metrics measure against), the markers as its human part, turned into that
+    skeleton's frame; marker QC in info['c3d'], with "solved_elsewhere" when the solve is not beside the
+    C3D and "take_warning" when the markers' pelvis is far from the solve's (likely another take)."""
     from .io.c3d import load_c3d
     from .markers import align_to_skeleton, marker_qc, marker_skeleton
 
@@ -259,9 +376,18 @@ def _load_marker_item(path: str, log, **opts) -> Item:
     log(f"{name}: markers on the robot retargeted from {paths.rel(match)}")
     base = load_item(match, log=log, **opts)
     markers, fit = align_to_skeleton(marker_skeleton(raw), base.human)
-    info = {**base.info, "c3d": {**marker_qc(raw), **fit}, "solved_motion": match}  # absolute path
+    c3d = {**marker_qc(raw), **fit}
+    if os.path.normcase(os.path.dirname(match)) != os.path.normcase(os.path.dirname(path)):
+        c3d["solved_elsewhere"] = True  # not beside the C3D: found in a motion folder by its name
+        log(f"{name}: C3D 폴더에 같은 이름의 솔버 결과가 없어 모션 폴더의 {paths.rel(match)}을(를) 씁니다")
+    warning = _take_warning(fit["residual_cm"], markers.duration, base.human.duration, match)
+    if warning:
+        c3d["take_warning"] = warning
+        log(f"{name}: {warning}")
+    info = {**base.info, "c3d": c3d, "solved_motion": match}  # absolute path
     return Item(label=f"{os.path.basename(os.path.dirname(path))}/{name}", source=path,
-                kind=f"C3D 마커 + {base.kind}", robot=base.robot, human=markers, info=info, retarget=base.retarget)
+                kind=f"C3D 마커 + {base.kind}", robot=base.robot, human=markers, info=info, retarget=base.retarget,
+                solved_human=base.human)
 
 
 def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> None:
@@ -277,13 +403,14 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
     out["qc"] = r.status
     out["qc_notes"] = "; ".join(r.notes)
     flags = dict(fm.get("_frames", {}))
-    if fk is not None and item.human is not None and item.retarget:  # retargeted here: how well (retarget_quality)
-        q = _retarget_quality(item, fk, out)
+    human = measured_human(item)  # C3D: measured against its solved skeleton
+    if fk is not None and human is not None and item.retarget:  # retargeted here: how well (retarget_quality)
+        q = _retarget_quality(item, fk, out, human)
         flags.update(q.pop("_frames", {}))
         out.update(q)
-        if item.human.objects:  # props captured with the person: does the robot's hand meet them (retlens.objects)
+        if human.objects:  # props captured with the person: does the robot's hand meet them (retlens.objects)
             try:
-                out.update(objects.hand_object_metrics(item.human, m, fk))
+                out.update(objects.hand_object_metrics(human, m, fk))
             except Exception as e:  # a skeleton without hands to match: no contact numbers, the rest still works
                 out["_objects"] = {"error": f"{type(e).__name__}: {e}"}
     if item.human is not None and item.human.kind == "markers":  # C3D: frames where a placed marker is missing
@@ -311,6 +438,8 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
         out["phys_harness_pct"] = 0.0
         out["phys_falls"] = pol.get("falls")
         out["phys_saturated_pct"] = 100 * pol.get("torque_saturated_ratio", float("nan"))
+        if pol.get("torque_limits_missing"):  # joints the robot gives no torque limit (1000 N m): saturation not judged
+            out["phys_torque_limits_missing"] = int(pol["torque_limits_missing"])
         out["phys_body_error_cm"] = pol.get("body_error_cm")
         out["phys_ok"] = "통과" if not pol.get("falls") else f"넘어짐 {pol['falls']}회"
         out["phys_fall_causes"] = cause_counts_text(pol.get("fall_diagnosis") or []) or None  # falls in the clip
@@ -321,13 +450,14 @@ def compute_metrics(item: Item, fk: analysis.FootKinematics | None, limits) -> N
     item.metrics = out
 
 
-def _retarget_quality(item: Item, fk: analysis.FootKinematics, metrics: dict) -> dict:
-    """Quality numbers of a retarget against its human skeleton, the 리타게팅 점수 over them and
-    the foot / balance metrics, and the details (``_quality``) inspectors show."""
+def _retarget_quality(item: Item, fk: analysis.FootKinematics, metrics: dict,
+                      human: SkeletonMotion | None = None) -> dict:
+    """Quality numbers of a retarget against its human skeleton (default item.human), the 리타게팅 점수
+    over them and the foot / balance metrics, and the details (``_quality``) inspectors show."""
     from . import retarget_quality as rq
 
     try:
-        q = rq.measure(item.human, item.robot, fk.robot, fk.model)
+        q = rq.measure(item.human if human is None else human, item.robot, fk.robot, fk.model)
     except Exception as e:  # a skeleton without the limbs to match: no score, the rest still works
         return {"_quality": {"error": f"{type(e).__name__}: {e}"}}
     if not q:

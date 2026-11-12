@@ -21,7 +21,14 @@ class ObjectTrack:
     rotations: np.ndarray  # (T, 3, 3) its frame in the world
     vertices: np.ndarray  # (V, 3) meters, in its own frame (scale applied); empty for a bare node
     faces: np.ndarray  # (F, 3) int
-    kind: str = "mesh"  # "mesh" | "empty"
+    kind: str = "mesh"  # "mesh" | "empty" | "bone" (a segment of a prop exported as a skeleton)
+    # props from a file of their own (retlens.props): that file, the prop a segment belongs to, the parent
+    # segment's index in the motion's objects (-1: none), and where the drawn shape came from ("파일의 메시",
+    # "... (모양 파일)", "... (기본값)", "모양 파일 오류: ..."; "" = no shape)
+    source: str = ""
+    group: str = ""
+    parent: int = -1
+    shape: str = ""
 
     def world_vertices(self, frame: int) -> np.ndarray:
         return self.vertices @ self.rotations[frame].T + self.positions[frame]

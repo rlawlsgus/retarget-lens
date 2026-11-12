@@ -47,7 +47,8 @@ def test_drop_open_and_attach(tmp_path, monkeypatch):
     lab.write_text("label,start_s,end_s\nwalk,0,1\n", encoding="utf-8")
     attached, opened, alone = [], [], []
     win = types.SimpleNamespace(
-        _pending_labels={}, _loading=0, selected=None,
+        _pending_labels={}, _loading=0, _load_done=0, _load_total=0, _load_cancelled=0, _refresh_status=lambda: None,
+        selected=None,
         scene=types.SimpleNamespace(items=[], set_labels=lambda it, p: attached.append((it, p)), fit_camera=lambda: None,
                                     log=lambda m: None),
         status=lambda *a: None, select=lambda it: None, _show_labels_result=lambda it, lab: None,

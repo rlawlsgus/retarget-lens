@@ -244,7 +244,10 @@ class MotionExportDialog(QDialog):
         self.setWindowTitle(f"로봇 모션 내보내기 - {name}")
         lay = QVBoxLayout(self)
         form = QFormLayout()
-        self.folder = FolderRow(_get(store, "motion_folder", start), "내보낼 폴더", self)
+        folder = _get(store, "motion_folder", start)
+        if start and folder and dataset.path_key(folder) == dataset.path_key(os.path.dirname(start)):
+            folder = start  # remembered as the motion's own folder (0.10.0's default): its retlens_export instead
+        self.folder = FolderRow(folder, "내보낼 폴더", self)
         form.addRow("내보낼 폴더", self.folder)
         lay.addLayout(form)
         box = QGroupBox("범위")

@@ -1,7 +1,8 @@
 # Vendored from GMR (github.com/YanjieZe/GMR @ bb1bbe40774794fceb2a7c579a3464a28e68c844,
 # general_motion_retargeting/motion_retarget.py, MIT, see LICENSE in this folder). RetLens changes:
 # the IK limits go to solve_ik as limits=; the constructor also takes a compiled model and the
-# config dict (any robot, no shared tables); the velocity limit is keyed by joint name.
+# config dict (any robot, no shared tables); the velocity limit is keyed by joint name; it prints
+# nothing unless verbose.
 
 import mink
 import mujoco as mj
@@ -37,8 +38,9 @@ class GeneralMotionRetargeting:
                 print("Use robot model: ", self.xml_file)
             self.model = mj.MjModel.from_xml_path(self.xml_file)
         
-        # Print DoF names in order
-        print("[GMR] Robot Degrees of Freedom (DoF) names and their order:")
+        # Print DoF names in order (RetLens: these three headings only when verbose, like the tables)
+        if verbose:
+            print("[GMR] Robot Degrees of Freedom (DoF) names and their order:")
         self.robot_dof_names = {}
         for i in range(self.model.nv):  # 'nv' is the number of DoFs
             dof_name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_JOINT, self.model.dof_jntid[i])
@@ -47,7 +49,8 @@ class GeneralMotionRetargeting:
                 print(f"DoF {i}: {dof_name}")
             
             
-        print("[GMR] Robot Body names and their IDs:")
+        if verbose:
+            print("[GMR] Robot Body names and their IDs:")
         self.robot_body_names = {}
         for i in range(self.model.nbody):  # 'nbody' is the number of bodies
             body_name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_BODY, i)
@@ -55,7 +58,8 @@ class GeneralMotionRetargeting:
             if verbose:
                 print(f"Body ID {i}: {body_name}")
         
-        print("[GMR] Robot Motor (Actuator) names and their IDs:")
+        if verbose:
+            print("[GMR] Robot Motor (Actuator) names and their IDs:")
         self.robot_motor_names = {}
         for i in range(self.model.nu):  # 'nu' is the number of actuators (motors)
             motor_name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_ACTUATOR, i)
