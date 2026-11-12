@@ -480,12 +480,15 @@ def _edited(lab: MotionLabels | None, segs: list[Segment]) -> MotionLabels:
                         found=lab.found, edited=True)
 
 
-def _like(lab: MotionLabels | None, label: str, track: str) -> tuple[str, tuple | None]:
-    """(name, color) of a segment that already has this label (its track's first), so a label looks the same."""
+def _like(lab: MotionLabels | None, label: str, track: str, default=None) -> tuple[str, tuple | None]:
+    """(name, color) of a segment that already has this label (its track's first), so a label looks the same;
+    none: default ((name, color) the label definition gives, retlens.autolabel.rules.defined_labels)."""
     segs = lab.segments if lab is not None else []
     s = next((s for s in segs if s.label == label and s.track == track), None) or \
         next((s for s in segs if s.label == label), None)
-    return (s.name, s.color) if s is not None else ("", None)
+    if s is not None:
+        return s.name, s.color
+    return tuple(default) if default is not None else ("", None)
 
 
 def with_bounds(lab: MotionLabels, seg: Segment, start: float, end: float, fps: float, duration: float,
@@ -523,14 +526,15 @@ def with_bounds(lab: MotionLabels, seg: Segment, start: float, end: float, fps: 
     return _edited(lab, segs), new
 
 
-def relabeled(lab: MotionLabels, seg: Segment, label: str) -> tuple[MotionLabels, Segment]:
-    """seg with another label (its name and colour follow a segment that already has that label)."""
+def relabeled(lab: MotionLabels, seg: Segment, label: str, default=None) -> tuple[MotionLabels, Segment]:
+    """seg with another label (its name and colour follow a segment that already has that label, else default:
+    the (name, color) its label definition gives)."""
     label = str(label).strip()
     if not label:
         raise ValueError("라벨 이름이 비었습니다")
     if label == seg.label:
         return lab, seg
-    name, color = _like(lab, label, seg.track)
+    name, color = _like(lab, label, seg.track, default)
     new = replace(seg, label=label, name=name, color=color)
     segs = list(lab.segments)
     segs[index_of(lab, seg)] = new
@@ -570,9 +574,10 @@ def merged(lab: MotionLabels, seg: Segment, direction: int) -> tuple[MotionLabel
 
 
 def added(lab: MotionLabels | None, track: str, t: float, fps: float, duration: float,
-          label: str = NEW_LABEL) -> tuple[MotionLabels, Segment]:
+          label: str = NEW_LABEL, default=None) -> tuple[MotionLabels, Segment]:
     """A new segment filling the unlabelled gap under motion time t on a track (a new track: the whole motion).
-    Labels that could not be read start again from this segment (the file they came from is kept)."""
+    Labels that could not be read start again from this segment (the file they came from is kept). Its name and
+    colour follow a segment that already has the label, else default (the label definition's (name, color))."""
     label = str(label).strip()
     if not label:
         raise ValueError("라벨 이름이 비었습니다")
@@ -586,7 +591,7 @@ def added(lab: MotionLabels | None, track: str, t: float, fps: float, duration: 
     hi = min((s.start for s in segs_on if s.start > t), default=max(duration, lo))
     if hi - lo < 0.5 / max(fps, 1.0):
         raise ValueError("빈칸이 한 프레임보다 짧습니다")
-    name, color = _like(usable, label, track)
+    name, color = _like(usable, label, track, default)
     new = Segment(label=label, start=lo, end=hi, track=track, name=name, color=color)
     segs = list(usable.segments) if usable is not None else []
     at = max((i + 1 for i, s in enumerate(segs) if s.track == track and s.start <= lo), default=None)

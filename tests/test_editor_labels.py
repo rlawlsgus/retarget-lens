@@ -374,3 +374,53 @@ def test_dragging_the_picked_segments_edge():
     QTest.mouseRelease(tracks, Qt.LeftButton, Qt.NoModifier, edge + QPoint(30, 0))
     assert len(edits) == 1  # cancelled
 
+
+
+def test_the_label_pick_dialog_offers_the_definitions():
+    """라벨 바꾸기 / 구간 추가: every label offered, the current one picked, and under the list what the label
+    definition says of the label shown (or that it is not defined); a typed new label is taken as it is."""
+    class Sc:
+        def label_names(self, track, item=None):
+            return ["집기", "놓기", "쓰기"]
+
+        def label_definitions(self, item=None):
+            return ({"작업": [{"label": "집기", "name": "물건 집기", "color": None},
+                             {"label": "놓기", "name": "", "color": None}]}, ["C:/x/defs.yaml"])
+
+    d = editor.LabelPickDialog(None, "라벨 바꾸기", "새 라벨:", Sc(), "작업", "쓰기")
+    assert [d.box.itemText(i) for i in range(d.box.count())] == ["집기", "놓기", "쓰기"]
+    assert d.box.currentText() == "쓰기" and "없는 라벨" in d.hint.text()
+    d.box.setCurrentIndex(0)
+    assert "작업 트랙 · 물건 집기" in d.hint.text() and d.label() == "집기"
+    d.box.setEditText("  새 이름 ")
+    assert d.label() == "새 이름"
+    d.box.setEditText("")
+    assert d.label() is None and "비었습니다" in d.hint.text()
+    d.deleteLater()
+
+
+def test_enter_in_the_label_pick_list():
+    """Enter in the filtered list with no row picked: the one label holding the text goes into the box; a label typed
+    in full is taken at once. (ASCII labels: QTest cannot type Hangul on the offscreen platform.)"""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    class Sc:
+        def label_names(self, track, item=None):
+            return ["pick", "place", "write"]
+
+        def label_definitions(self, item=None):
+            return ({"work": [{"label": n, "name": "", "color": None} for n in ("pick", "place", "write")]}, ["d.yaml"])
+
+    d = editor.LabelPickDialog(None, "rename", "new label:", Sc(), "work", "pick")
+    d.show()
+    pop = d.box.completer().popup()
+    d.box.setEditText("")
+    QTest.keyClicks(d.box.lineEdit(), "pla")
+    QTest.keyClick(pop, Qt.Key_Return)
+    assert d.box.currentText() == "place" and d.result() == 0  # put in the box, not taken yet
+    d.box.setEditText("")
+    QTest.keyClicks(d.box.lineEdit(), "WRITE")
+    QTest.keyClick(pop, Qt.Key_Return)
+    assert d.result() == 1 and d.label() == "write"  # typed in full (any case): taken
+    d.deleteLater()

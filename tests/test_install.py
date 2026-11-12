@@ -448,6 +448,60 @@ def test_update_dialog_and_status_button(tmp_path, monkeypatch):
     app.processEvents()
 
 
+def test_the_automatic_check_asks_github_at_most_once_a_day(tmp_path, monkeypatch):
+    """At start-up only, at most once in CHECK_EVERY_S even when a newer version is known (its button shows from what
+    was stored), never while GitHub's request limit lasts; a stored newer version this program has reached is
+    forgotten. 업데이트 확인 (manual) is not held back."""
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    QtCore = pytest.importorskip("PySide6.QtCore")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    from retlens.app import update_ui
+
+    store = QtCore.QSettings(str(tmp_path / "retlens.ini"), QtCore.QSettings.IniFormat)
+    monkeypatch.setattr(update_ui, "_settings_store", lambda: store)
+    monkeypatch.setattr(install, "running_version", lambda: "1.0.0")
+    asked = []
+    monkeypatch.setattr(install, "check_latest", lambda **kw: asked.append(1) or install.Check(current="1.0.0"))
+
+    class Win(QtWidgets.QWidget):
+        def __init__(self):
+            super().__init__()
+            self.scene = type("S", (), {"log": lambda s, m: None, "items": []})()
+
+        def status(self, text, ms=0):
+            pass
+
+    ctl = update_ui.UpdateController(Win())
+    started = []
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(update_ui, "threading", SimpleNamespace(  # only this module's threads
+        Thread=lambda target, **kw: SimpleNamespace(start=lambda: started.append(target))))
+    store.setValue("update/last_check", time.time() - 60)
+    store.setValue("update/newer", "2.0.0")
+    ctl._auto_check()
+    assert not started and ctl.button.text() == "업데이트 2.0.0" and not ctl.button.isHidden()  # known: no request
+    store.setValue("update/newer", "1.0.0")  # updated to it since
+    ctl._auto_check()
+    assert not started and store.value("update/newer") == ""
+    store.setValue("update/last_check", time.time() - install.CHECK_EVERY_S - 1)
+    store.setValue("update/retry_at", time.time() + 600)  # GitHub's limit
+    ctl._auto_check()
+    assert not started
+    store.setValue("update/retry_at", 0)
+    ctl._auto_check()
+    assert len(started) == 1
+    limited = install.Check(current="1.0.0", error="한도", retry_at=time.time() + 900)
+    monkeypatch.setattr(install, "check_latest", lambda **kw: limited)
+    ctl.check(force=True)  # a manual check that hit the limit holds the automatic one back
+    assert float(store.value("update/retry_at")) == pytest.approx(limited.retry_at)
+    rel = install.Release(version="3.0.0", tag="v3.0.0", name="RetLens 3.0.0", notes="", sha256=SHA, size=1)
+    monkeypatch.setattr(install, "check_latest", lambda **kw: install.Check(current="1.0.0", latest=rel, newer=True))
+    ctl.check(force=True)  # 업데이트 확인 found it: the next start shows its button without asking again
+    assert store.value("update/newer") == "3.0.0"
+
+
 # ------------------------------------------------------------------ after the review
 @needs_windows
 def test_own_children_are_not_other_retlens():

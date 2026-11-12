@@ -405,7 +405,8 @@ class ApiBackend:
                 result = motion_labels.with_bounds(base, seg, float(q.get("start_s", seg.start)),
                                                    float(q.get("end_s", seg.end)), fps, dur)
             elif op == "rename":
-                result = motion_labels.relabeled(base, seg, str(q.get("label", "")))
+                name = str(q.get("label", ""))
+                result = motion_labels.relabeled(base, seg, name, sc.label_definition(name.strip(), seg.track, item))
             elif op == "split":
                 result = motion_labels.split(base, seg, float(q["time_s"]), fps)
             elif op == "delete":
@@ -413,8 +414,9 @@ class ApiBackend:
             elif op == "merge":
                 result = motion_labels.merged(base, seg, -1 if q.get("with") == "prev" else 1)
             elif op == "add":
-                result = motion_labels.added(base, str(q.get("track") or ""), float(q["time_s"]), fps, dur,
-                                             str(q.get("label") or motion_labels.NEW_LABEL))
+                track, name = str(q.get("track") or ""), str(q.get("label") or motion_labels.NEW_LABEL)
+                result = motion_labels.added(base, track, float(q["time_s"]), fps, dur, name,
+                                             sc.label_definition(name.strip(), track, item))
             else:
                 raise ApiError("'edit' must be bounds, rename, split, delete, merge, add, undo or redo", 400)
         except (KeyError, TypeError) as e:

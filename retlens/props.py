@@ -51,6 +51,7 @@ import functools
 import json
 import os
 import re
+import time
 
 import numpy as np
 
@@ -80,13 +81,21 @@ def _listing(folder: str, stamp: int) -> tuple[tuple[str, bool], ...]:
         return ()
 
 
+RECENT_NS = 2_000_000_000  # a folder changed this recently is listed again every time (_entries)
+
+
 def _entries(folder: str) -> tuple[tuple[str, bool], ...]:
-    """(name, is a folder) of a folder's entries, read again when the folder changes."""
+    """(name, is a folder) of a folder's entries, read again when the folder changes. Windows moves file times on in
+    clock ticks (about 16 ms): a second file made in the same tick leaves the folder's time as it was, so a folder
+    changed in the last RECENT_NS is not taken from the cache."""
     try:
         stamp = os.stat(folder).st_mtime_ns
     except OSError:
         return ()
-    return _listing(os.path.normcase(os.path.abspath(folder)), stamp)
+    key = os.path.normcase(os.path.abspath(folder))
+    if time.time_ns() - stamp < RECENT_NS:
+        return _listing.__wrapped__(key, stamp)
+    return _listing(key, stamp)
 
 
 def _fbx_stems(folder: str) -> list[tuple[str, str]]:

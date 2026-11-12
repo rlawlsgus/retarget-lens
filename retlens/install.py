@@ -508,12 +508,18 @@ def _get(url: str, extra: frozenset, headers: dict | None = None, timeout: float
 
 
 def _rate_limited(status: int, headers) -> UpdateError | None:
+    """GitHub's limit for requests without a sign-in (60 an hour per network address, shared by everyone behind the
+    same address): the error carries when it resets (retry_at, epoch s; an hour from now when not said)."""
     if status in (403, 429) and headers is not None and headers.get("X-RateLimit-Remaining") == "0":
         try:
-            reset = time.strftime("%H:%M", time.localtime(int(headers.get("X-RateLimit-Reset", "0"))))
-        except ValueError:
-            reset = "잠시 뒤"
-        return UpdateError(f"GitHub 요청 한도에 걸렸습니다(같은 네트워크에서 많이 확인함). {reset} 이후에 다시 확인하세요")
+            at = float(headers.get("X-RateLimit-Reset", "0")) or time.time() + 3600
+            reset = time.strftime("%H:%M", time.localtime(at))
+        except (ValueError, OverflowError, OSError):
+            at, reset = time.time() + 3600, "잠시 뒤"
+        err = UpdateError(f"GitHub 요청 한도에 걸렸습니다(같은 네트워크 주소에서 시간당 60번, 다른 사람의 요청 포함). "
+                          f"{reset} 이후에 다시 확인하세요")
+        err.retry_at = at
+        return err
     return None
 
 
@@ -567,6 +573,7 @@ class Check:
     etag: str | None = None
     not_modified: bool = False
     error: str | None = None
+    retry_at: float | None = None  # GitHub's request limit: not before this (epoch s)
     cached: dict | None = field(default=None, repr=False)  # GitHub's answer, reused on 304
 
     def to_dict(self) -> dict:
@@ -613,7 +620,7 @@ def check_latest(etag: str | None = None, cached: dict | None = None, timeout: f
         if res.latest is not None:
             res.newer = is_newer(res.latest.version, base)
     except UpdateError as e:
-        res.error = str(e)
+        res.error, res.retry_at = str(e), getattr(e, "retry_at", None)
     except (ValueError, KeyError, TypeError) as e:
         res.error = f"GitHub의 답을 읽지 못했습니다 ({type(e).__name__})"
     return res

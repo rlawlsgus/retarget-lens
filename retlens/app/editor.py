@@ -35,7 +35,7 @@ from PySide6.QtGui import (QAction, QActionGroup, QBrush, QColor, QDesktopServic
                            QKeySequence, QPainter, QPalette, QPen, QPixmap)
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox,
                                QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QMainWindow,
@@ -689,9 +689,9 @@ class InspectorPanel(QScrollArea):
         self._labels_info = info = self._value("")
         self._labels_edited = edited = self._value("편집됨 (저장 안 함) · 라벨 CSV로 저장...으로 남깁니다")
         edited.setStyleSheet("color: rgb(230,150,60)")
-        self._show_labels_info(item, lab)
         lay.addWidget(info)
         lay.addWidget(edited)
+        self._show_labels_info(item, lab)  # after both are in the panel: shown before, they open as windows of their own
         segs = lab.segments if lab is not None else []
         rules = autolabel.rules_file()
         row = QHBoxLayout()
@@ -703,7 +703,8 @@ class InspectorPanel(QScrollArea):
         auto.setToolTip("규칙 파일대로 이 모션의 사람 동작을 보고 라벨을 붙입니다"
                         + (f"\n규칙: {rules}" if rules else "\n(규칙 파일을 먼저 고릅니다)"))
         auto.clicked.connect(lambda: self.win.auto_label(item))
-        auto.setVisible(self.win.scene.has_skeleton(item))  # a robot motion has no person to label
+        if not self.win.scene.has_skeleton(item):  # a robot motion has no person to label
+            auto.hide()  # never setVisible(True) here: a widget with no parent yet would open as a window of its own
         row.addWidget(auto)
         pick = QPushButton("규칙 파일...")
         pick.setToolTip("자동 라벨에 쓸 규칙 파일(YAML·JSON)을 고릅니다" + (f"\n지금: {rules}" if rules else ""))
@@ -2914,9 +2915,11 @@ class SegmentModel(QAbstractTableModel):
 
 
 class SegmentDelegate(QStyledItemDelegate):
-    """Editors of the segment list: a label from the ones in use (or a new one), a time on the motion's frames."""
+    """Editors of the segment list: a label from the label definition files and the ones in use (or a new one), a
+    time on the motion's frames."""
 
     def __init__(self, model: SegmentModel, names, parent=None):
+        """names(track, motion): the labels to offer (MotionScene.label_names)."""
         super().__init__(parent)
         self.model, self.names = model, names
 
@@ -2924,7 +2927,9 @@ class SegmentDelegate(QStyledItemDelegate):
         if index.column() - self.model.multi == 0:
             box = QComboBox(parent)
             box.setEditable(True)
-            box.addItems(self.names(self.model.segs[index.row()].track))
+            box.setInsertPolicy(QComboBox.NoInsert)
+            box.setMaxVisibleItems(25)
+            box.addItems(self.names(self.model.segs[index.row()].track, self.model.it))
             return box
         spin = QDoubleSpinBox(parent)
         spin.setDecimals(3)
@@ -2941,6 +2946,116 @@ class SegmentDelegate(QStyledItemDelegate):
 
     def setModelData(self, editor, model, index):
         model.setData(index, editor.currentText() if isinstance(editor, QComboBox) else editor.value(), Qt.EditRole)
+
+
+class _PickEnter(QObject):
+    """Enter in LabelPickDialog's filtered list with no row picked: a label typed in full (any case) is taken at once;
+    the one label holding the text goes into the box; else the list only closes (Enter again takes the text as
+    typed). A child of the list, so it goes with it."""
+
+    def __init__(self, box: QComboBox, names: list[str], accept, parent: QObject):
+        super().__init__(parent)
+        self.box, self.names, self.take = box, names, accept
+
+    def eventFilter(self, obj, e):
+        if e.type() != QEvent.KeyPress or e.key() not in (Qt.Key_Return, Qt.Key_Enter) \
+                or not isinstance(obj, QAbstractItemView) or obj.currentIndex().isValid():
+            return False
+        t = self.box.lineEdit().text().strip()
+        same = next((n for n in self.names if n.lower() == t.lower()), None)
+        model = obj.model()
+        only = model.index(0, 0).data() if model is not None and model.rowCount() == 1 else None
+        obj.hide()
+        if same is not None:
+            self.box.setEditText(same)
+            self.take()
+        elif only:
+            self.box.setEditText(only)
+        return True
+
+
+class LabelPickDialog(QDialog):
+    """A label for a segment (라벨 바꾸기, 구간 추가): every label the label definition files give (the 자동 라벨 rule
+    file of the motion's labels and the 자동 라벨 규칙 setting; the segment's track first), then the ones in use. A
+    new label may be typed; typing filters the list. The line under it says what the definition gives the label
+    shown, or that it is not defined."""
+
+    def __init__(self, parent, title: str, text: str, scene, track: str, current: str = "", item=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(380)
+        names = scene.label_names(track, item)
+        defined, files = scene.label_definitions(item)
+        self.defined = {}  # label -> (track, long name): the first definition, the segment's track before others
+        for lane in sorted(defined, key=lambda lane: lane != track):
+            for d in defined[lane]:
+                self.defined.setdefault(d["label"], (lane, d.get("name") or ""))
+        self.files = files
+        lab = item.labels if item is not None else None
+        try:
+            self.rules_set = bool(autolabel.rules_file()) or bool(lab is not None and lab.auto and lab.path)
+        except Exception:  # noqa: BLE001 - a settings file that cannot be read: no setting
+            self.rules_set = False
+        if current and current not in names:
+            names.insert(0, current)
+        names = names or [motion_labels.NEW_LABEL]
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(text))
+        self.box = QComboBox()
+        self.box.setEditable(True)
+        self.box.setInsertPolicy(QComboBox.NoInsert)
+        self.box.setMaxVisibleItems(25)
+        for i, n in enumerate(names):
+            self.box.addItem(n)
+            if n in self.defined:
+                lane, long = self.defined[n]
+                self.box.setItemData(i, f"{lane or '이름 없는'} 트랙" + (f" · {long}" if long else ""), Qt.ToolTipRole)
+        done = QCompleter(names, self.box)  # typing shows the labels holding the text, wherever it is in them
+        done.setFilterMode(Qt.MatchContains)
+        done.setCaseSensitivity(Qt.CaseInsensitive)
+        done.setCompletionMode(QCompleter.PopupCompletion)
+        self.box.setCompleter(done)
+        self.names = names
+        pop = done.popup()
+        pop.installEventFilter(_PickEnter(self.box, names, self.accept, pop))  # Enter in the filtered list
+        self.box.setCurrentIndex(names.index(current) if current in names else 0)
+        lay.addWidget(self.box)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color: gray")
+        lay.addWidget(self.hint)
+        if files:
+            n_def = len(self.defined)
+            src = QLabel(f"라벨 정의 {n_def}개: " + ", ".join(os.path.basename(f) for f in files))
+            src.setToolTip("\n".join(files) + "\n(자동 라벨 규칙 파일: 인스펙터 > 라벨 > 규칙 파일...)")
+            src.setStyleSheet("color: gray")
+            lay.addWidget(src)
+        self.box.currentTextChanged.connect(self._show)
+        self._show(self.box.currentText())
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _show(self, text: str) -> None:
+        t = text.strip()
+        if t in self.defined:
+            lane, long = self.defined[t]
+            self.hint.setText(f"라벨 정의: {lane or '이름 없는'} 트랙" + (f" · {long}" if long else ""))
+        elif not t:
+            self.hint.setText("라벨 이름이 비었습니다")
+        elif self.files:
+            self.hint.setText("라벨 정의 파일에 없는 라벨입니다 (이 이름으로 새로 붙임)")
+        elif self.rules_set:
+            self.hint.setText("라벨 정의 파일(자동 라벨 규칙)을 찾거나 읽지 못해 열린 모션의 라벨만 보입니다. "
+                              "자동 라벨을 눌러 보면 이유가 나옵니다")
+        else:
+            self.hint.setText("라벨 정의 파일(자동 라벨 규칙)이 정해지지 않아 열린 모션의 라벨만 보입니다. "
+                              "인스펙터 > 라벨 > 규칙 파일...에서 고릅니다")
+
+    def label(self) -> str | None:
+        t = self.box.currentText().strip()
+        return t or None
 
 
 def segment_text(it: Item, s: motion_labels.Segment) -> str:
@@ -4184,13 +4299,11 @@ class EditorWindow(QMainWindow):
         if result is not None:
             self.edit_labels(it, lab, result, what, before=seg)
 
-    def _ask_label(self, title: str, text: str, track: str, current: str = "") -> str | None:
-        names = self.scene.label_names(track)
-        if current and current not in names:
-            names.insert(0, current)
-        label, ok = QInputDialog.getItem(self, title, text, names or [motion_labels.NEW_LABEL],
-                                         names.index(current) if current in names else 0, True)
-        return label.strip() if ok and label.strip() else None
+    def _ask_label(self, title: str, text: str, track: str, current: str = "", item: Item | None = None) -> str | None:
+        """A label to give: the label definition files' labels (자동 라벨 규칙 파일, the track's first) and the ones
+        in use, or a new one typed. Under the list: what the definition says of the label shown."""
+        d = LabelPickDialog(self, title, text, self.scene, track, current, item)
+        return d.label() if d.exec() == QDialog.Accepted else None
 
     def label_rename(self) -> None:
         sel = self.label_selection()
@@ -4198,9 +4311,10 @@ class EditorWindow(QMainWindow):
             self._edit_picked("라벨 바꾸기", None)
             return
         label = self._ask_label("라벨 바꾸기", f"{sel[2].label} ({sel[2].start:.2f}–{sel[2].end:.2f} s)의 새 라벨:",
-                                sel[2].track, sel[2].label)
+                                sel[2].track, sel[2].label, sel[0])
         if label is not None:
-            self._edit_picked("라벨 바꾸기", lambda it, lab, seg: motion_labels.relabeled(lab, seg, label))
+            self._edit_picked("라벨 바꾸기", lambda it, lab, seg: motion_labels.relabeled(
+                lab, seg, label, self.scene.label_definition(label, seg.track, it)))
 
     def label_split(self) -> None:
         self._edit_picked("구간 나누기", lambda it, lab, seg: motion_labels.split(lab, seg, self.scene.t - it.offset,
@@ -4229,7 +4343,8 @@ class EditorWindow(QMainWindow):
             return
         try:
             if field == "label":
-                result = motion_labels.relabeled(base, seg, str(value))
+                result = motion_labels.relabeled(base, seg, str(value),
+                                                 self.scene.label_definition(str(value).strip(), seg.track, item))
             else:
                 start, end = (float(value), seg.end) if field == "start" else (seg.start, float(value))
                 result = motion_labels.with_bounds(base, seg, start, end, item.robot.fps, item.robot.duration)
@@ -4241,11 +4356,12 @@ class EditorWindow(QMainWindow):
     def label_add(self, item: Item, track: str, t: float) -> None:
         """A segment in the unlabelled gap under motion time t on a track; its label is asked first."""
         base = item.labels
-        label = self._ask_label("구간 추가", f"{track or '라벨'} 트랙, {t:.2f} s의 빈칸에 붙일 라벨:", track)
+        label = self._ask_label("구간 추가", f"{track or '라벨'} 트랙, {t:.2f} s의 빈칸에 붙일 라벨:", track, item=item)
         if label is None:
             return
         try:
-            result = motion_labels.added(base, track, t, item.robot.fps, item.robot.duration, label)
+            result = motion_labels.added(base, track, t, item.robot.fps, item.robot.duration, label,
+                                         self.scene.label_definition(label, track, item))
         except ValueError as e:
             self.status(str(e), 6000)
             return
@@ -4271,14 +4387,35 @@ class EditorWindow(QMainWindow):
         d = QDialog(self)
         d.setWindowTitle(f"새 라벨 트랙 - {item.label}")
         form = QFormLayout(d)
+        defined = self.scene.label_definitions(item)[0]
         track = QComboBox()
         track.setEditable(True)
-        track.addItems(dict.fromkeys(["", *[t for it in self.scene.items if it.labels is not None for t in it.labels.tracks]]))
-        track.setToolTip("비워 두면 이름 없는 트랙 (트랙이 하나일 때 흔함)")
+        track.addItems(dict.fromkeys(["", *defined,  # the label definition files' tracks, then the ones in use
+                                      *[t for it in self.scene.items if it.labels is not None for t in it.labels.tracks]]))
+        track.setToolTip("비워 두면 이름 없는 트랙 (트랙이 하나일 때 흔함). 라벨 정의 파일(자동 라벨 규칙)의 트랙이 먼저 나옵니다")
         form.addRow("트랙", track)
         label = QComboBox()
         label.setEditable(True)
-        label.addItems(self.scene.label_names() or [motion_labels.NEW_LABEL])
+        label.setInsertPolicy(QComboBox.NoInsert)
+        label.setMaxVisibleItems(25)
+
+        touched = [False]  # the label typed or picked by the user: kept when the track changes (else the track's first)
+        label.lineEdit().textEdited.connect(lambda _t: touched.__setitem__(0, True))
+        label.activated.connect(lambda _i: touched.__setitem__(0, True))
+
+        def fill(name: str) -> None:  # the track's defined labels first, as it is typed or picked
+            kept = label.currentText() if touched[0] else ""
+            label.blockSignals(True)
+            label.clear()
+            label.addItems(self.scene.label_names(name.strip(), item) or [motion_labels.NEW_LABEL])
+            if kept:
+                label.setEditText(kept)
+            else:
+                label.setCurrentIndex(0)
+            label.blockSignals(False)
+
+        fill(track.currentText())
+        track.currentTextChanged.connect(fill)
         form.addRow("첫 구간 라벨", label)
         t = self.scene.t - item.offset
         form.addRow(QLabel(f"재생 위치({t:.2f} s)의 빈칸을 채웁니다. 그 뒤 끝을 끌거나 나눠서 다듬습니다."))
@@ -4288,9 +4425,10 @@ class EditorWindow(QMainWindow):
         form.addRow(buttons)
         if d.exec() != QDialog.Accepted:
             return
+        name = track.currentText().strip()
         try:
-            result = motion_labels.added(lab, track.currentText().strip(), t, item.robot.fps, item.robot.duration,
-                                         label.currentText())
+            result = motion_labels.added(lab, name, t, item.robot.fps, item.robot.duration, label.currentText(),
+                                         self.scene.label_definition(label.currentText().strip(), name, item))
         except ValueError as e:
             self.status(str(e), 6000)
             return

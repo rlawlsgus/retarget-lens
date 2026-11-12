@@ -572,16 +572,33 @@ class UpdateController(QObject):
             store.setValue("update/last_check", time.time())
             if chk.etag:
                 store.setValue("update/etag", chk.etag)
+            # what was found, by the automatic check or 업데이트 확인: the next start shows its button without asking
+            store.setValue("update/newer", chk.latest.version if chk.newer and chk.latest is not None else "")
+        if chk.retry_at:  # GitHub's request limit, manual checks too: no automatic one until it resets
+            store.setValue("update/retry_at", chk.retry_at)
         self.last_check = chk
         return chk
 
     def _auto_check(self) -> None:
+        """The automatic check, at start-up only: at most once in CHECK_EVERY_S (a newer version found before shows
+        its button without asking GitHub again) and not while GitHub's request limit lasts. 업데이트 확인 asks any
+        time."""
         store = _settings_store()
-        try:
-            last = float(store.value("update/last_check", 0) or 0)
-        except (TypeError, ValueError):
-            last = 0.0
-        if time.time() - last < install.CHECK_EVERY_S and not store.value("update/newer", ""):
+
+        def num(key: str) -> float:
+            try:
+                return float(store.value(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        newer = str(store.value("update/newer", "") or "")
+        if newer and not install.is_newer(newer, install.running_version()):  # updated to it (or past it) since
+            store.setValue("update/newer", "")
+            newer = ""
+        if newer and store.value("update/skip", "") != newer:
+            self._show_button(newer)
+        now = time.time()
+        if now - num("update/last_check") < install.CHECK_EVERY_S or now < num("update/retry_at"):
             return
 
         def work():
@@ -601,13 +618,16 @@ class UpdateController(QObject):
             store.setValue("update/newer", chk.latest.version)
             if store.value("update/skip", "") == chk.latest.version:
                 return
-            self.button.setText(f"업데이트 {chk.latest.version}")
-            self.button.setToolTip(f"새 버전 RetLens {chk.latest.version}이 있습니다. 눌러서 보기")
-            self.button.show()
+            self._show_button(chk.latest.version)
             self.win.status(f"새 버전 RetLens {chk.latest.version}이 있습니다 (도움말 > 업데이트 확인)", 15000)
         else:
             store.setValue("update/newer", "")
             self.button.hide()
+
+    def _show_button(self, version: str) -> None:
+        self.button.setText(f"업데이트 {version}")
+        self.button.setToolTip(f"새 버전 RetLens {version}이 있습니다. 눌러서 보기")
+        self.button.show()
 
     def open_dialog(self, force: bool = True) -> None:
         """도움말 > 업데이트 확인 (force: ask GitHub again; cheap with the ETag), the status-bar button (what is known)."""

@@ -35,6 +35,14 @@ def scene(tmp_path_factory):
     server.stop()
 
 
+@pytest.fixture(autouse=True)
+def _no_label_rules(monkeypatch):
+    """No 자동 라벨 규칙 setting of the user's (its labels could differ, and a failed assert would print them)."""
+    from retlens import autolabel
+
+    monkeypatch.setattr(autolabel, "rules_file", lambda: "")
+
+
 def test_add_play_measure_remove(scene):
     events = []
     scene.listen(lambda e, p: events.append(e))
@@ -617,3 +625,59 @@ def test_fall_causes_shown(scene):
     assert "(지지면 이탈 20, 앞 20회)" in scene.result_text(isaac)
     assert scene.fall_details(isaac)[22]["why_none"] == "원인 분석은 앞 20회만"
 
+
+
+def test_label_choices_come_from_the_label_definition_files(scene, tmp_path, monkeypatch):
+    """라벨 바꾸기 / 구간 추가 offer every label the label definition files (자동 라벨 rule files) give: the
+    segment's track first, then the labels in use; read again when the file changes, left out when it is broken.
+    The rule file a motion's automatic labels came from counts without the setting."""
+    from retlens import autolabel
+    from retlens.app import api_core
+    from retlens.synthetic import walking_bvh_text
+
+    rules = tmp_path / "defs.yaml"
+    rules.write_text("name: 정의\ntracks:\n  - track: 작업\n    rules:\n"
+                     "      - {label: 집기, name: 물건 집기, color: '#112233', when: {손: 뻗기}}\n"
+                     "      - {label: 놓기, when: {손: 작업}}\n      - {label: 서기}\n"
+                     "  - {track: 이동, axis: 이동, skip: [정지]}\n", encoding="utf-8")
+    monkeypatch.setattr(autolabel, "rules_file", lambda: "")
+    a = scene.add(SAMPLE)
+    human = None
+    try:
+        hand = tmp_path / "a.labels.csv"
+        hand.write_text("label,start_s,end_s,track\n쓰기,0,0.5,작업\n쓰기,0.5,1,작업\n다른,0,1,기타\n", encoding="utf-8")
+        scene.set_labels(a, str(hand))
+        assert scene.label_names("작업", a) == ["쓰기", "다른"]  # no definition file: the labels in use
+        assert scene.label_definitions(a) == ({}, []) and "label_definitions" not in api_core.item_info(scene, a)
+        monkeypatch.setattr(autolabel, "rules_file", lambda: str(rules))
+        names = scene.label_names("작업", a)
+        assert names[:4] == ["집기", "놓기", "서기", "쓰기"]  # the track's definitions first, then the ones in use
+        assert names.index("발 옮기기") < names.index("다른") and "정지" not in names
+        defined, files = scene.label_definitions(a)
+        assert files == [str(rules)] and list(defined) == ["작업", "이동"]
+        assert scene.label_definition("집기", "작업", a) == ("물건 집기", (0x11, 0x22, 0x33))
+        assert scene.label_definition("없음", "작업", a) is None
+        info = api_core.item_info(scene, a)["label_definitions"]
+        assert info["files"] == [str(rules)] and info["tracks"]["작업"] == ["집기", "놓기", "서기"]
+        st = rules.stat()
+        rules.write_text("name: 정의\nrules:\n  - {label: 새것}\n", encoding="utf-8")  # changed: read again
+        os.utime(rules, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+        assert scene.label_names("", a)[0] == "새것"
+        st = rules.stat()
+        rules.write_text("rules: [broken\n", encoding="utf-8")
+        os.utime(rules, ns=(st.st_atime_ns, st.st_mtime_ns + 10 ** 9))
+        assert scene.label_definitions(a) == ({}, []) and scene.label_names("작업", a) == ["쓰기", "다른"]
+        # automatic labels: their own rule file, with no setting
+        monkeypatch.setattr(autolabel, "rules_file", lambda: "")
+        bvh = tmp_path / "walk.bvh"
+        bvh.write_text(walking_bvh_text(seconds=2.0))
+        own = tmp_path / "own.yaml"
+        own.write_text("name: 자기\nrules:\n  - {label: 걷기2, when: {이동: 걷기}}\n  - {label: 그밖}\n", encoding="utf-8")
+        human = scene.add(str(bvh))
+        assert not scene.auto_label(human, str(own)).error
+        assert scene.label_definitions(human)[1] == [str(own)]
+        assert scene.label_names("", human)[:2] == ["걷기2", "그밖"]
+    finally:
+        scene.remove(a)
+        if human is not None:
+            scene.remove(human)

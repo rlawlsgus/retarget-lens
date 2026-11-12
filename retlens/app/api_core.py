@@ -170,6 +170,11 @@ def item_info(scene: MotionScene, item: Item, metrics: bool = True) -> dict:
     if out["labels"] is not None and hasattr(scene, "label_undo_text"):  # label editing (the window's undo history)
         undo, redo = scene.label_undo_text(item)
         out["labels"].update(unsaved_edits=labels.edited, undo=undo, redo=redo)
+    if metrics and hasattr(scene, "label_definitions"):  # labels to pick from when editing: the 자동 라벨 rule files'
+        defined, files = scene.label_definitions(item)
+        if defined:
+            out["label_definitions"] = {"files": files, "tracks": {lane: [d["label"] for d in ds]
+                                                                    for lane, ds in defined.items()}}
     # where the problems are (retlens.problems; falls under "fall"), in motion time: {kind: [[start_s, end_s], ...]}
     out["problems"] = {k: [list(s) for s in sp] for k, sp in scene.problems(item).items()}
     if metrics:

@@ -264,6 +264,30 @@ def _approach(a, labels, where) -> dict:
     return out
 
 
+def defined_labels(rules: dict) -> dict[str, list[dict]]:
+    """Every label the rules can give, per lane, in the file's order: {lane: [{label, name, color}]}. A rule lane's
+    are its rules' labels and its approach label; an axis lane's are its track's values but the skipped ones (a 자세
+    lane's: the postures, then the 'A→B' changes between them). name and color as apply gives them (the first any
+    rule of that label gives, in any lane)."""
+    meta = {}
+    for t in rules["tracks"]:
+        for r in t.get("rules", []):
+            m_ = meta.setdefault(r["label"], {"name": "", "color": None})
+            m_["name"] = m_["name"] or r["name"]
+            m_["color"] = m_["color"] or r["color"]
+    out = {}
+    for t in rules["tracks"]:
+        if "axis" in t:
+            vals = [str(v) for v in segment.VALUES[t["axis"]]]
+            if t["axis"] == "자세":  # the track also holds the changes between postures (the pairs _values takes)
+                vals += [f"{a}→{b}" for a in segment.POSTURE_RANK for b in segment.POSTURE_RANK if a != b]
+            names = [v for v in vals if v not in t["skip"]]
+        else:
+            names = [r["label"] for r in t["rules"]] + ([t["approach"]["label"]] if t.get("approach") else [])
+        out[t["track"]] = [{"label": n, **meta.get(n, {"name": "", "color": None})} for n in dict.fromkeys(names)]
+    return out
+
+
 # ---------------------------------------------------------------- applying
 def _holds(cond: list[dict], tr: dict, T: int) -> np.ndarray:
     if not cond:

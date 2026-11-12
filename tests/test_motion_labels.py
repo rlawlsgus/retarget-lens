@@ -377,3 +377,18 @@ def test_saving_never_takes_another_motions_table(tmp_path):
     same, s = ml.with_bounds(lab, seg, 1.0002, 2.0, FPS, DUR)  # given back rounded: not an edit
     assert same is lab and s is seg
 
+
+
+def test_a_new_label_takes_its_definitions_look():
+    """A label no segment of the motion has yet takes the name and colour its definition gives; one the motion
+    already has keeps the motion's look."""
+    lab = ml.MotionLabels(path="", segments=[ml.Segment("a", 0.0, 1.0, track="t", name="에이", color=(1, 2, 3)),
+                                             ml.Segment("b", 1.0, 2.0, track="t")])
+    _, seg = ml.relabeled(lab, lab.segments[1], "c", ("씨", (9, 9, 9)))
+    assert (seg.label, seg.name, seg.color) == ("c", "씨", (9, 9, 9))
+    _, seg = ml.relabeled(lab, lab.segments[1], "a", ("다른", (0, 0, 0)))
+    assert (seg.name, seg.color) == ("에이", (1, 2, 3))
+    _, seg = ml.relabeled(lab, lab.segments[1], "d")
+    assert (seg.name, seg.color) == ("", None)
+    _, seg = ml.added(None, "t", 0.5, FPS, DUR, "c", ("씨", (9, 9, 9)))
+    assert (seg.name, seg.color) == ("씨", (9, 9, 9))

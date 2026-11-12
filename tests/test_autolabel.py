@@ -660,3 +660,27 @@ def test_min_seg_keeps_unlabelled_frames_and_within_zero_and_shared_colors():
                                  {"track": "c", "rules": [{"label": "걷기", "when": {"이동": "걷기"}}]}]})
     colors = {lane: m.get("color") for lane, lab, s, e, m in rules.apply(rs, _tracks(이동=loco), []) if lab == "걷기"}
     assert colors == {"a": "#ff0000", "b": "#ff0000", "c": "#ff0000"}
+
+
+def test_defined_labels_per_track_in_the_files_order():
+    """The labels a rule file can give (the pick list of 라벨 바꾸기): a rule track's rule labels once each and its
+    approach label, an axis track's values but the skipped ones; the name and colour a rule gives a label."""
+    rs = rules.check({"name": "x", "tracks": [
+        {"track": "작업", "rules": [
+            {"label": "걷기", "name": "걸어가기", "when": {"이동": "걷기"}},
+            {"label": "집기", "color": "#ff0000", "when": {"손": "뻗기"}},
+            {"label": "걷기", "when": {"이동": "달리기"}},
+            {"label": "서기"}],
+         "approach": {"from": ["걷기"], "to": ["집기"], "label": "다가가기"}},
+        {"track": "이동", "axis": "이동", "skip": ["정지"]}]})
+    d = rules.defined_labels(rs)
+    assert list(d) == ["작업", "이동"]
+    assert [x["label"] for x in d["작업"]] == ["걷기", "집기", "서기", "다가가기"]
+    assert d["작업"][0]["name"] == "걸어가기" and d["작업"][1]["color"] == "#ff0000" and d["작업"][2]["name"] == ""
+    moving = [x["label"] for x in d["이동"]]
+    assert "정지" not in moving and moving == [v for v in segment.VALUES["이동"] if v != "정지"]
+    assert next(x for x in d["이동"] if x["label"] == "걷기")["name"] == "걸어가기"  # named by a rule elsewhere
+    posture = [x["label"] for x in rules.defined_labels(rules.check(
+        {"tracks": [{"track": "자세", "axis": "자세", "skip": ["선 자세→앉음"]}]}))["자세"]]
+    assert posture[:len(segment.POSTURE_RANK)] == list(segment.POSTURE_RANK)  # the postures, then the changes
+    assert "선 자세→쪼그림" in posture and "선 자세→앉음" not in posture and all("→" in x for x in posture[8:])

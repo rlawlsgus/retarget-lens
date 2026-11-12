@@ -396,6 +396,9 @@ class MotionScene:
         self.playlist: dict | None = None  # 라벨 구간 이어 재생 (play_segments)
         # label edits per motion: {"undo": [(labels, segment before, segment after, what)], "redo": [...]}
         self.label_history: dict[Item, dict] = {}
+        # label definition (자동 라벨 rule) files read for the label pick lists: {path: ((mtime, size), labels)}; one
+        # entry per file, replaced whole (the window and the API threads read it: no step iterates or deletes)
+        self._rule_label_cache: dict[str, tuple] = {}
         self._version = 0  # bumped by every event; with the time and settings it decides redraws
         self._drawn_key, self._drawn_at = None, 0.0
         self._listeners: list[Callable[[str, object], None]] = []
@@ -735,8 +738,10 @@ class MotionScene:
         self._labels_changed(item)
         return item.labels
 
-    def label_names(self, track: str | None = None) -> list[str]:
-        """Labels on the open motions, for picking one: the track's own first, the most used first."""
+    def label_names(self, track: str | None = None, item: Item | None = None) -> list[str]:
+        """Labels to pick from: the label definition files' labels of this track (label_definitions, the file's
+        order), the open motions' labels on this track (the most used first), the definitions' other tracks, then
+        the open motions' other labels. track None: all tracks alike."""
         from collections import Counter
 
         on_track, others = Counter(), Counter()
@@ -744,8 +749,72 @@ class MotionScene:
             lab = it.labels
             for s in (lab.segments if lab is not None else []):
                 (on_track if track is not None and s.track == track else others)[s.label] += 1
-        names = [n for n, _ in on_track.most_common()]
-        return names + [n for n, _ in others.most_common() if n not in on_track]
+        defined = self.label_definitions(item)[0]
+        own = [d["label"] for d in defined.get(track, [])] if track is not None else []
+        rest = [d["label"] for lane, ds in defined.items() if track is None or lane != track for d in ds]
+        return list(dict.fromkeys(own + [n for n, _ in on_track.most_common()] + rest
+                                  + [n for n, _ in others.most_common()]))
+
+    def label_definitions(self, item: Item | None = None) -> tuple[dict[str, list[dict]], list[str]]:
+        """The labels the label definition files give, per track in the files' order ({track: [{label, name,
+        color}]}, retlens.autolabel.rules.defined_labels), and those files. The files are the rule file this
+        motion's automatic labels came from, then the 자동 라벨 규칙 setting (or $RETLENS_LABEL_RULES); one that is
+        missing or cannot be read is left out (자동 라벨 says why). Read again only when a file changes."""
+        from .. import autolabel
+
+        lab = item.labels if item is not None else None
+        files = [lab.path] if lab is not None and lab.auto and lab.path else []
+        try:
+            files.append(autolabel.rules_file())
+        except Exception:  # noqa: BLE001 - a settings file that cannot be read: no setting
+            pass
+        out, used, seen = {}, [], set()
+        for f in files:
+            key = os.path.normcase(os.path.abspath(f)) if f else ""
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            got = self._rule_labels(f)
+            if got is None:
+                continue
+            used.append(f)
+            for lane, ds in got.items():
+                have = out.setdefault(lane, [])
+                known = {d["label"] for d in have}
+                have += [d for d in ds if d["label"] not in known]
+        return out, used
+
+    def _rule_labels(self, path: str) -> dict | None:
+        """retlens.autolabel.rules.defined_labels of a rule file, kept until the file changes; None: no such file or
+        it cannot be read."""
+        from ..autolabel import rules
+
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        p, stamp = os.path.normcase(os.path.abspath(path)), (st.st_mtime_ns, st.st_size)
+        cache = self.__dict__.setdefault("_rule_label_cache", {})  # (a scene made without __init__ in tests)
+        hit = cache.get(p)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        try:
+            got = rules.defined_labels(rules.load(path))
+        except (OSError, ValueError):  # rules.RuleError is a ValueError
+            got = None
+        cache[p] = (stamp, got)  # one step: this file's last version
+        return got
+
+    def label_definition(self, label: str, track: str | None = None, item: Item | None = None):
+        """(name, color) the label definition files give this label (its track's definition first), None when they
+        do not define it: what a segment newly given this label looks like (motion_labels.relabeled / added)."""
+        defined = self.label_definitions(item)[0]
+        lanes = ([defined[track]] if track in defined else []) + [ds for lane, ds in defined.items() if lane != track]
+        for ds in lanes:
+            for d in ds:
+                if d["label"] == label:
+                    return d.get("name") or "", motion_labels._color(str(d.get("color") or ""))
+        return None
 
     def _labels_changed(self, item: Item) -> None:
         self._refresh_playlist(item)
