@@ -108,6 +108,64 @@ def test_export_motion_cuts_bad_frames_and_reads_back(tmp_path):
     assert [p["name"] for p in whole["pieces"]] == ["walk"] and whole["pieces"][0]["qc"] == "WARN"  # 10 of 300 bad
 
 
+def test_save_as_leaves_out_the_cut_time(tmp_path):
+    """다른 이름으로 저장 (export_motion removed=, exact_name=): the idle end cut off, one file of the new name; a cut
+    in the middle as well, the parts as <name>_<start>-<end>s; labels moved with each part."""
+    from retlens.app import export_dialogs
+
+    m = g1_motion(seconds=6.0, fps=50.0)
+    lab = motion_labels.MotionLabels("x", [motion_labels.Segment("걷기", 0.0, 4.0), motion_labels.Segment("idle", 4.0, 6.0)])
+    res = dataset.export_motion(m, str(tmp_path), "walk_trim", labels=lab, removed=((4.0, 6.0),), exact_name=True,
+                                formats=("npz",))
+    assert [p["name"] for p in res["pieces"]] == ["walk_trim"] and res["cut_s"] == 0.0
+    back = load_robot_npz(res["pieces"][0]["files"][0])
+    assert back.num_frames == 200 and np.allclose(back.dof_pos, m.dof_pos[:200])
+    found = motion_labels.load_for(res["pieces"][0]["files"][0], 50.0, 4.0)
+    assert [(s.label, s.start, s.end) for s in found.segments] == [("걷기", 0.0, 4.0)]
+    with open(res["pieces"][0]["info"], encoding="utf-8") as f:
+        assert json.load(f)["removed_s"] == [[4.0, 6.0]]
+    out2 = tmp_path / "two"
+    kept = [(0.0, 1.0), (2.0, 4.0)]
+    res = dataset.export_motion(m, str(out2), "walk_trim", labels=lab, removed=((1.0, 2.0), (4.0, 6.0)),
+                                exact_name=True, formats=("npz",))
+    assert [p["name"] for p in res["pieces"]] == ["walk_trim_0.00-1.00s", "walk_trim_2.00-4.00s"]
+    assert len(kept) == len(res["pieces"])
+    assert sorted(export_dialogs.save_as_files(str(out2), [p["name"] for p in res["pieces"]], ("npz",), True)) == \
+        sorted(os.path.join(str(out2), n) for n in os.listdir(out2))  # the dialog knows the names before it writes
+    second = motion_labels.load_for(res["pieces"][1]["files"][0], 50.0, 2.0)
+    assert [(s.label, s.start, s.end) for s in second.segments] == [("걷기", 0.0, 2.0)]
+    whole = dataset.export_motion(m, str(tmp_path / "w"), "walk", removed=())  # no cut: as before
+    assert [p["name"] for p in whole["pieces"]] == ["walk"]
+
+
+def test_save_as_split_into_named_files(tmp_path):
+    """파일 나누기 (export_motion splits=, names=): a take of three round trips into one file per leg, each under the
+    name given, nothing left out; a split inside cut time changes nothing; the wrong number of names raises."""
+    from retlens.app import export_dialogs
+
+    m = g1_motion(seconds=6.0, fps=50.0)
+    lab = motion_labels.MotionLabels("x", [motion_labels.Segment("나르기", 0.0, 6.0)])
+    names = ["go_1", "back_1", "go_2"]
+    res = dataset.export_motion(m, str(tmp_path), "x", labels=lab, splits=(2.0, 4.0), names=names, exact_name=True,
+                                formats=("npz",))
+    assert [(p["name"], p["start_s"], p["end_s"]) for p in res["pieces"]] == \
+        [("go_1", 0.0, 2.0), ("back_1", 2.0, 4.0), ("go_2", 4.0, 6.0)]
+    back = load_robot_npz(res["pieces"][1]["files"][0])
+    assert back.num_frames == 100 and np.allclose(back.dof_pos, m.dof_pos[100:200])
+    found = motion_labels.load_for(res["pieces"][2]["files"][0], 50.0, 2.0)
+    assert [(s.label, s.start, s.end) for s in found.segments] == [("나르기", 0.0, 2.0)]
+    with open(res["pieces"][0]["info"], encoding="utf-8") as f:
+        assert json.load(f)["splits_s"] == [2.0, 4.0]
+    assert sorted(export_dialogs.save_as_files(str(tmp_path), names, ("npz",), True)) == \
+        sorted(os.path.join(str(tmp_path), n) for n in os.listdir(tmp_path))
+    both = dataset.export_motion(m, str(tmp_path / "b"), "x", removed=((5.0, 6.0),), splits=(5.5, 1.0),
+                                 names=["a", "b"], exact_name=True)  # 5.5 is cut away
+    assert [(p["start_s"], p["end_s"]) for p in both["pieces"]] == [(0.0, 1.0), (1.0, 5.0)]
+    with pytest.raises(ValueError):
+        dataset.export_motion(m, str(tmp_path / "c"), "x", splits=(3.0,), names=["only"], exact_name=True)
+    assert export_dialogs.part_names("take", 1) == ["take"] and export_dialogs.part_names("take", 3)[2] == "take_03"
+
+
 @pytest.fixture
 def capture(tmp_path, monkeypatch):
     """Two capture folders: a human BVH with labels, a robot motion, a broken file, a motion of another robot."""

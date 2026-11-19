@@ -7,6 +7,11 @@ pivots, rotation orders, units, axes, takes) is the reader here: Blender runs
 headless with blender_fbx_script.py and dumps the armature's world joint
 matrices per frame (about 2 s per clip). Dumps are cached in data/cache/fbx/.
 
+One thing the importer does differently from FBX is put right (blender_fbx_script.hold_first_keys): before a
+channel's first key FBX holds that key's value, the importer the node's static value. Key-reduced exports
+(MotionBuilder plots) otherwise start with frames of the static pose, e.g. a root turned 180 degrees for the
+first frames. meta["warnings"] says so when a Blender's importer could not be set up that way.
+
 Blender is found through RetLens's 환경 설정, then $BLENDER, then
 C:\\blender\\*\\blender.exe, then PATH (retlens.settings.find_blender).
 The ufbx Python binding was tried first and dropped: its 0.0.5 wheel crashes and returns
@@ -33,8 +38,8 @@ from .bvh import cmu_capture_fps
 
 CACHE_DIR = paths.cache_dir("fbx")  # dev: data/cache/fbx
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_fbx_script.py")  # Blender runs this file
-SCRIPT_VERSION = 3  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
-PROPS_VERSION = 3  # = blender_fbx_script.PROPS_VERSION (read_props)
+SCRIPT_VERSION = 4  # = blender_fbx_script.VERSION; bump to invalidate cached dumps
+PROPS_VERSION = 4  # = blender_fbx_script.PROPS_VERSION (read_props)
 _DUMP_LOCKS: dict[str, threading.Lock] = {}  # one Blender run per dump at a time in this process
 _DUMP_LOCKS_GUARD = threading.Lock()
 
@@ -193,6 +198,7 @@ def read_fbx(path: str, take: str | None = None, cache: bool = True) -> dict:
             "objects": _dumped_objects(d),
             "armature": str(d["armature"]) if "armature" in d else "",
             "other_bones": other,
+            "first_keys_held": bool(d["first_keys_held"]) if "first_keys_held" in d else False,
         }
 
 
@@ -206,7 +212,8 @@ def read_props(path: str, take: str | None = None, cache: bool = True) -> dict:
     with np.load(out, allow_pickle=False) as d:
         return {"fps": float(d["fps"]), "key_fps": float(d["key_fps"]), "frame_start": int(d["frame_start"]),
                 "objects": _dumped_objects(d), "take": str(d["take"]), "takes": [str(t) for t in d["takes"]],
-                "reader": f"Blender {d['blender']} FBX importer", "cache": out}
+                "reader": f"Blender {d['blender']} FBX importer", "cache": out,
+                "first_keys_held": bool(d["first_keys_held"]) if "first_keys_held" in d else False}
 
 
 def _auto_scale(rest_positions: np.ndarray) -> float:
@@ -286,6 +293,10 @@ def load_fbx(
     objects = [_object_track(o, s, dropped, ground_offset) for o in raw.get("objects", [])]
     extra, warnings = _other_armatures(raw, path, s, dropped, ground_offset, len(objects))
     objects += extra
+    if not raw.get("first_keys_held", True):  # blender_fbx_script.hold_first_keys could not patch this Blender
+        warnings = list(warnings) + [
+            "이 Blender의 FBX 임포터에는 '첫 키 값 유지'를 적용하지 못했습니다. 키를 줄여 저장한 FBX는 채널의 첫 키 앞 프레임이 "
+            "정적 값으로 읽혀 시작 몇 프레임의 방향·자세가 틀릴 수 있습니다 (Blender 4.5 LTS에서는 적용됨)"]
     meta_extra = {"warnings": warnings} if warnings else {}
     return SkeletonMotion(
         name=stem,

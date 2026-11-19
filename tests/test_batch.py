@@ -145,3 +145,41 @@ def test_dataset_table_sorts_and_filters():
     assert model.data(model.index(4, labels)) == "자동"  # where the labels came from, in the window's words
     proxy.set(qc="", text="자동")
     assert proxy.rowCount() == 1
+
+
+def test_dataset_table_qc_sorts_worst_first():
+    """A click on the QC header: FAIL, WARN, PASS (by rank, not alphabetically); the next click PASS first."""
+    pytest.importorskip("PySide6.QtWebEngineWidgets")
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QTableView
+
+    from retlens.app import editor
+
+    QApplication.instance() or QApplication([])
+    model, proxy = editor.BatchModel(), editor.BatchFilter()
+    proxy.setSourceModel(model)
+    for name, qc in (("a", "WARN"), ("b", "PASS"), ("c", "FAIL"), ("d", "PASS"), ("e", "WARN")):
+        model.add({"name": name, "folder": "s", "qc": qc})
+    view = QTableView()
+    view.setModel(proxy)
+    view.setSortingEnabled(True)
+    view.sortByColumn(-1, Qt.AscendingOrder)  # as the 데이터셋 tab starts
+    view.resize(900, 300)
+    view.show()
+    col = [k for k, _t, _f in batch.COLUMNS].index("qc")
+    head = view.horizontalHeader()
+
+    def order():
+        return [model.rows[proxy.mapToSource(proxy.index(i, 0)).row()]["qc"] for i in range(proxy.rowCount())]
+
+    QTest.mouseClick(head.viewport(), Qt.LeftButton, pos=QPoint(head.sectionViewportPosition(col) + 5, 5))
+    assert order() == ["FAIL", "WARN", "WARN", "PASS", "PASS"]
+    QTest.mouseClick(head.viewport(), Qt.LeftButton, pos=QPoint(head.sectionViewportPosition(col) + 5, 5))
+    assert order() == ["PASS", "PASS", "WARN", "WARN", "FAIL"]
+    other = [k for k, _t, _f in batch.COLUMNS].index("name")  # another column sorted in between
+    for _ in range(2):
+        QTest.mouseClick(head.viewport(), Qt.LeftButton, pos=QPoint(head.sectionViewportPosition(other) + 5, 5))
+        QTest.mouseClick(head.viewport(), Qt.LeftButton, pos=QPoint(head.sectionViewportPosition(col) + 5, 5))
+        assert order() == ["FAIL", "WARN", "WARN", "PASS", "PASS"]
+    view.close()

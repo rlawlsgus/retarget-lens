@@ -315,6 +315,142 @@ class MotionExportDialog(QDialog):
         super().accept()
 
 
+BAD_NAME = '<>:"/\\|?*'
+
+
+def part_names(name: str, n: int) -> list[str]:
+    """Default file names of 다른 이름으로 저장's parts: the name itself for one, <name>_01, <name>_02, ... for more."""
+    return [name] if n == 1 else [f"{name}_{k + 1:0{max(2, len(str(n)))}d}" for k in range(n)]
+
+
+def bad_name(n: str) -> bool:
+    return not n or any(c in n for c in BAD_NAME) or n.strip(". ") == ""
+
+
+def save_as_files(out: str, names, formats, labels: bool) -> list[str]:
+    """The files 다른 이름으로 저장 writes into out (dataset.export_motion with names): <name>.<format>, .json (and
+    .labels.csv) per part."""
+    exts = [f".{f}" for f in formats] + [".json"] + ([".labels.csv"] if labels else [])
+    return [os.path.join(out, b + e) for b in names for e in exts]
+
+
+def _strip_ext(n: str) -> str:
+    n = n.strip()
+    for ext in (".npz", ".csv", ".pkl", ".json"):
+        if n.lower().endswith(ext):
+            n = n[: -len(ext)]
+    return n.strip()
+
+
+class SaveMotionAsDialog(QDialog):
+    """다른 이름으로 저장 of one motion: its robot motion without the timeline's cut spans, under a new name; one file
+    per part when cuts in the middle or 파일 나누기 points leave several (each part's name can be changed)."""
+
+    def __init__(self, parent, store, label: str, duration: float, parts, cuts, start_folder: str, name: str,
+                 splits=()):
+        super().__init__(parent)
+        self.store = store
+        self.parts = list(parts)
+        self.setWindowTitle(f"다른 이름으로 저장 - {label}")
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.folder = FolderRow(_get(store, "save_as_folder", start_folder), "저장할 폴더", self)
+        form.addRow("저장할 폴더", self.folder)
+        self.edit = QLineEdit(name)
+        self.edit.setToolTip("확장자 없이 씁니다. 형식마다 <이름>.npz 등과 <이름>.json(어디서 잘랐는지), 라벨을 함께 쓰면 "
+                             "<이름>.labels.csv를 씁니다. 여러 파일이면 <이름>_01, <이름>_02, ...")
+        form.addRow("이름", self.edit)
+        self.formats = FormatRow(store, self)
+        form.addRow("형식", self.formats)
+        self.labels = QCheckBox("라벨 함께 (창에서 고친 라벨 그대로, 파일마다 그 파일의 시작이 0초)")
+        self.labels.setChecked(_get(store, "labels", True))
+        form.addRow("", self.labels)
+        lay.addLayout(form)
+        left = sum(b - a for a, b in self.parts)
+        lines = [f"남는 시간: {left:.2f}초 / {duration:.2f}초"]
+        if cuts:
+            lines.append("잘라낸 시간: " + ", ".join(f"{a:.2f}–{b:.2f}s" for a, b in cuts))
+        if splits:
+            lines.append("파일 나누기: " + ", ".join(f"{t:.2f}s" for t in splits))
+        if not cuts and not splits:
+            lines.append("잘라내거나 나눈 곳 없음: 모션 전체를 새 이름으로 저장합니다 "
+                         "(타임라인에서 Shift+드래그로 범위를 고르고 Shift+Delete, 재생 위치에서 K로 파일 나누기)")
+        info = QLabel("\n".join(lines))
+        info.setWordWrap(True)
+        lay.addWidget(info)
+        self.table = None
+        if len(self.parts) > 1:
+            from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
+
+            lay.addWidget(QLabel(f"{len(self.parts)}개 파일로 저장합니다. 파일 이름 칸을 두 번 눌러 바꿀 수 있습니다"
+                                 "(예: 들고 가기, 돌아오기)."))
+            t = self.table = QTableWidget(len(self.parts), 4, self)
+            t.setHorizontalHeaderLabels(["시작 (s)", "끝 (s)", "길이 (s)", "파일 이름"])
+            t.verticalHeader().setVisible(False)
+            t.setSelectionMode(QAbstractItemView.NoSelection)
+            t.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+            self._auto = [True] * len(self.parts)
+            self._filling = True
+            for r, (a, b) in enumerate(self.parts):
+                for c, v in enumerate((a, b, b - a)):
+                    cell = QTableWidgetItem(f"{v:.2f}")
+                    cell.setFlags(Qt.ItemIsEnabled)
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    t.setItem(r, c, cell)
+                t.setItem(r, 3, QTableWidgetItem(""))
+            self._filling = False
+            self._fill_names()
+            t.itemChanged.connect(self._name_edited)
+            self.edit.textChanged.connect(self._fill_names)
+            t.setMinimumHeight(min(320, 40 + 28 * len(self.parts)))
+            lay.addWidget(t)
+        lay.addWidget(_buttons(self, "저장"))
+
+    def _fill_names(self) -> None:
+        """The names not changed by hand follow the 이름 box (<이름>_01, ...)."""
+        self._filling = True
+        for r, n in enumerate(part_names(self.name(), len(self.parts))):
+            if self._auto[r]:
+                self.table.item(r, 3).setText(n)
+        self._filling = False
+
+    def _name_edited(self, cell) -> None:
+        if not self._filling and cell.column() == 3:
+            self._auto[cell.row()] = False
+
+    def name(self) -> str:
+        return _strip_ext(self.edit.text())
+
+    def names(self) -> list[str]:
+        """One file name per part, in time order."""
+        if self.table is None:
+            return [self.name()]
+        return [_strip_ext(self.table.item(r, 3).text()) for r in range(len(self.parts))]
+
+    def accept(self) -> None:
+        names = self.names()
+        if not self.folder.path():
+            QMessageBox.warning(self, "다른 이름으로 저장", "저장할 폴더를 고르세요.")
+            return
+        bad = next((n for n in [self.name(), *names] if bad_name(n)), None)
+        if bad is not None:
+            QMessageBox.warning(self, "다른 이름으로 저장", f"쓸 수 없는 이름입니다: {bad or '(빈칸)'}\n({BAD_NAME} 는 쓸 수 없음)")
+            return
+        seen: set[str] = set()
+        for n in names:
+            if n.lower() in seen:
+                QMessageBox.warning(self, "다른 이름으로 저장", f"파일 이름이 겹칩니다: {n}")
+                return
+            seen.add(n.lower())
+        if not self.formats.value():
+            QMessageBox.warning(self, "다른 이름으로 저장", "형식을 하나 이상 고르세요.")
+            return
+        _put(self.store, "save_as_folder", self.folder.path())
+        _put(self.store, "labels", self.labels.isChecked())
+        self.formats.save(self.store)
+        super().accept()
+
+
 def confirm_folder(parent, out: str, title: str) -> bool:
     """Ask before writing into a folder that already has files: an earlier export's files (its manifest) are
     replaced; files of the same names are overwritten."""

@@ -11,6 +11,8 @@ offset that best lines a motion up with a reference.
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from . import stability
@@ -136,6 +138,9 @@ class FootKinematics:
         self.profile = prof = profile(robot)
         self.model = prof.model()
         self.data = mj.MjData(self.model)
+        # one MjData, and the window measures from several threads (opening, physics results, 다시 리타게팅,
+        # export, the API): whoever writes data.qpos and runs FK on it holds this
+        self.lock = threading.RLock()
         self.joint_names = robot_joint_names(self.model)
         parts = prof.parts
         if foot_bodies is None:
@@ -162,18 +167,19 @@ class FootKinematics:
         sole, flat, foot = np.zeros((T, 2)), np.zeros((T, 2)), np.zeros((T, 2, 3))
         points, com = np.zeros((T, 2, G, 3)), np.zeros((T, 3))
         q = model.qpos0.copy()
-        for t in range(T):
-            q[:3], q[3:7] = m.root_pos[t], m.root_quat[t]
-            q[7:] = [m.dof_pos[t, i] if i is not None else 0.0 for i in idx]
-            data.qpos[:] = q
-            mj.mj_kinematics(model, data)
-            mj.mj_comPos(model, data)
-            com[t] = data.subtree_com[0]  # the world body's subtree = the whole robot
-            for k, (b, geoms) in enumerate(zip(self.feet, self.soles)):
-                foot[t, k] = data.xpos[b]
-                pts = list(sole_world(data, geoms)) or [data.xpos[b]]
-                points[t, k] = pts + [pts[-1]] * (G - len(pts))
-                sole[t, k], flat[t, k] = min(p[2] for p in pts), max(p[2] for p in pts)
+        with self.lock:
+            for t in range(T):
+                q[:3], q[3:7] = m.root_pos[t], m.root_quat[t]
+                q[7:] = [m.dof_pos[t, i] if i is not None else 0.0 for i in idx]
+                data.qpos[:] = q
+                mj.mj_kinematics(model, data)
+                mj.mj_comPos(model, data)
+                com[t] = data.subtree_com[0]  # the world body's subtree = the whole robot
+                for k, (b, geoms) in enumerate(zip(self.feet, self.soles)):
+                    foot[t, k] = data.xpos[b]
+                    pts = list(sole_world(data, geoms)) or [data.xpos[b]]
+                    points[t, k] = pts + [pts[-1]] * (G - len(pts))
+                    sole[t, k], flat[t, k] = min(p[2] for p in pts), max(p[2] for p in pts)
         return {"sole": sole, "flat": flat, "foot": foot, "points": points, "com": com}
 
 

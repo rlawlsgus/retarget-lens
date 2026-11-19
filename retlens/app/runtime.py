@@ -3,7 +3,8 @@
 A packaged RetLens is a windowed program: there is no console, so print(), rich, tqdm and
 tracebacks would vanish (sys.stdout is None). Installed (or console-less) runs therefore write
 them to %LOCALAPPDATA%\\RetLens\\logs\\retlens-<time>.log (the newest 20 are kept), crashes of
-the interpreter included (faulthandler). Errors nobody caught show a dialog with the details
+the interpreter included (faulthandler; a native crash also leaves a minidump there, retlens.crashdump).
+Errors nobody caught show a dialog with the details
 and a button to the log folder; one that happens before Qt is up still gets a Windows message
 box. Running from the repository keeps everything on the console as before.
 
@@ -138,6 +139,12 @@ def install_error_hooks() -> None:
 def main(argv=None) -> int:
     """Entry point of RetLens (packaged exe and tools/editor.py)."""
     setup_logging()
+    try:  # a native crash (heap corruption, access violation) also leaves a minidump next to the logs
+        from .. import crashdump
+
+        crashdump.install(paths.logs_dir(), _log_file)
+    except Exception:
+        pass
     argv = list(sys.argv[1:] if argv is None else argv)
     code = 1
     try:

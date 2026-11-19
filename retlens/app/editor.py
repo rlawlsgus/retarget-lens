@@ -366,6 +366,8 @@ class SceneView(QWebEngineView):
 
 # ------------------------------------------------------------------------------ hierarchy
 QC_COLORS = {"FAIL": QColor(230, 90, 80), "WARN": QColor(230, 160, 60)}
+# the 데이터셋 table's QC column by rank: a header's first click sorts descending (FAIL, WARN, PASS), the next PASS first
+QC_SORT = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
 
 def score_text(it: Item) -> str:
@@ -1074,6 +1076,21 @@ class _Same:
         return id(self.obj)
 
 
+def _cuts(sc, it) -> tuple:
+    """The motion's 시간 잘라내기 spans (MotionScene.cut_spans); none for a scene without them."""
+    f = getattr(sc, "cut_spans", None)
+    return f(it) if f is not None else ()
+
+
+def _splits(sc, it) -> tuple:
+    """The motion's 파일 나누기 points (MotionScene.split_points); none for a scene without them."""
+    f = getattr(sc, "split_points", None)
+    return f(it) if f is not None else ()
+
+
+SPLIT_COLOR = (70, 200, 255)
+
+
 class TimelineTracks(QWidget):
     """Ruler, one bar per motion (its offset and length, falls in red), its labelled segments in
     lanes under the bar (one lane per label track, retlens.motion_labels) and the playhead. A
@@ -1090,6 +1107,7 @@ class TimelineTracks(QWidget):
         self.setFocusPolicy(Qt.ClickFocus)  # Esc stops dragging a segment's edge; Delete deletes the picked segment
         self._drag = False
         self._edge: dict | None = None  # dragging the picked segment's start or end (label editing)
+        self._range: dict | None = None  # Shift+dragging a time range on a motion (시간 잘라내기)
         self._no_menu = 0.0  # when a right press cancelled a drag: its menu (right after) does not open
         self._layer: tuple | None = None  # (_layer_key(), QPixmap)
 
@@ -1221,7 +1239,8 @@ class TimelineTracks(QWidget):
         back for the next one, which would look unchanged."""
         sc, sel, pal = self.win.scene, self.win.selected, self.palette()
         rows = tuple((_Same(it), it.label, _Same(labels), it.offset, it.visible, it.color, sc.shown(it).robot.duration,
-                      it is sel, tuple(sc.falls(it)), _Same(sc.shown(it).metrics.get("_problems"))) for it, _y, _h, _tracks, labels in
+                      it is sel, tuple(sc.falls(it)), _Same(sc.shown(it).metrics.get("_problems")),
+                      _cuts(sc, it), _splits(sc, it)) for it, _y, _h, _tracks, labels in
                      (rows if rows is not None else self._rows()))
         return (self.width(), self.height(), self.devicePixelRatioF(), self._span(), rows, sc.view.show_problems,
                 pal.color(QPalette.Base).rgba(), pal.color(QPalette.Text).rgba(), self.font().key())
@@ -1229,8 +1248,10 @@ class TimelineTracks(QWidget):
     def view_key(self) -> tuple:
         """What is drawn: TimelinePanel.refresh repaints only when this changes."""
         sel, ed = self._selection(), self._edge
+        rng = getattr(self.win, "time_range", None)
         return (self._layer_key(), self.win.scene.t, _Same(sel[2]) if sel is not None else None,
-                (ed["preview"].start, ed["preview"].end) if ed is not None and ed.get("preview") is not None else None)
+                (ed["preview"].start, ed["preview"].end) if ed is not None and ed.get("preview") is not None else None,
+                (_Same(rng[0]), rng[1], rng[2]) if rng is not None else None)
 
     def paintEvent(self, _):
         rows = self._rows()
@@ -1259,6 +1280,7 @@ class TimelineTracks(QWidget):
                     if r is not None:
                         p.drawRect(r.adjusted(1, 1, -1, -1))
         self._paint_selection(p, rows)
+        self._paint_range(p, rows, span)
         self._paint_ruler(p, span)
         x = self._x(sc.t, span)
         p.setPen(QPen(QColor(255, 150, 40), 2))
@@ -1281,6 +1303,25 @@ class TimelineTracks(QWidget):
         p.drawRect(r)
         for x in (r.left(), r.right()):
             p.fillRect(QRectF(x - 2, r.top() - 1, 4, r.height() + 2), hl)
+
+    def _paint_range(self, p: QPainter, rows, span) -> None:
+        """The time range Shift+dragged on a motion (EditorWindow.time_range): filled over its row."""
+        rng = getattr(self.win, "time_range", None)
+        if rng is None:
+            return
+        it, a, b = rng
+        row = next((r for r in rows if r[0] is it), None)
+        if row is None:
+            return
+        xa, xb = self._x(it.offset + a, span), self._x(it.offset + b, span)
+        r = QRectF(xa, row[1] + 1, max(2.0, xb - xa), row[2] - 2)
+        c = QColor(255, 220, 90)
+        fill = QColor(c)
+        fill.setAlpha(70)
+        p.fillRect(r, fill)
+        p.setPen(QPen(c, 1.5))
+        p.setBrush(Qt.NoBrush)
+        p.drawRect(r)
 
     def _ruler_ticks(self, span):
         lo, hi = span
@@ -1342,6 +1383,24 @@ class TimelineTracks(QWidget):
                         for a, b in sp:
                             xa, xb = self._x(it.offset + a, span), self._x(it.offset + min(b, dur), span)
                             p.drawRect(QRectF(xa, y + self.ROW_H - 7, max(2.0, xb - xa), 3))
+            for a, b in _cuts(sc, it):  # 시간 잘라내기: darkened and hatched over the bar and its lanes
+                xa, xb = self._x(it.offset + a, span), self._x(it.offset + b, span)
+                r = QRectF(xa, y + 1, max(2.0, xb - xa), h - 2)
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(0, 0, 0, 150))
+                p.drawRect(r)
+                p.setBrush(QBrush(QColor(220, 220, 220, 150), Qt.BDiagPattern))
+                p.drawRect(r)
+                p.setPen(QPen(QColor(240, 90, 80), 1.5))
+                for x in (xa, xb):
+                    p.drawLine(QPointF(x, y + 1), QPointF(x, y + h - 1))
+            for t in _splits(sc, it):  # 파일 나누기: a blue dashed line over the row, a notch on the bar
+                x = self._x(it.offset + t, span)
+                p.setPen(QPen(QColor(*SPLIT_COLOR), 2, Qt.DashLine))
+                p.drawLine(QPointF(x, y + 1), QPointF(x, y + h - 1))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(*SPLIT_COLOR))
+                p.drawPolygon([QPointF(x - 5, y + 1), QPointF(x + 5, y + 1), QPointF(x, y + 7)])
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(230, 40, 40))
             for ft, _cause in sc.falls(it):
@@ -1383,6 +1442,18 @@ class TimelineTracks(QWidget):
             if row is not None:
                 self.win.select(row[0])
             return
+        if e.modifiers() & Qt.ShiftModifier and hasattr(self.win, "set_time_range"):  # Shift+drag: a time range
+            row = self._row_at(e.position().y())
+            if row is not None:
+                t = self._motion_t(row[0], e.position().x())
+                self._range = {"item": row[0], "t0": t}
+                self.win.select(row[0])
+                self.win.set_time_range(None)
+                self.win.scene.set_playing(False)
+                self.win.scene.seek(row[0].offset + t)
+            return
+        if getattr(self.win, "time_range", None) is not None:  # a plain click lets the range go
+            self.win.set_time_range(None)
         which = self.edge_at(e.position())
         if which is not None:  # on the picked segment's edge: drag it (a click without moving still seeks)
             it, lab, seg = self._selection()
@@ -1393,6 +1464,11 @@ class TimelineTracks(QWidget):
         self._drag = True
         self.win.scene.set_playing(False)
         self.win.scene.seek(self._t(e.position().x()))
+
+    def _motion_t(self, it: Item, x: float) -> float:
+        """The motion's own time under x, on its frames and inside it."""
+        fps, dur = it.robot.fps, it.robot.duration
+        return min(max(0.0, round((self._t(x) - it.offset) * fps) / fps), dur)
 
     def _pick(self, pos) -> None:
         pick = getattr(self.win, "set_label_selection", None)
@@ -1425,7 +1501,15 @@ class TimelineTracks(QWidget):
             self.win.scene.seek(hit[0].offset + hit[1].start)
 
     def mouseMoveEvent(self, e):
-        if self._edge is not None:
+        if self._range is not None:
+            it, t0 = self._range["item"], self._range["t0"]
+            t = self._motion_t(it, e.position().x())
+            self.win.set_time_range(it, t0, t)
+            self.win.scene.seek(it.offset + t)
+            a, b = min(t0, t), max(t0, t)
+            QToolTip.showText(e.globalPosition().toPoint(), f"{a:.2f}–{b:.2f} s ({b - a:.2f}초) · Shift+Delete: 시간 "
+                              "잘라내기", self)
+        elif self._edge is not None:
             self._drag_edge(e)
         elif self._drag:
             self.win.scene.seek(self._t(e.position().x()))
@@ -1433,10 +1517,17 @@ class TimelineTracks(QWidget):
             edge = self.edge_at(e.position()) is not None
             if edge != (self.cursor().shape() == Qt.SizeHorCursor):
                 self.setCursor(Qt.SizeHorCursor) if edge else self.unsetCursor()
-            self.setToolTip(self._fall_at(e.position()) or self._label_tip(e.position()))
+            self.setToolTip(self._fall_at(e.position()) or self._cut_tip(e.position()) or self._label_tip(e.position()))
 
     def mouseReleaseEvent(self, e):
         self._drag = False
+        if self._range is not None:
+            self._range = None
+            rng = getattr(self.win, "time_range", None)
+            if rng is not None:
+                self.win.status(f"{rng[0].label}: 범위 {rng[1]:.2f}–{rng[2]:.2f}s ({rng[2] - rng[1]:.2f}초) 고름 · "
+                                "Shift+Delete: 시간 잘라내기, 우클릭 > 시간 잘라내기·나누기", 8000)
+            return
         ed, self._edge = self._edge, None
         if ed is None:
             return
@@ -1451,6 +1542,9 @@ class TimelineTracks(QWidget):
         if e.key() == Qt.Key_Escape and self._edge is not None:
             self._edge = None
             self.update()
+            return
+        if e.key() == Qt.Key_Escape and getattr(self.win, "time_range", None) is not None:
+            self.win.set_time_range(None)
             return
         super().keyPressEvent(e)
 
@@ -1488,6 +1582,23 @@ class TimelineTracks(QWidget):
         labels = row[4] if row is not None else None
         if pos.x() < self.NAME_W and labels is not None and labels.error:
             return f"라벨 파일을 쓰지 못함: {labels.error}"
+        return ""
+
+    def _cut_tip(self, pos) -> str:
+        """Over a cut span: what it is and what takes it back."""
+        row = self._row_at(pos.y())
+        if row is None or pos.x() < self.NAME_W:
+            return ""
+        it = row[0]
+        t = self._t(pos.x()) - it.offset
+        for st in _splits(self.win.scene, it):
+            if abs(self._x(it.offset + st) - pos.x()) < 5:
+                return (f"{it.label}: 파일 나누기 {st:.2f}s. 다른 이름으로 저장할 때 여기서 파일이 나뉩니다 "
+                        "(되돌리기: Ctrl+Z, 우클릭 > 시간 잘라내기·나누기)")
+        for a, b in _cuts(self.win.scene, it):
+            if a <= t < b:
+                return (f"{it.label}: 잘라낸 시간 {a:.2f}–{b:.2f}s ({b - a:.2f}초). 다른 이름으로 저장할 때 빠집니다 "
+                        "(되돌리기: Ctrl+Z, 우클릭 > 시간 잘라내기 > 모두 취소)")
         return ""
 
     def _fall_at(self, pos) -> str:
@@ -2426,6 +2537,8 @@ class BatchModel(QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
             return batch.COLUMNS[section][1]
+        if orientation == Qt.Horizontal and role == Qt.InitialSortOrderRole and batch.COLUMNS[section][0] == "qc":
+            return Qt.DescendingOrder  # its first click: FAIL, WARN, PASS (QC_SORT), whichever column was sorted before
         return None
 
     def data(self, index, role=Qt.DisplayRole):
@@ -2433,8 +2546,10 @@ class BatchModel(QAbstractTableModel):
         key, _title, fmt = batch.COLUMNS[index.column()]
         if role == Qt.DisplayRole:
             return LABEL_SOURCES.get(r.get(key), r.get(key)) if key == "labels" else batch.cell(r, key, fmt)
-        if role == Qt.UserRole:  # sorting: numbers as numbers, blanks last
+        if role == Qt.UserRole:  # sorting: numbers as numbers, blanks last; QC by rank (QC_SORT), not alphabetically
             v = r.get(key)
+            if key == "qc" and v in QC_SORT:
+                return (0, float(QC_SORT[v]), "")
             return (1, 0.0, "") if v is None or v == "" else (0, float(v), "") if isinstance(v, (int, float)) else (0, 0.0, str(v))
         if role == Qt.ToolTipRole:
             return "\n".join(x for x in (r.get("file"), r.get("error"), r.get("qc_notes"), r.get("phys_ok"),
@@ -3692,6 +3807,7 @@ class EditorWindow(QMainWindow):
         super().__init__()
         self.scene, self.url = scene, url
         self.selected: Item | None = None
+        self.time_range: tuple | None = None  # (motion, start_s, end_s) Shift+dragged on the timeline (its own time)
         self.settings = app_settings()
         self.bridge = SceneBridge()
         self.bridge.event.connect(self._on_scene)
@@ -3865,10 +3981,19 @@ class EditorWindow(QMainWindow):
                                 tip="←/→(1/30초씩)로 재생 위치를 옮긴 뒤 누릅니다. 더 세밀하게는 구간 표에서 숫자로 고칩니다")
         self.a_end_here = act("구간 끝을 재생 위치로", lambda: self.label_edge_here("end"), "]")
         self.a_delete_seg = act("라벨 구간 삭제", self.label_delete, tip="Delete (타임라인이나 구간 표에서)")
+        self.a_cut_seg = act("고른 범위·구간 시간 잘라내기", self.cut_picked, "Shift+Delete",
+                             tip="타임라인에서 Shift+드래그로 고른 범위, 없으면 고른 라벨 구간의 시간을 모션에서 뺍니다"
+                                 "(다른 이름으로 저장할 때 빠짐, 원본 파일은 그대로). 라벨만 지우는 것은 '라벨 구간 삭제'(Delete)")
+        self.a_split_file = act("재생 위치에서 파일 나누기", lambda: self.split_file_here(self.selected), "K",
+                                tip="다른 이름으로 저장할 때 고른 모션을 재생 위치에서 두 파일로 나눕니다(예: 왕복을 가기·오기로). "
+                                    "라벨 구간 나누기(S)와 다릅니다")
+        self.a_save_as = act("모션 다른 이름으로 저장...", lambda: self.selected is not None and
+                             self.save_motion_as(self.selected),
+                             tip="고른 모션의 로봇 모션을 잘라낸 시간을 빼고 새 이름으로 저장합니다(라벨 함께)")
         self.a_save_labels = act("라벨 CSV로 저장...", lambda: self.selected is not None and
                                  self.save_labels_dialog(self.selected))
         self.a_remove_all = act("모두 제거...", self.remove_all)
-        for a in (self.a_video, self.a_remove, self.a_remove_all):  # select() / the items event turn them on
+        for a in (self.a_video, self.a_remove, self.a_remove_all, self.a_save_as):  # select() / the items event: on
             a.setEnabled(False)
         self.a_play = act("재생 / 일시정지", sc.toggle_play, "Space", QStyle.SP_MediaPlay)
         self.a_home = act("처음으로", lambda: sc.seek(0.0), "Home", QStyle.SP_MediaSkipBackward)
@@ -3936,14 +4061,15 @@ class EditorWindow(QMainWindow):
         self.m_recent = QMenu("최근 작업 세션", self)
         self.m_recent.aboutToShow.connect(lambda: self._fill_recent_menu(self.m_recent))
         for a in (self.a_open, self.a_batch, self.a_export, None, self.a_session_new, self.a_session_open, self.m_recent,
-                  self.a_session_save, self.a_session_save_as, None, self.a_video, self.a_video_dir, self.a_folders, None,
+                  self.a_session_save, self.a_session_save_as, None, self.a_save_as, self.a_video, self.a_video_dir,
+                  self.a_folders, None,
                   self.a_settings, self.a_setup, None, self.a_quit):
             m.addSeparator() if a is None else m.addMenu(a) if isinstance(a, QMenu) else m.addAction(a)
         m = mb.addMenu("편집(&E)")
         m.setToolTipsVisible(True)
         for a in (self.a_undo, self.a_redo, None, self.a_rename, self.a_split, self.a_add_seg, self.a_merge_prev,
-                  self.a_merge_next, self.a_start_here, self.a_end_here, self.a_delete_seg, self.a_save_labels, None,
-                  self.a_remove, self.a_remove_all):
+                  self.a_merge_next, self.a_start_here, self.a_end_here, self.a_delete_seg, self.a_cut_seg,
+                  self.a_split_file, self.a_save_labels, None, self.a_remove, self.a_remove_all):
             m.addSeparator() if a is None else m.addAction(a)
         self._refresh_label_actions()
         m = mb.addMenu("보기(&V)")
@@ -4198,6 +4324,7 @@ class EditorWindow(QMainWindow):
         self.timeline.tracks.update()
         self.a_video.setEnabled(item is not None)
         self.a_remove.setEnabled(item is not None)
+        self.a_save_as.setEnabled(item is not None)
         self._refresh_label_actions()
 
     def remove(self, item: Item | None) -> None:
@@ -4458,8 +4585,139 @@ class EditorWindow(QMainWindow):
     def label_menu(self, m: QMenu, it: Item, seg) -> None:
         """A picked segment's entries (timeline and segment list right-click)."""
         for a in (self.a_rename, self.a_split, self.a_merge_prev, self.a_merge_next, self.a_start_here, self.a_end_here,
-                  self.a_delete_seg):
+                  self.a_delete_seg, self.a_cut_seg):
             m.addAction(a)
+
+    # ---------------------------------------------------------------- 시간 잘라내기, 다른 이름으로 저장
+    # The cuts mark time to leave out (MotionScene.cut_time, an undo step like a label edit); the motion and its
+    # file stay as they are, and 다른 이름으로 저장 writes the rest (retlens.dataset.export_motion, removed=...).
+    def _range(self):
+        """The Shift+dragged time range (motion, start_s, end_s) while that motion is still open."""
+        r = self.time_range
+        return r if r is not None and r[0] in self.scene.items else None
+
+    def set_time_range(self, it: Item | None, a: float = 0.0, b: float = 0.0) -> None:
+        """Pick a time range of a motion (its own time; None or empty: none)."""
+        self.time_range = None if it is None or abs(b - a) < 1e-6 else (it, min(a, b), max(a, b))
+        self.timeline.tracks.update()
+        self._refresh_label_actions()
+
+    def cut_picked(self) -> None:
+        rng = self._range()
+        if rng is not None:  # the Shift+dragged range first
+            it, a, b = rng
+            self.set_time_range(None)
+            self._cut(it, a, b, f"시간 잘라내기: {a:.2f}–{b:.2f}s")
+            return
+        sel = self.label_selection()
+        if sel is None:
+            self.status("타임라인에서 Shift+드래그로 범위를 고르거나, 잘라낼 라벨 구간을 고르세요", 5000)
+            return
+        it, _lab, seg = sel
+        self._cut(it, seg.start, seg.end, f"시간 잘라내기: {seg.label}")
+
+    def cut_playhead(self, it: Item, to_end: bool) -> None:
+        """Cut from the playhead to the motion's end (to_end), or from its start to the playhead."""
+        t = self.scene.t - it.offset
+        self._cut(it, t, it.robot.duration, "재생 위치부터 끝까지 잘라내기") if to_end else \
+            self._cut(it, 0.0, t, "처음부터 재생 위치까지 잘라내기")
+
+    def _cut(self, it: Item, a: float, b: float, what: str) -> None:
+        if not self.scene.cut_time(it, a, b, what):
+            self.status(f"{it.label}: 잘라낼 시간이 없습니다 (재생 위치가 모션 밖이거나 이미 잘라낸 시간)", 5000)
+            return
+        kept = sum(e - s for s, e in self.scene.kept_spans(it))
+        self.status(f"{it.label}: {what} · 남은 {kept:.2f}초 / {it.robot.duration:.2f}초 (다른 이름으로 저장할 때 빠짐, "
+                    "Ctrl+Z로 되돌림)", 8000)
+        self._refresh_label_actions()
+
+    def split_file_here(self, it: Item | None) -> None:
+        """파일 나누기 at the playhead: 다른 이름으로 저장 writes the motion as one file per part."""
+        if it is None:
+            self.status("나눌 모션을 고르세요", 4000)
+            return
+        t = self.scene.t - it.offset
+        if not self.scene.split_file(it, t, f"파일 나누기: {t:.2f}s"):
+            self.status(f"{it.label}: 여기서는 나눌 수 없습니다 (재생 위치가 모션 처음·끝이거나 밖, 또는 이미 나눈 곳)", 5000)
+            return
+        n = len(self.scene.parts(it))
+        self.status(f"{it.label}: {t:.2f}s에서 파일 나누기 · 다른 이름으로 저장하면 파일 {n}개 (Ctrl+Z로 되돌림)", 8000)
+        self._refresh_label_actions()
+
+    def cut_menu(self, m: QMenu, it: Item) -> None:
+        """The motion's right-click 시간 잘라내기·나누기 entries."""
+        rng = self._range()
+        if rng is not None and rng[0] is it:
+            m.addAction(f"고른 범위 잘라내기 ({rng[1]:.2f}–{rng[2]:.2f}s)", self.cut_picked)
+        sel = self.label_selection()
+        if sel is not None and sel[0] is it and (rng is None or rng[0] is not it):
+            m.addAction(self.a_cut_seg)
+        t = self.scene.t - it.offset
+        inside = 0.0 < t < it.robot.duration
+        a = m.addAction(f"재생 위치({t:.2f}s)부터 끝까지 잘라내기", lambda: self.cut_playhead(it, True))
+        a.setEnabled(inside)
+        a = m.addAction(f"처음부터 재생 위치({t:.2f}s)까지 잘라내기", lambda: self.cut_playhead(it, False))
+        a.setEnabled(inside)
+        m.addSeparator()
+        a = m.addAction(f"재생 위치({t:.2f}s)에서 파일 나누기", lambda: self.split_file_here(it))
+        a.setEnabled(inside)
+        splits = self.scene.split_points(it)
+        if splits:
+            near = min(splits, key=lambda s: abs(s - t))
+            m.addAction(f"가장 가까운 나누기({near:.2f}s) 빼기",
+                        lambda: self.scene.unsplit(it, near) and self._refresh_label_actions())
+            m.addAction(f"나누기 모두 빼기 ({len(splits)}곳)",
+                        lambda: self.scene.unsplit(it) and self._refresh_label_actions())
+        m.addSeparator()
+        a = m.addAction("잘라낸 시간 모두 취소", lambda: self.scene.clear_cuts(it) and self._refresh_label_actions())
+        a.setEnabled(bool(self.scene.cut_spans(it)))
+
+    def save_motion_as(self, it: Item) -> None:
+        """다른 이름으로 저장: the motion's robot motion without its cut spans, under a new name (one file per format, or
+        <name>_<start>-<end>s pieces when a cut in the middle leaves two parts), its labels as in the window and
+        a .json each."""
+        sc = self.scene
+        kept = sc.parts(it)
+        if not kept:
+            QMessageBox.warning(self, "다른 이름으로 저장", f"{it.label}: 모든 시간을 잘라내 저장할 것이 없습니다.")
+            return
+        stem = os.path.splitext(os.path.basename(it.source))[0]
+        while True:
+            dlg = export_dialogs.SaveMotionAsDialog(
+                self, self.settings, it.label, it.robot.duration, kept, sc.cut_spans(it),
+                os.path.join(os.path.dirname(it.source), "retlens_export"),
+                stem + ("_trim" if sc.cut_spans(it) and len(kept) == 1 else ""), splits=sc.split_points(it))
+            if dlg.exec() != QDialog.Accepted:
+                return
+            out, names, formats = dlg.folder.path(), dlg.names(), dlg.formats.value()
+            files = export_dialogs.save_as_files(out, names, formats, dlg.labels.isChecked() and it.labels is not None)
+            key = lambda p: os.path.normcase(os.path.realpath(p))  # noqa: E731
+            own = {key(p) for p in (it.source, it.info.get("solved_motion"), it.labels.path if it.labels else None) if p}
+            if any(key(p) in own for p in files):
+                QMessageBox.warning(self, "다른 이름으로 저장", f"원본 파일이나 이 모션의 라벨 파일을 덮어쓰게 됩니다.\n\n{out}\n\n"
+                                    "다른 이름이나 폴더를 고르세요.")
+                continue
+            there = [p for p in files if os.path.exists(p)]
+            if there and QMessageBox.question(
+                    self, "다른 이름으로 저장", "이미 있는 파일을 덮어쓸까요?\n\n" + "\n".join(os.path.basename(p) for p in there[:8])
+                    + (f"\n외 {len(there) - 8}개" if len(there) > 8 else "")) != QMessageBox.Yes:
+                continue
+            break
+        try:
+            os.makedirs(out, exist_ok=True)
+            res = dataset.export_motion(
+                it.robot, out, names[0], labels=it.labels if dlg.labels.isChecked() else None, removed=sc.cut_spans(it),
+                splits=sc.split_points(it), names=names, exact_name=True, formats=formats, limits=sc.limits, source=it.source, fk=sc.fk,
+                info={"retarget": it.retarget or None, "kind": it.kind, "source_sha256": dataset.sha256(it.source),
+                      "saved_as": True})
+        except Exception as e:
+            QMessageBox.warning(self, "다른 이름으로 저장", f"{type(e).__name__}: {e}")
+            return
+        n, secs = len(res["pieces"]), sum(p["duration_s"] for p in res["pieces"])
+        self.status(f"다른 이름으로 저장: {it.label} → {out} ({n}개, {secs:.1f}초)", 8000)
+        export_dialogs.report(self, "다른 이름으로 저장", f"{out}\n\n파일 {n}개 · {secs:.2f}초\n\n"
+                              + "\n".join(os.path.basename(f) for p in res["pieces"] for f in p["files"][:1]),
+                              out, self.open_path)
 
     def _refresh_label_actions(self) -> None:
         undo, redo = self.scene.label_undo_text(self.selected)
@@ -4471,6 +4729,8 @@ class EditorWindow(QMainWindow):
         for a in (self.a_rename, self.a_split, self.a_merge_prev, self.a_merge_next, self.a_start_here, self.a_end_here,
                   self.a_delete_seg):
             a.setEnabled(picked)
+        self.a_cut_seg.setEnabled(picked or self._range() is not None)
+        self.a_split_file.setEnabled(self.selected is not None)
         self.a_add_seg.setEnabled(self.selected is not None)
         lab = self.selected.labels if self.selected is not None else None
         self.a_save_labels.setEnabled(lab is not None and (bool(lab.segments) or lab.edited))
@@ -4500,6 +4760,9 @@ class EditorWindow(QMainWindow):
             m.addAction("저장된 동영상 열기", lambda: self.open_path(self.scene.video_file(it)))
         m.addAction("파일 위치 열기", lambda: self.open_path(os.path.dirname(it.source)))
         m.addAction("로봇 모션 내보내기...", lambda: self.export_motion(it))
+        m.addAction("다른 이름으로 저장...", lambda: self.save_motion_as(it))
+        n = len(self.scene.cut_spans(it)) + len(self.scene.split_points(it))
+        self.cut_menu(m.addMenu(f"시간 잘라내기·나누기 ({n}곳)" if n else "시간 잘라내기·나누기"), it)
         m.addSeparator()
         self.add_label_actions(m.addMenu("라벨"), it)
         m.addSeparator()

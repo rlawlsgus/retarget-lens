@@ -396,6 +396,12 @@ class MotionScene:
         self.playlist: dict | None = None  # 라벨 구간 이어 재생 (play_segments)
         # label edits per motion: {"undo": [(labels, segment before, segment after, what)], "redo": [...]}
         self.label_history: dict[Item, dict] = {}
+        # 시간 잘라내기 per motion: ((start_s, end_s), ...) sorted, apart, in the motion's time; left out by 다른 이름으로
+        # 저장 (the motion itself plays as it is). A change is a step of the label undo history (cut_time)
+        self.cuts: dict[Item, tuple] = {}
+        # 파일 나누기 per motion: (time_s, ...) sorted, inside the motion: 다른 이름으로 저장 writes one file per part
+        # between them (a round trip into its legs). A step of the label undo history too (split_file)
+        self.splits: dict[Item, tuple] = {}
         # label definition (자동 라벨 rule) files read for the label pick lists: {path: ((mtime, size), labels)}; one
         # entry per file, replaced whole (the window and the API threads read it: no step iterates or deletes)
         self._rule_label_cache: dict[str, tuple] = {}
@@ -573,6 +579,8 @@ class MotionScene:
                     pass
             self.items.remove(item)
             self.label_history.pop(item, None)
+            self.cuts.pop(item, None)
+            self.splits.pop(item, None)
             for i, it in enumerate(self.items):
                 it.handles["index"] = i
             if item in (self.compare.ref, self.compare.item):
@@ -667,7 +675,7 @@ class MotionScene:
         h = self.label_history.setdefault(item, {"undo": [], "redo": []})
         if old is not None:  # a snapshot keeps only its segments: the index is made again when it comes back
             old.__dict__.pop("_idx_cache", None)
-        h["undo"].append((old, before, after, what))
+        h["undo"].append((old, before, after, what, self._trim(item)))  # its 시간 잘라내기 and 나누기 then too
         del h["undo"][:-self.UNDO_LIMIT]
         h["redo"].clear()
 
@@ -700,9 +708,10 @@ class MotionScene:
             h = self.label_history.get(item)
             if not h or not h["redo" if redo else "undo"]:
                 return None
-            labels, before, after, what = h["redo" if redo else "undo"].pop()
-            h["undo" if redo else "redo"].append((item.labels, before, after, what))
+            labels, before, after, what, trim = h["redo" if redo else "undo"].pop()
+            h["undo" if redo else "redo"].append((item.labels, before, after, what, self._trim(item)))
             item.labels = labels
+            self._set_trim(item, trim)
         self._labels_changed(item)
         return what, (after if redo else before)
 
@@ -710,6 +719,124 @@ class MotionScene:
         """What undo and redo would do for the motion (None: nothing)."""
         h = self.label_history.get(item) if item is not None else None
         return (h["undo"][-1][3] if h and h["undo"] else None), (h["redo"][-1][3] if h and h["redo"] else None)
+
+    # ---------------------------------------------------------------- 시간 잘라내기 (다른 이름으로 저장)
+    def cut_spans(self, item: Item | None) -> tuple:
+        """The motion's cut spans ((start_s, end_s), ...), in its own time (not the timeline's)."""
+        return self.cuts.get(item, ()) if item is not None else ()
+
+    def kept_spans(self, item: Item) -> list[tuple[float, float]]:
+        """What 다른 이름으로 저장 writes: the motion's time without its cut spans, (start_s, end_s) each."""
+        out, t, dur = [], 0.0, item.robot.duration
+        for a, b in self.cut_spans(item):
+            if a > t + 1e-6:
+                out.append((t, a))
+            t = max(t, b)
+        if dur > t + 1e-6:
+            out.append((t, dur))
+        return out
+
+    def _set_cuts(self, item: Item, cuts) -> None:
+        if cuts:
+            self.cuts[item] = tuple(cuts)
+        else:
+            self.cuts.pop(item, None)
+
+    def _trim(self, item: Item) -> tuple:
+        """(cuts, splits) of the motion, as the undo history keeps them."""
+        return self.cuts.get(item, ()), self.splits.get(item, ())
+
+    def _set_trim(self, item: Item, trim) -> None:
+        cuts, splits = trim
+        self._set_cuts(item, cuts)
+        if splits:
+            self.splits[item] = tuple(splits)
+        else:
+            self.splits.pop(item, None)
+
+    def split_points(self, item: Item | None) -> tuple:
+        """The motion's 파일 나누기 times (its own time), sorted."""
+        return self.splits.get(item, ()) if item is not None else ()
+
+    def parts(self, item: Item) -> list[tuple[float, float]]:
+        """The files 다른 이름으로 저장 writes, (start_s, end_s) each: the kept time (kept_spans) cut again at the split
+        points; a split inside cut time changes nothing."""
+        out = []
+        for a, b in self.kept_spans(item):
+            t = a
+            for s in self.split_points(item):
+                if t + 1e-6 < s < b - 1e-6:
+                    out.append((t, s))
+                    t = s
+            out.append((t, b))
+        return out
+
+    def split_file(self, item: Item, t: float, what: str = "파일 나누기") -> bool:
+        """Add a split point at t (on a frame), one undo step; False when nothing changed (at the motion's ends, or
+        there already) or the motion is gone."""
+        fps, dur = item.robot.fps, item.robot.duration
+        t = round(round(float(t) * fps) / fps, 6)
+        if not 0.5 / fps < t < dur - 0.5 / fps:
+            return False
+        with self.lock:
+            if item not in self.items:
+                return False
+            old = self.split_points(item)
+            if any(abs(t - s) < 0.5 / fps for s in old):
+                return False
+            self._push_undo(item, item.labels, None, None, what)
+            self.splits[item] = tuple(sorted([*old, t]))
+        self._labels_changed(item)
+        return True
+
+    def unsplit(self, item: Item, t: float | None = None, what: str = "파일 나누기 빼기") -> bool:
+        """Take out the split point nearest t (None: all of them), one undo step; False when there is none."""
+        with self.lock:
+            old = self.split_points(item)
+            if item not in self.items or not old:
+                return False
+            new = () if t is None else tuple(s for s in old if s != min(old, key=lambda s: abs(s - t)))
+            self._push_undo(item, item.labels, None, None, what)
+            self._set_trim(item, (self.cut_spans(item), new))
+        self._labels_changed(item)
+        return True
+
+    def cut_time(self, item: Item, start: float, end: float, what: str = "시간 잘라내기") -> bool:
+        """Take [start, end) of the motion's time out of what 다른 이름으로 저장 writes (on frames; joined with the
+        cuts it touches), one step of its undo history; False when nothing changed (less than a frame, already
+        cut) or the motion is gone."""
+        fps, dur = item.robot.fps, item.robot.duration
+        a = min(max(0.0, round(float(start) * fps) / fps), dur)
+        b = min(max(0.0, round(float(end) * fps) / fps), dur)
+        if b - a < 0.5 / fps:
+            return False
+        with self.lock:
+            if item not in self.items:
+                return False
+            old = self.cut_spans(item)
+            merged: list[list[float]] = []
+            for s, e in sorted([*old, (a, b)]):
+                if merged and s <= merged[-1][1] + 1e-6:
+                    merged[-1][1] = max(merged[-1][1], e)
+                else:
+                    merged.append([s, e])
+            new = tuple((round(s, 6), round(e, 6)) for s, e in merged)
+            if new == old:
+                return False
+            self._push_undo(item, item.labels, None, None, what)
+            self._set_cuts(item, new)
+        self._labels_changed(item)
+        return True
+
+    def clear_cuts(self, item: Item) -> bool:
+        """All of the motion's cuts back (one undo step); False when it had none."""
+        with self.lock:
+            if item not in self.items or not self.cut_spans(item):
+                return False
+            self._push_undo(item, item.labels, None, None, "시간 잘라내기 모두 취소")
+            self._set_cuts(item, ())
+        self._labels_changed(item)
+        return True
 
     @staticmethod
     def labels_dirty(item: Item) -> bool:
@@ -730,10 +857,10 @@ class MotionScene:
             key = os.path.normcase(os.path.abspath(path))
             h = self.label_history.get(item, {})
             for stack in (h.get("undo", []), h.get("redo", [])):
-                for k, (lab, before, after, what) in enumerate(stack):
+                for k, (lab, *rest) in enumerate(stack):
                     if lab is not None and not lab.edited and lab.path and lab.segments is not base.segments \
                             and os.path.normcase(os.path.abspath(lab.path)) == key:
-                        stack[k] = (replace(lab, edited=True), before, after, what)
+                        stack[k] = (replace(lab, edited=True), *rest)
         self._log_labels(item)
         self._labels_changed(item)
         return item.labels
@@ -1193,6 +1320,8 @@ class MotionScene:
                 raise ValueError(f"{item.label}: 이미 제거된 모션입니다")
             new.labels = item.labels  # under the lock: an edit made while it retargeted stays
             history = self.label_history.pop(item, None)
+            cuts = self.cuts.pop(item, None)  # the same file and times: its 시간 잘라내기 stays
+            splits = self.splits.pop(item, None)
             i = self.items.index(item)
             c = self.compare  # its place in the overlay comparison too (remove() would turn it off)
             was_on, was_ref, was_item = c.on, c.ref is item, c.item is item
@@ -1206,6 +1335,10 @@ class MotionScene:
                 c.on = was_on
             if history is not None:
                 self.label_history[new] = history
+            if cuts:
+                self.cuts[new] = cuts
+            if splits:
+                self.splits[new] = splits
             for k, it in enumerate(self.items):
                 it.handles["index"] = k
             self._build_item(new, i)

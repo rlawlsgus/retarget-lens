@@ -31,10 +31,11 @@ HUMAN_EXT = (".bvh", ".fbx")
 ROBOT_EXT = (".csv", ".pkl")
 MARKER_EXT = (".c3d",)  # raw optical markers: shown on the same take's retargeted robot
 # bump when retargeting output changes for the same input and settings (invalidates the cache)
-PIPELINE_VERSION = 9  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
+PIPELINE_VERSION = 10  # 2: CMU 60 Hz BVH timing; 3: SMPL-X via the derived T-pose config; 4: elbow / knee twist;
 # 5: feet levelled from the clip's stance, foot-flat through legs and pelvis height; 6: the robot's
 # parts from its model (robot_profile: joint centres, flex signs), any robot; 9: BVH names with spaces and a BOM,
-# classic Biped chest / bare root bone, interpolated LAFAN1 / Nokov above the source fps, mesh / round sole points
+# classic Biped chest / bare root bone, interpolated LAFAN1 / Nokov above the source fps, mesh / round sole points;
+# 10: FBX channels hold their first key before it (key-reduced exports no longer start with the static pose)
 MOTION_EXT = HUMAN_EXT + ROBOT_EXT + (".npz",) + MARKER_EXT
 # folders the viewer lists motions from (dev: data/raw, data/samples, data/retargeted,
 # data/uploads, reports; installed: see retlens.paths); uploads land in UPLOADS

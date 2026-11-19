@@ -501,6 +501,58 @@ def test_fbx_root_null_second_actor_and_prop_armature(tmp_path, monkeypatch):
         fbx.load_fbx(ascii_fbx)
 
 
+# Inside Blender: the importer's own rule (a channel's frames before its first key = the node's static value), then
+# FBX's (= that key's value) once blender_fbx_script.hold_first_keys has set it up.
+FIRST_KEYS = textwrap.dedent("""
+    import sys
+    import numpy as np
+    sys.path.insert(0, sys.argv[sys.argv.index("--") + 1])
+    import blender_fbx_script as script
+    import io_scene_fbx.import_fbx as importer
+
+    early = (np.array([0, 10, 40, 50], dtype=np.int64), np.array([1.0, 2.0, 3.0, 4.0]))  # keyed from the start
+    late = (np.array([40, 50], dtype=np.int64), np.array([170.0, 175.0]))  # leading keys dropped (key reduction)
+    static = [0.0, -4.0]  # the node's static values: a root that faces the other way
+    _, plain = importer._combine_curve_keyframe_times([early, late], static)
+    assert plain[1].tolist() == [-4.0, -4.0, 170.0, 175.0], plain
+    assert script.hold_first_keys() and script.hold_first_keys()  # set up once, asked twice
+    times, held = importer._combine_curve_keyframe_times([early, late], static)
+    assert times.tolist() == [0, 10, 40, 50] and held[0].tolist() == [1.0, 2.0, 3.0, 4.0], (times, held)
+    assert held[1].tolist() == [170.0, 170.0, 170.0, 175.0], held
+    print("FIRST_KEYS_OK")
+""")
+
+
+@pytest.mark.skipif(_blender() is None, reason="Blender not found")
+def test_fbx_channel_holds_its_first_key(tmp_path):
+    """A key-reduced export (MotionBuilder plot): the rotation channel's first key comes after the translation's.
+    FBX holds that first key before it; Blender's importer would read the static value there (a root turned 180
+    degrees for the first frames)."""
+    from retlens.io import fbx
+
+    script = tmp_path / "first_keys.py"
+    script.write_text(FIRST_KEYS, encoding="utf-8")
+    r = subprocess.run([_blender(), "-b", "--factory-startup", "--python-exit-code", "2", "--python", str(script), "--",
+                        os.path.dirname(fbx.SCRIPT)], capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and "FIRST_KEYS_OK" in r.stdout, r.stdout[-2000:] + r.stderr[-2000:]
+
+
+def test_fbx_warns_when_first_keys_are_not_held(monkeypatch):
+    """A Blender whose importer hold_first_keys could not set up: the motion says its first frames may be wrong."""
+    from retlens.io import fbx
+
+    eye = np.broadcast_to(np.eye(3), (3, 2, 3, 3)).copy()
+    raw = {"names": ["Hips", "Head"], "parents": np.array([-1, 0]), "positions": np.zeros((3, 2, 3)) + [0, 0, 1.0],
+           "frames": eye, "rest_positions": np.array([[0, 0, 1.0], [0, 0, 1.7]]), "rest_frames": eye[0], "fps": 30.0,
+           "frame_start": 0, "take": "t", "takes": ["t"], "reader": "Blender x FBX importer", "cache": "", "objects": [],
+           "armature": "a", "other_bones": []}
+    monkeypatch.setattr(fbx, "read_fbx", lambda path, take=None: {**raw, "first_keys_held": False})
+    (warning,) = fbx.load_fbx("clip.fbx", drop_tpose=False).meta["warnings"]
+    assert "첫 키" in warning
+    monkeypatch.setattr(fbx, "read_fbx", lambda path, take=None: {**raw, "first_keys_held": True})
+    assert "warnings" not in fbx.load_fbx("clip.fbx", drop_tpose=False).meta
+
+
 def test_empty_fbx_says_so_without_blender(tmp_path, monkeypatch):
     from retlens.io import fbx
 

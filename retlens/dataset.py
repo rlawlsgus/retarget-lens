@@ -135,19 +135,31 @@ def qc_bad_spans(robot, limits) -> list[tuple[float, float]]:
     return spans(check_robot(robot, QCConfig(), limits).hard_mask(), robot.fps, min_s=0.0)
 
 
-def pieces(frames: int, fps: float, cut: CutOptions | None, spans: list, range_s=None) -> dict:
+def pieces(frames: int, fps: float, cut: CutOptions | None, spans: list, range_s=None, removed=(), splits=()) -> dict:
     """{"ranges": [(i0, i1)], "cut_s": seconds taken out by the spans (and range), "short_s": seconds dropped as
-    pieces too short, "by_kind": {kind: seconds}} of a motion of `frames` frames."""
+    pieces too short, "by_kind": {kind: seconds}} of a motion of `frames` frames. removed: (start_s, end_s) spans
+    the user took out (타임라인 시간 잘라내기), exact like the range (no pad), not counted in cut_s. splits: times
+    (s) where a piece is cut in two with nothing taken out (파일 나누기)."""
     spans = list(spans) if cut is not None else []
     cut_by = cut_mask(frames, fps, spans, cut.pad_s if cut is not None else 0.0)
-    outside = np.zeros(frames, dtype=bool)
+    outside = cut_mask(frames, fps, [(float(a), float(b), "removed") for a, b in removed])
     lo, hi = 0.0, frames / fps
     if range_s is not None:  # the range itself is exact (no pad)
         lo, hi = max(0.0, float(range_s[0])), min(frames / fps, float(range_s[1]))
         if hi <= lo:
             raise ValueError(f"시간 범위가 비었습니다: {range_s[0]:g}–{range_s[1]:g}초 (모션 길이 {frames / fps:.2f}초)")
-        outside = cut_mask(frames, fps, [(-1.0, lo, "range"), (hi, frames / fps + 1.0, "range")])
+        outside |= cut_mask(frames, fps, [(-1.0, lo, "range"), (hi, frames / fps + 1.0, "range")])
     ranges, short = kept_ranges(cut_by | outside, fps, cut.min_piece_s if cut is not None else 0.0)
+    if splits:
+        at = sorted({int(round(float(t) * fps)) for t in splits})
+        parts = []
+        for i0, i1 in ranges:
+            for f in at:
+                if i0 < f < i1:
+                    parts.append((i0, f))
+                    i0 = f
+            parts.append((i0, i1))
+        ranges = parts
     by_kind: dict[str, float] = {}
     for a, b, k in spans:  # seconds per kind inside the range (before the pad; overlaps counted in each)
         by_kind[k] = round(by_kind.get(k, 0.0) + max(0.0, min(b, hi) - max(a, lo)), 3)
@@ -381,23 +393,37 @@ def clean_previous(out: str, keep=()) -> list[str]:
 # ------------------------------------------------------------------ one motion
 def export_motion(robot, out_dir: str, stem: str, *, labels=None, cut: CutOptions | None = None, qc_bad=(),
                   problems: dict | None = None, falls=(), range_s=None, formats=("npz",), info: dict | None = None,
-                  limits=None, qc: str = "FAIL", source: str | None = None, fk=None) -> dict:
+                  limits=None, qc: str = "FAIL", source: str | None = None, fk=None, removed=(),
+                  exact_name: bool = False, splits=(), names=None) -> dict:
     """구간 잘라 내보내기 of one robot motion into out_dir: the whole motion (or range_s of it), with cut the spans
     taken out and the rest in pieces; each piece kept when its QC is no worse than `qc` (with fk, an
-    analysis.FootKinematics, QC as the window gives it: the balance check too). info goes into each piece's
-    <name>.json. Raises before writing anything when a file would replace the motion's source file (`source`, or
-    robot.source, however the paths are spelled). Returns {"pieces": [...], "dropped": [...], "cut_s", "short_s",
-    "by_kind"}; a piece written as csv also has "csv_fps" and "csv_frames" (the csv is at CSV_FPS)."""
+    analysis.FootKinematics, QC as the window gives it: the balance check too). removed: (start_s, end_s) spans
+    taken out as they are (the timeline's 시간 잘라내기). exact_name: a single piece is named `stem` itself (다른 이름으로
+    저장), not <stem>_<start>-<end>s. splits: times where a piece is cut in two (파일 나누기). names: one file name per
+    piece (in time order; raises when the count differs). info goes into each piece's <name>.json. Raises before writing anything when a
+    file would replace the motion's source file (`source`, or robot.source, however the paths are spelled). Returns
+    {"pieces": [...], "dropped": [...], "cut_s", "short_s", "by_kind"}; a piece written as csv also has "csv_fps"
+    and "csv_frames" (the csv is at CSV_FPS)."""
     from .motion_labels import save_csv
     from .qc import QCConfig, add_balance_flags, check_robot
 
     T, fps = robot.num_frames, robot.fps
     spans = cut_spans(robot.duration, cut, qc_bad, problems, falls) if cut is not None else []
-    plan = pieces(T, fps, cut, spans, range_s)
+    plan = pieces(T, fps, cut, spans, range_s, removed, splits)
+    given = list(names) if names is not None else None
+    if given is not None and len(given) != len(plan["ranges"]):
+        raise ValueError(f"파일 이름 {len(given)}개와 나눈 조각 {len(plan['ranges'])}개의 수가 다릅니다")
+    order = {r: k for k, r in enumerate(plan["ranges"])}
+
+    def piece(i0, i1):
+        if given is not None:
+            return given[order[(i0, i1)]]
+        return stem if exact_name and len(plan["ranges"]) == 1 else piece_name(stem, i0, i1, T, fps)
+
     real: dict = {}  # the source by its real path and by its folder's (a file symlink: written through, or over)
     mine = {k for p in (source, robot.source) if p for k in (path_key(p), path_key(p, real))}
     for i0, i1 in plan["ranges"]:  # the whole motion keeps its name: never written over the file it came from
-        base = os.path.join(out_dir, piece_name(stem, i0, i1, T, fps))
+        base = os.path.join(out_dir, piece(i0, i1))
         names = [f"{base}.{fmt}" for fmt in formats] + [base + ".json"]
         for p in names + ([base + ".labels.csv"] if labels is not None else []):
             if path_key(p, real) in mine:
@@ -405,7 +431,7 @@ def export_motion(robot, out_dir: str, stem: str, *, labels=None, cut: CutOption
     written, dropped = [], []
     for i0, i1 in plan["ranges"]:
         part = slice_motion(robot, i0, i1)
-        name = piece_name(stem, i0, i1, T, fps)
+        name = piece(i0, i1)
         part.name = name
         r = check_robot(part, QCConfig(), limits)
         if fk is not None and part.num_frames >= 2:  # standing with the CoM outside the feet (compare.compute_metrics)
@@ -435,6 +461,8 @@ def export_motion(robot, out_dir: str, stem: str, *, labels=None, cut: CutOption
                        **({"csv_fps": entry["csv_fps"], "csv_frames": entry["csv_frames"]} if "csv_fps" in entry else {}),
                        "robot": robot.meta.get("robot_ident"), "qc": r.status,
                        "cut": asdict(cut) if cut is not None else None, "range_s": list(range_s) if range_s else None,
+                       **({"removed_s": [[round(float(a), 4), round(float(b), 4)] for a, b in removed]} if removed else {}),
+                       **({"splits_s": [round(float(t), 4) for t in splits]} if splits else {}),
                        **(info or {})}, f, ensure_ascii=False, indent=1, default=_json_default)
         written.append(entry)
     return {"pieces": written, "dropped": dropped, "cut_s": plan["cut_s"], "short_s": plan["short_s"],

@@ -550,6 +550,67 @@ def test_label_edits_undo_and_save(scene, tmp_path, monkeypatch):
             scene.remove(it)
 
 
+def test_cut_time_is_an_undo_step(scene, monkeypatch):
+    """시간 잘라내기: spans on frames, joined when they touch, an undo step with the label edits; kept_spans is the
+    rest; it follows the motion when retargeted again and goes when it is removed."""
+    a = scene.add(SAMPLE)
+    try:
+        dur, fps = a.robot.duration, a.robot.fps
+        assert scene.cut_spans(a) == () and scene.kept_spans(a) == [(0.0, dur)]
+        assert scene.cut_time(a, dur - 0.5, dur + 3.0, "끝 잘라내기")  # past the end: up to the end
+        assert scene.cut_spans(a) == ((round(round((dur - 0.5) * fps) / fps, 6), round(dur, 6)),)
+        assert not scene.cut_time(a, dur - 0.4, dur - 0.2)  # inside what is cut: nothing changes, no step
+        assert not scene.cut_time(a, 0.2, 0.2 + 0.2 / fps)  # less than a frame
+        assert scene.cut_time(a, 0.2, 0.4)
+        assert scene.cut_time(a, 0.4, 0.6)  # touches the one before: one span
+        (s0, e0), (s1, _e1) = scene.cut_spans(a)
+        assert (s0, e0) == (0.2, 0.6) and s1 == scene.cut_spans(a)[1][0]
+        assert scene.kept_spans(a) == [(0.0, 0.2), (0.6, s1)]
+        assert scene.label_undo_text(a) == ("시간 잘라내기", None)
+        assert scene.undo_labels(a) == ("시간 잘라내기", None)
+        assert scene.cut_spans(a) == ((0.2, 0.4), (s1, round(dur, 6)))
+        scene.undo_labels(a, redo=True)
+        assert scene.cut_spans(a)[0] == (0.2, 0.6)
+        a.retarget = {"foot_flat": False, "swing_clearance_cm": 0.0, "self_collision": False}
+        monkeypatch.setattr(scene, "_load_with", lambda item, ff, sw, sc: scene_module_load(item))
+        cuts = scene.cut_spans(a)
+        b = scene.retarget_again(a, foot_flat=True)
+        assert scene.cut_spans(b) == cuts and a not in scene.cuts
+        assert scene.clear_cuts(b) and scene.cut_spans(b) == () and not scene.clear_cuts(b)
+        assert scene.undo_labels(b) == ("시간 잘라내기 모두 취소", None) and scene.cut_spans(b) == cuts
+        scene.remove(b)
+        assert b not in scene.cuts
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)
+
+
+def test_split_file_is_an_undo_step(scene):
+    """파일 나누기: points on frames inside the motion, an undo step with the cuts; parts() is the kept time cut at
+    them (a point inside cut time does nothing); it goes when the motion is removed."""
+    a = scene.add(SAMPLE)
+    try:
+        dur, fps = a.robot.duration, a.robot.fps
+        assert scene.parts(a) == [(0.0, dur)]
+        assert not scene.split_file(a, 0.0) and not scene.split_file(a, dur)  # at the ends: nothing to split
+        assert scene.split_file(a, 1.0) and not scene.split_file(a, 1.0 + 0.2 / fps)  # already there
+        assert scene.split_file(a, 0.5)
+        assert scene.split_points(a) == (0.5, 1.0) and scene.parts(a) == [(0.0, 0.5), (0.5, 1.0), (1.0, dur)]
+        assert scene.cut_time(a, 0.8, 1.2)  # the split at 1.0 is inside the cut: two parts
+        assert scene.parts(a) == [(0.0, 0.5), (0.5, 0.8), (1.2, dur)]
+        assert scene.undo_labels(a) == ("시간 잘라내기", None) and scene.split_points(a) == (0.5, 1.0)
+        assert scene.undo_labels(a) == ("파일 나누기", None) and scene.split_points(a) == (1.0,)
+        assert scene.unsplit(a, 0.9) and scene.split_points(a) == ()
+        assert not scene.unsplit(a)
+        scene.undo_labels(a)
+        assert scene.split_points(a) == (1.0,)
+        scene.remove(a)
+        assert a not in scene.splits
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)
+
+
 def scene_module_load(item):
     """A retarget stand-in: the same motion again (test_label_edits_undo_and_save)."""
     import copy

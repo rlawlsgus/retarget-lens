@@ -26,6 +26,8 @@ its fingers' first bodies when it has jointed fingers (that body sits at the wri
 
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 
 from .motion import ObjectTrack, RobotMotion, SkeletonMotion
@@ -95,14 +97,15 @@ def robot_hands(r: RobotMotion, fk) -> np.ndarray:
     idx = [col.get(n) for n in fk.joint_names]
     q = model.qpos0.copy()
     out = np.zeros((r.num_frames, 2, 3))
-    for t in range(r.num_frames):
-        q[:3], q[3:7] = r.root_pos[t], r.root_quat[t]
-        q[7:] = [r.dof_pos[t, i] if i is not None else 0.0 for i in idx]
-        data.qpos[:] = q
-        mj.mj_kinematics(model, data)
-        for s in range(2):
-            p = data.xpos[bodies[s]]
-            out[t, s] = p + 0.5 * (data.xpos[fingers[s]].mean(axis=0) - p) if fingers[s] else p
+    with getattr(fk, "lock", None) or contextlib.nullcontext():  # the window's one MjData: shared by threads
+        for t in range(r.num_frames):
+            q[:3], q[3:7] = r.root_pos[t], r.root_quat[t]
+            q[7:] = [r.dof_pos[t, i] if i is not None else 0.0 for i in idx]
+            data.qpos[:] = q
+            mj.mj_kinematics(model, data)
+            for s in range(2):
+                p = data.xpos[bodies[s]]
+                out[t, s] = p + 0.5 * (data.xpos[fingers[s]].mean(axis=0) - p) if fingers[s] else p
     return out
 
 

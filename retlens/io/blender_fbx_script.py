@@ -35,13 +35,63 @@ import sys
 import bpy
 import numpy as np
 
-VERSION = 3  # 2: objects; 3: an armature's root null is no object, the other armatures' bones (xb_*)
-PROPS_VERSION = 3  # 2: every empty, parents across bones / empties, takes, key_fps; 3: take slots, armature children
+VERSION = 4  # 2: objects; 3: an armature's root null is no object, the other armatures' bones (xb_*);
+# 4: a channel holds its first key before that key (hold_first_keys)
+PROPS_VERSION = 4  # 2: every empty, parents across bones / empties, takes, key_fps; 3: take slots, armature children;
+# 4: a channel holds its first key before that key (hold_first_keys)
 
 
 def fail(msg):
     print(f"[blender_fbx] ERROR: {msg}", flush=True)
     sys.exit(2)
+
+
+def hold_first_keys():
+    """Make Blender's FBX importer hold a curve's first key before that key, as FBX does.
+
+    FBX evaluates a curve before its first key as that key's value (constant pre-extrapolation, the FBX SDK
+    default: MotionBuilder, Maya and Unreal show the file that way). Blender's importer puts the curves of a
+    node's translation / rotation / scaling on common key times and fills a channel's frames before its own
+    first key with the node's static value instead (import_fbx._combine_curve_keyframe_times:
+    np.interp(..., left=initial_value)). A key-reduced export (a MotionBuilder plot whose leading keys of a
+    channel were dropped because the value did not change) then starts with frames of the static pose: a root
+    that faces another way for the first frames, a limb that jumps at its first key. Giving the importer each
+    curve's first key as that "initial value" reads the file as FBX does; nothing else changes (rest pose,
+    frames from the first key on, channels without a curve).
+
+    Returns whether the importer was set up (False: a Blender whose importer has no such function; the file
+    then reads as that Blender reads it).
+    """
+    try:
+        import io_scene_fbx.import_fbx as importer
+    except Exception:  # no Python FBX importer in this Blender
+        return False
+    if getattr(importer, "_retlens_holds_first_keys", False):
+        return True
+    combine = getattr(importer, "_combine_curve_keyframe_times", None)
+    if combine is None:
+        return False
+
+    def combine_holding_first_keys(times_and_values_tuples, initial_values):
+        first = [values[0] if len(values) else initial
+                 for (_, values), initial in zip(times_and_values_tuples, initial_values)]
+        return combine(times_and_values_tuples, first)
+
+    importer._combine_curve_keyframe_times = combine_holding_first_keys
+    importer._retlens_holds_first_keys = True
+    return True
+
+
+def import_fbx(src):
+    """Import the file into the (emptied) scene, keys read by FBX's rule (hold_first_keys). Returns whether
+    that rule could be set up in this Blender."""
+    held = hold_first_keys()
+    if not held:
+        print("[blender_fbx] WARNING: this Blender's FBX importer could not be set to hold first keys; the frames "
+              "before a channel's first key read as the node's static value", flush=True)
+    bpy.ops.import_scene.fbx(filepath=src, use_anim=True, anim_offset=0.0, automatic_bone_orientation=False,
+                             ignore_leaf_bones=False, use_custom_props=False)
+    return held
 
 
 def armature_with_action(required=True):
@@ -103,8 +153,7 @@ def object_mesh(o):
 
 def dump(src, out, take=""):
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    bpy.ops.import_scene.fbx(filepath=src, use_anim=True, anim_offset=0.0, automatic_bone_orientation=False,
-                             ignore_leaf_bones=False, use_custom_props=False)
+    held = import_fbx(src)
     arm = armature_with_action(required=False)
     actions = [a.name for a in bpy.data.actions]
     scene = bpy.context.scene
@@ -159,6 +208,7 @@ def dump(src, out, take=""):
     np.savez(out, names=np.array(names, dtype=str), parents=np.array(parents, dtype=np.int64), mats=mats, rest=rest,
              fps=fps, frame_start=f0, take=act.name if act is not None else "", takes=np.array(actions, dtype=str),
              armature=arm.name if arm is not None else "", blender=bpy.app.version_string, script_version=VERSION,
+             first_keys_held=held,
              obj_names=np.array([o.name for o in objs], dtype=str), obj_kinds=np.array([o.type.lower() for o in objs], dtype=str),
              obj_mats=obj_mats, obj_vert_start=nv, obj_face_start=nf,
              obj_verts=np.concatenate([v for v, _ in meshes]) if objs else np.zeros((0, 3)),
@@ -206,8 +256,7 @@ def dump_props(src, out, take=""):
     """Every node of a props-only file, raw: which ones make a prop is decided in retlens.props. take: the
     animation stack to sample (default: the one the importer assigned, the file's first)."""
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    bpy.ops.import_scene.fbx(filepath=src, use_anim=True, anim_offset=0.0, automatic_bone_orientation=False,
-                             ignore_leaf_bones=False, use_custom_props=False)
+    held = import_fbx(src)
     scene = bpy.context.scene
     fps = scene.render.fps / scene.render.fps_base
     objs = sorted(scene.objects, key=lambda o: o.name)
@@ -290,7 +339,7 @@ def dump_props(src, out, take=""):
     nf = np.cumsum([0] + [len(f) for _, f in meshes])
     col = lambda k, dtype=str: np.array([t[k] for t in tracks], dtype=dtype)  # noqa: E731
     np.savez(out, fps=fps, key_fps=scene.render.fps, frame_start=f0, blender=bpy.app.version_string,
-             script_version=PROPS_VERSION, take=chosen, takes=np.array(stacks, dtype=str),
+             script_version=PROPS_VERSION, first_keys_held=held, take=chosen, takes=np.array(stacks, dtype=str),
              obj_names=col("name"), obj_kinds=col("kind"), obj_groups=col("group"),
              obj_parents=np.array(parents, dtype=np.int64), obj_binds=col("bind"),
              obj_children=col("children", np.int64), obj_below_mesh=col("below_mesh", bool),
