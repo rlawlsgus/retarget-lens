@@ -24,7 +24,8 @@ deleted outside RetLens's own folders. Install / update / uninstall work only in
 (paths.FROZEN); from the source tree only the check works.
 
 Test overrides (honoured only from the source tree or with RETLENS_TEST=1): RETLENS_INSTALL_DIR,
-RETLENS_START_MENU_DIR, RETLENS_DESKTOP_DIR, RETLENS_NO_REGISTRY=1, RETLENS_UPDATE_API (localhost only).
+RETLENS_START_MENU_DIR, RETLENS_DESKTOP_DIR, RETLENS_NO_REGISTRY=1, RETLENS_UPDATE_PAGE (a stand-in for the
+repository's github.com pages) and RETLENS_UPDATE_API (the API path instead), localhost only.
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ ASSET_RE = re.compile(r"^RetLens-(\d{1,4}\.\d{1,4}\.\d{1,4})-win64\.zip$")
 # a zip the user downloaded: browsers save a second copy as "... (1).zip"
 LOCAL_ZIP_RE = re.compile(r"^RetLens-(\d{1,4}\.\d{1,4}\.\d{1,4})-win64(?: ?\(\d+\))?\.zip$", re.IGNORECASE)
 SHA_LINE_RE = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(\S+)\s*$")
+PAGE_TAG_RE = re.compile(r"/releases/tag/(v\d{1,4}\.\d{1,4}\.\d{1,4})/?$")
 SHIPPED = ("RetLens.exe", "retlens-cli.exe", "retlens-update.exe", "_internal")
 MARKER, STAMP, MANIFEST = helper.MARKER, helper.STAMP, helper.MANIFEST
 UNINSTALL_KEY = helper.UNINSTALL_KEY
@@ -514,19 +516,45 @@ def api_url() -> tuple[str, frozenset]:
     return API_LATEST, frozenset()
 
 
+def page_base() -> tuple[str, frozenset]:
+    """(the repository's web address, extra allowed hosts): github.com, or a localhost test server
+    (RETLENS_UPDATE_PAGE) standing in for it."""
+    o = os.environ.get("RETLENS_UPDATE_PAGE")
+    if o and _testing():
+        host = (urllib.parse.urlsplit(o).hostname or "").lower()
+        if host in ("127.0.0.1", "localhost"):
+            return o.rstrip("/"), frozenset({host})
+    return f"https://github.com/{REPO}", frozenset()
+
+
+def allowed_extra() -> frozenset:
+    """The test servers' hosts allowed besides GitHub (none outside tests)."""
+    return api_url()[1] | page_base()[1]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Hands a redirect back as it is (its Location is the answer)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def opener(extra_hosts: frozenset = frozenset()) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_GitHubOnly(extra_hosts))
 
 
-def _get(url: str, extra: frozenset, headers: dict | None = None, timeout: float = 10.0, limit: int = 1 << 21):
-    """(status, headers, body bytes) of a GET through the GitHub-only opener; HTTP errors return their status."""
+def _get(url: str, extra: frozenset, headers: dict | None = None, timeout: float = 10.0, limit: int = 1 << 21,
+         method: str = "GET", follow: bool = True):
+    """(status, headers, body bytes) of a request through the GitHub-only opener (follow=False: a redirect comes
+    back as its status, with its Location); HTTP errors return their status."""
     if not url_allowed(url, extra):
         raise UpdateError(f"허용되지 않은 주소입니다: {urllib.parse.urlsplit(url).hostname}")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json",
-                                               **(headers or {})})
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT,
+                                                              "Accept": "application/vnd.github+json", **(headers or {})})
+    o = opener(extra) if follow else urllib.request.build_opener(_NoRedirect())
     try:
-        with opener(extra).open(req, timeout=timeout) as r:
-            return r.status, r.headers, r.read(limit + 1)[:limit]
+        with o.open(req, timeout=timeout) as r:
+            return r.status, r.headers, (r.read(limit + 1)[:limit] if method != "HEAD" else b"")
     except urllib.error.HTTPError as e:
         return e.code, e.headers, b""
     except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as e:
@@ -549,6 +577,15 @@ def _rate_limited(status: int, headers) -> UpdateError | None:
             at, reset = time.time() + 3600, "잠시 뒤"
         err = UpdateError(f"GitHub 요청 한도에 걸렸습니다(같은 네트워크 주소에서 시간당 60번, 다른 사람의 요청 포함). "
                           f"{reset} 이후에 다시 확인하세요")
+        err.retry_at = at
+        return err
+    if status == 429:  # the web pages' own limit (much higher; says when in Retry-After, if at all)
+        try:
+            at = time.time() + max(60.0, float((headers or {}).get("Retry-After") or 900))
+        except (TypeError, ValueError):
+            at = time.time() + 900
+        err = UpdateError(f"GitHub가 잠시 요청을 막았습니다. {time.strftime('%H:%M', time.localtime(at))} 이후에 다시 "
+                          "확인하세요")
         err.retry_at = at
         return err
     return None
@@ -614,9 +651,88 @@ class Check:
         return d
 
 
+class _PageChanged(UpdateError):
+    """github.com answered the release page in a way this does not know (then the API is asked instead)."""
+
+
 def check_latest(etag: str | None = None, cached: dict | None = None, timeout: float = 10.0) -> Check:
     """The latest release on GitHub and whether it is newer than this program (and the installed one, from a
-    portable copy). etag + cached: the previous answer, reused on 304 (which does not count against the limit)."""
+    portable copy). Asked from GitHub's web pages (check_page), not its API: the API takes 60 requests an hour from
+    one network address without a sign-in, shared by everyone in an office behind it. The API is asked only when
+    the pages answer in a way not known (or for tests, RETLENS_UPDATE_API); etag + cached are for that path."""
+    if not (os.environ.get("RETLENS_UPDATE_API") and _testing()):
+        res = check_page(timeout)
+        if not isinstance(res, _PageChanged):
+            return res
+    return check_api(etag, cached, timeout)
+
+
+def _base_version() -> tuple[str, dict | None, str]:
+    """(this program's version, the installed copy's info when this is a portable copy, the newer of the two)."""
+    current = running_version()
+    inst = installed_info() if is_portable() else None
+    return current, inst, max([v for v in (current, (inst or {}).get("version")) if parse_version(v)],
+                              key=parse_version)
+
+
+def check_page(timeout: float = 10.0) -> "Check | _PageChanged":
+    """The latest release from github.com's pages: /releases/latest redirects to /releases/tag/v<version> (drafts
+    and pre-releases never are "latest"); the zip's checksum is the release's .sha256 file and its size the zip's
+    Content-Length (both release downloads, which the API limit does not count). The notes are not read (only the
+    API gives them): the dialog links the release page. A _PageChanged when the redirect is not what it should be."""
+    current, inst, base = _base_version()
+    res = Check(current=current, installed_version=(inst or {}).get("version"))
+    root, extra = page_base()
+    try:
+        status, headers, _b = _get(root + "/releases/latest", extra, {"Accept": "text/html"}, timeout, limit=0,
+                                   follow=False)
+        if status in (301, 302, 303, 307, 308):
+            where = urllib.parse.urljoin(root + "/releases/latest", (headers or {}).get("Location") or "")
+            path = urllib.parse.urlsplit(where).path
+            m = PAGE_TAG_RE.search(path)
+            if m is None:
+                if path.rstrip("/").endswith("/releases"):  # no release yet: GitHub shows the (empty) list
+                    raise UpdateError("공개된 릴리즈가 없습니다")
+                return _PageChanged(f"releases/latest -> {path}")
+            tag = m.group(1)
+        elif status == 404:
+            raise UpdateError("공개된 릴리즈가 없습니다")
+        else:
+            err = _rate_limited(status, headers)
+            if err:
+                raise err
+            return _PageChanged(f"releases/latest: HTTP {status}")
+        v = tag[1:]
+        name = f"RetLens-{v}-win64.zip"
+        url = f"{root}/releases/download/{tag}/{name}"
+        st, h, txt = _get(url + ".sha256", extra, {"Accept": "application/octet-stream"}, timeout, limit=1024)
+        if st == 404:
+            raise UpdateError(f"릴리즈 {tag}에 {name}.sha256이 없습니다(파일을 올리는 중이면 잠시 뒤 다시 확인하세요)")
+        if st != 200:
+            raise _rate_limited(st, h) or UpdateError(f"GitHub가 HTTP {st}로 답했습니다")
+        sha = parse_sha256_file(txt.decode("ascii", "replace"), name)
+        if sha is None:
+            raise UpdateError(f"릴리즈 {tag}의 .sha256 파일에 {name}의 체크섬이 없습니다")
+        st, h, _b = _get(url, extra, {"Accept": "application/octet-stream"}, timeout, method="HEAD")
+        if st == 404:
+            raise UpdateError(f"릴리즈 {tag}에 {name}이 없습니다(파일을 올리는 중이면 잠시 뒤 다시 확인하세요)")
+        try:
+            size = int((h or {}).get("Content-Length") or 0) if st == 200 else 0
+        except (TypeError, ValueError):
+            size = 0
+        page = f"{root}/releases/tag/{tag}"
+        res.latest = Release(version=v, tag=tag, name=f"RetLens {v}", page=page, asset_name=name, asset_url=url,
+                             size=size, sha256=sha,
+                             notes=f"바뀐 점은 [GitHub 릴리즈 페이지]({page})에서 볼 수 있습니다.")
+        res.newer = is_newer(v, base)
+    except UpdateError as e:
+        res.error, res.retry_at = str(e), getattr(e, "retry_at", None)
+    return res
+
+
+def check_api(etag: str | None = None, cached: dict | None = None, timeout: float = 10.0) -> Check:
+    """The latest release from GitHub's API (the release notes too). etag + cached: the previous answer, reused on
+    304 (which does not count against the limit)."""
     current = running_version()
     inst = installed_info() if is_portable() else None
     base = max([v for v in (current, (inst or {}).get("version")) if parse_version(v)], key=parse_version)
@@ -703,7 +819,7 @@ def download(rel: Release, progress: Progress | None = None, cancel: threading.E
         return rel.local_zip
     if not rel.sha256 or not re.fullmatch(r"[0-9a-f]{64}", rel.sha256):
         raise UpdateError("이 릴리즈에는 체크섬이 없어 업데이트하지 않습니다")
-    _url, extra = api_url()
+    extra = allowed_extra()
     if not url_allowed(rel.asset_url, extra):
         raise UpdateError("릴리즈 파일 주소가 GitHub가 아닙니다")
     os.makedirs(downloads_dir(), exist_ok=True)

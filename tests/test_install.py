@@ -138,7 +138,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    do_HEAD = do_GET
 
 
 @pytest.fixture
@@ -173,6 +176,40 @@ def test_check_latest_newer_etag_rate_limit_and_redirects(server, places):
     srv.routes["/latest"] = (200, {}, json.dumps(release_json(tag="v0.0.1")).encode())
     old = install.check_latest()
     assert old.error is None and not old.newer  # older than this program: nothing to do
+
+
+def test_check_from_the_release_pages_not_the_api(server, places, monkeypatch):
+    """The check asks github.com's pages (no API, so no 60-an-hour limit): /releases/latest's redirect gives the tag,
+    the .sha256 download the checksum, a HEAD of the zip its size; a missing file, no release, the pages' own limit
+    and a redirect it does not know (then the API) each answered."""
+    srv, base = server
+    monkeypatch.delenv("RETLENS_UPDATE_API")
+    monkeypatch.setenv("RETLENS_UPDATE_PAGE", base + "/repo")
+    name = "RetLens-99.0.0-win64.zip"
+    srv.routes["/repo/releases/latest"] = (302, {"Location": base + "/repo/releases/tag/v99.0.0"}, b"")
+    srv.routes[f"/repo/releases/download/v99.0.0/{name}.sha256"] = (200, {}, f"{SHA}  {name}\n".encode())
+    srv.routes[f"/repo/releases/download/v99.0.0/{name}"] = (200, {"Content-Length": "466"}, b"x" * 466)
+    chk = install.check_latest()
+    assert chk.error is None and chk.newer and chk.latest.version == "99.0.0" and chk.latest.sha256 == SHA
+    assert chk.latest.size == 466 and chk.latest.asset_url == f"{base}/repo/releases/download/v99.0.0/{name}"
+    assert chk.latest.page.endswith("/releases/tag/v99.0.0") and chk.latest.page in chk.latest.notes
+    del srv.routes[f"/repo/releases/download/v99.0.0/{name}.sha256"]  # not uploaded yet
+    assert ".sha256" in install.check_latest().error
+    srv.routes[f"/repo/releases/download/v99.0.0/{name}.sha256"] = (200, {}, f"{SHA}  other.zip\n".encode())
+    assert "체크섬" in install.check_latest().error
+    srv.routes["/repo/releases/latest"] = (302, {"Location": base + "/repo/releases"}, b"")
+    assert "릴리즈가 없습니다" in install.check_latest().error
+    srv.routes["/repo/releases/latest"] = (429, {"Retry-After": "120"}, b"")
+    limited = install.check_latest()
+    assert limited.error and limited.retry_at and limited.retry_at > time.time() + 60
+    srv.routes["/repo/releases/latest"] = (302, {"Location": "https://evil.example/x/releases/tag/v99.0.0"}, b"")
+    assert install.check_latest().latest is None  # GitHub's pages answered oddly: the API is asked (none here)
+    srv.routes["/repo/releases/latest"] = (302, {"Location": base + "/repo/releases/tag/v0.0.1"}, b"")
+    srv.routes["/repo/releases/download/v0.0.1/RetLens-0.0.1-win64.zip.sha256"] = \
+        (200, {}, f"{SHA}  RetLens-0.0.1-win64.zip\n".encode())
+    srv.routes["/repo/releases/download/v0.0.1/RetLens-0.0.1-win64.zip"] = (200, {}, b"")  # no Content-Length
+    old = install.check_latest()
+    assert old.error is None and not old.newer and old.latest.size == 0  # older; no zip size: still a release
 
 
 # ------------------------------------------------------------------ staging
