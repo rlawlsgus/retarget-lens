@@ -282,6 +282,29 @@ def test_helper_swaps_after_the_parent_exits_and_keeps_user_files(places, tmp_pa
     assert install.folder_version(install_dir) == "9.9.9" and os.path.isdir(os.path.join(install_dir, "GMT"))
     assert os.path.isdir(res["old"]) and install.folder_version(res["old"]) == "1.0.0" and not os.path.exists(staged)
     assert "waiting for RetLens to exit" in res["_log"] and not os.path.exists(tmp_path / "user" / "pending.json")
+    assert "progress: 프로그램 파일을 바꾸는 중입니다" in res["_log"]  # the progress window's lines (no UI: logged)
+
+
+def test_a_retlens_started_during_a_swap_does_not_start(places, monkeypatch):
+    """swap_in_progress: a journal and a running helper, and this RetLens not started by it, mean another window
+    would hold the folder being swapped; the one the helper starts (or a stale journal, or no helper) goes on."""
+    from retlens.app import runtime
+
+    me, parent = os.getpid(), 4242
+    table = {me: (parent, "RetLens.exe"), parent: (1, "explorer.exe"), 777: (parent, "retlens-update-1-ab.exe")}
+    monkeypatch.setattr(install, "process_table", lambda: table)
+    assert not install.swap_in_progress()  # no journal
+    helper.write_json(install.journal_path(), {"phase": "start"})
+    assert install.swap_in_progress() and runtime._update_running()
+    table[me] = (777, "RetLens.exe")  # started by the helper: the new version, or the old one put back
+    assert not install.swap_in_progress()
+    table[me] = (parent, "RetLens.exe")
+    del table[777]  # the helper is gone: a cut-off swap is for the recovery, not a reason to stay closed
+    assert not install.swap_in_progress()
+    table[777] = (parent, "retlens-update-1-ab.exe")
+    old = time.time() - install.SWAP_GUARD_S - 60
+    os.utime(install.journal_path(), (old, old))
+    assert not install.swap_in_progress()
 
 
 @needs_windows

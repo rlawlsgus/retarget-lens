@@ -298,6 +298,37 @@ class _PROCESSENTRY32W(ctypes.Structure):
 
 def parent_pids() -> dict[int, int]:
     """{pid: parent pid} of every process (a Toolhelp snapshot)."""
+    return {pid: pp for pid, (pp, _name) in process_table().items()}
+
+
+SWAP_GUARD_S = 2 * 3600  # a journal older than this is a swap cut off long ago (sign-in recovery), not one running
+
+
+def swap_in_progress() -> bool:
+    """An update helper is putting a new version in the program folder right now (its journal is there and a
+    retlens-update runs), and this RetLens was not started by it (the new version it starts, or the old one it puts
+    back). Another RetLens started meanwhile would hold the folder and keep the swap from finishing."""
+    if os.name != "nt":
+        return False
+    try:
+        if time.time() - os.path.getmtime(journal_path()) > SWAP_GUARD_S:
+            return False
+    except OSError:
+        return False
+    procs = process_table()
+    helpers = {pid for pid, (_pp, name) in procs.items() if name.lower().startswith("retlens-update")}
+    if not helpers:
+        return False
+    p, steps = procs.get(os.getpid(), (0, ""))[0], 0
+    while p and steps < 4:  # started by a helper (directly, or through a launcher in between)
+        if p in helpers:
+            return False
+        p, steps = procs.get(p, (0, ""))[0], steps + 1
+    return True
+
+
+def process_table() -> dict[int, tuple[int, str]]:
+    """{pid: (parent pid, program file name)} of every process (a Toolhelp snapshot)."""
     if os.name != "nt":
         return {}
     k32 = ctypes.windll.kernel32
@@ -311,7 +342,7 @@ def parent_pids() -> dict[int, int]:
         e.dwSize = ctypes.sizeof(e)
         ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(e))
         while ok:
-            out[int(e.th32ProcessID)] = int(e.th32ParentProcessID)
+            out[int(e.th32ProcessID)] = (int(e.th32ParentProcessID), e.szExeFile)
             ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(e))
     finally:
         k32.CloseHandle(ctypes.c_void_p(snap))

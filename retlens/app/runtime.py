@@ -139,6 +139,8 @@ def install_error_hooks() -> None:
 def main(argv=None) -> int:
     """Entry point of RetLens (packaged exe and tools/editor.py)."""
     setup_logging()
+    if _update_running():
+        return 0
     try:  # a native crash (heap corruption, access violation) also leaves a minidump next to the logs
         from .. import crashdump
 
@@ -176,6 +178,31 @@ def main(argv=None) -> int:
     finally:
         _after_exit(code)
     return code
+
+
+UPDATING = ("RetLens 업데이트를 적용하는 중입니다.\n\n끝나면 새 버전이 저절로 시작됩니다. 잠시 기다려 주세요. "
+            "지금 RetLens를 실행하면 업데이트가 프로그램 파일을 바꾸지 못합니다.")
+
+
+def _update_running() -> bool:
+    """An update is swapping the program folder (retlens.install.swap_in_progress): say so and do not start (this
+    window would hold the folder it is replacing)."""
+    try:
+        from ..install import swap_in_progress
+
+        if not swap_in_progress():
+            return False
+    except Exception:
+        return False
+    print(f"[{APP_NAME}] an update is being applied: not started", flush=True)
+    if os.name == "nt" and not os.environ.get("RETLENS_UPDATE_NO_UI"):
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(None, UPDATING, f"{APP_NAME} 업데이트", 0x40 | 0x40000 | 0x10000)
+        except Exception:
+            pass
+    return True
 
 
 def _after_exit(code: int) -> None:

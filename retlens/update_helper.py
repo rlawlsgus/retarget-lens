@@ -243,11 +243,128 @@ def set_runonce(command: str | None) -> None:
         log(f"RunOnce: {e}")
 
 
+class Progress:
+    """A small window that says the update is being applied (RetLens is gone and the new one is not up yet: without
+    it nothing shows for a minute or more, and the user starts RetLens again, which holds the folder). Its own thread
+    runs the window; set() changes the line, close() ends it. Nothing when there is no desktop (tests, no UI)."""
+
+    W, H = 460, 130
+
+    def __init__(self, text: str):
+        self.hwnd = None
+        self._label = None
+        self._ready = None
+        if os.name != "nt" or os.environ.get("RETLENS_UPDATE_NO_UI"):
+            return
+        import threading
+
+        self._ready = threading.Event()
+        self._text = text
+        threading.Thread(target=self._run, daemon=True).start()
+        self._ready.wait(5.0)
+
+    def _run(self) -> None:
+        try:
+            from ctypes import wintypes
+
+            u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            u32.DefWindowProcW.restype = LRESULT
+            u32.CreateWindowExW.restype = wintypes.HWND
+            u32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                            wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+            u32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            u32.SendMessageW.restype = LRESULT
+            k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+            def proc(hwnd, msg, wp, lp):
+                if msg == 0x0010:  # WM_CLOSE: only close() ends it (the user cannot stop an update half way)
+                    if getattr(self, "_closing", False):
+                        u32.DestroyWindow(hwnd)
+                    return 0
+                if msg == 0x0002:  # WM_DESTROY
+                    u32.PostQuitMessage(0)
+                    return 0
+                return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+            self._proc = WNDPROC(proc)  # kept alive with the window
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                            ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE),
+                            ("hIcon", wintypes.HICON), ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                            ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+            inst = k32.GetModuleHandleW(None)
+            wc = WNDCLASSW()
+            wc.lpfnWndProc = self._proc
+            wc.hInstance = inst
+            wc.hCursor = u32.LoadCursorW(None, 32650)  # IDC_APPSTARTING (busy arrow)
+            wc.hbrBackground = 16  # COLOR_BTNFACE + 1
+            wc.lpszClassName = "RetLensUpdateProgress"
+            u32.RegisterClassW(ctypes.byref(wc))
+            sx, sy = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+            style = 0x00C00000 | 0x00080000 | 0x10000000  # WS_CAPTION | WS_SYSMENU | WS_VISIBLE
+            self.hwnd = u32.CreateWindowExW(0x00000008, wc.lpszClassName, TITLE, style,  # WS_EX_TOPMOST
+                                            (sx - self.W) // 2, (sy - self.H) // 2, self.W, self.H,
+                                            None, None, inst, None)
+            self._label = u32.CreateWindowExW(0, "STATIC", self._text, 0x50000000,  # WS_CHILD | WS_VISIBLE
+                                              20, 20, self.W - 50, self.H - 60, self.hwnd, None, inst, None)
+            font = ctypes.windll.gdi32.GetStockObject(17)  # DEFAULT_GUI_FONT
+            u32.SendMessageW(self._label, 0x0030, font, 1)  # WM_SETFONT
+            u32.SetForegroundWindow(self.hwnd)
+            self._ready.set()
+            msg = wintypes.MSG()
+            while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u32.TranslateMessage(ctypes.byref(msg))
+                u32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as e:
+            log(f"progress window: {e}")
+        finally:
+            self.hwnd = None
+            if self._ready is not None:
+                self._ready.set()
+
+    def set(self, text: str) -> None:
+        log(f"progress: {text}")
+        if self._label:
+            try:
+                ctypes.windll.user32.SetWindowTextW(self._label, text)
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        hwnd = self.hwnd
+        if hwnd:
+            self._closing = True
+            try:
+                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            except Exception:
+                pass
+
+
+_progress: Progress | None = None
+
+
+def progress(text: str) -> None:
+    """Change the progress window's line (when there is one)."""
+    if _progress is not None:
+        _progress.set(text)
+
+
 # ------------------------------------------------------------------ folders
+HELD = "프로그램 폴더를 다른 프로그램(백신 검사, 다른 RetLens 창, 탐색기 등)이 쓰고 있어 기다리는 중입니다… {s}초"
+
+
 def retry(fn, what: str, seconds: float, ask: str | None = None) -> bool:
-    """fn() until it works or `seconds` pass; then, with ask, a retry / cancel box. True when it worked."""
+    """fn() until it works or `seconds` pass; then, with ask, a retry / cancel box. True when it worked. While it
+    waits, the progress window says so."""
     while True:
-        end = time.time() + seconds
+        t0 = time.time()
+        end = t0 + seconds
         delay = 0.25
         while True:
             try:
@@ -255,6 +372,8 @@ def retry(fn, what: str, seconds: float, ask: str | None = None) -> bool:
                 return True
             except OSError as e:
                 last = e
+            if time.time() - t0 > 2.0:
+                progress(HELD.format(s=int(time.time() - t0)))
             if time.time() >= end:
                 break
             time.sleep(delay)
@@ -371,12 +490,14 @@ def swap(job: Job) -> dict:
     if job.get("recover_command"):
         set_runonce(job["recover_command"])
     wait = float(job.get("retry_s", 60.0))  # how long a held file is waited out before asking
+    progress("프로그램 파일을 바꾸는 중입니다…")
     if not retry(lambda: os.rename(install, old), "rename install -> old", wait, BUSY):
         result["error"] = "프로그램 폴더를 쓰는 프로그램이 있어 바꾸지 못했습니다"
         _end_journal(journal)
         return result
     write_json(journal, {"install": install, "old": old, "staged": staged, "to": job.get("to"),
                          "from": job.get("from"), "phase": "old-moved", "time": time.time()})
+    progress("새 버전을 제자리에 넣는 중입니다…")
     if not retry(lambda: os.rename(staged, install), "rename staged -> install", wait):
         put_back = retry(lambda: os.rename(old, install), "put the old folder back", float(job.get("putback_s", 600.0)),
                          "이전 버전을 제자리에 돌려놓지 못했습니다. 프로그램 폴더를 쓰는 프로그램을 닫고 '다시 시도'를 누르세요.")
@@ -442,6 +563,8 @@ def run_swap(job: Job) -> dict:
     relaunch = bool(job.get("relaunch"))
     if result.get("ok"):
         if relaunch:
+            progress(f"RetLens {job.get('to') or ''}을(를) 시작하는 중입니다… 새 버전의 첫 실행은 백신 검사 때문에 1–2분 "
+                     "걸릴 수 있습니다. RetLens를 따로 실행하지 마세요.")
             proc = start(exe, list(job.get("relaunch_args") or []), job.get("workdir") or "")
             state = health(job, proc) if proc is not None else "exited"  # could not even be started: the same
             result["health"] = state
@@ -622,6 +745,10 @@ def main(argv: list[str] | None = None) -> int:
         if job.get("action") == "swap" and job.get("relaunch") and os.path.isfile(exe):
             start(exe, [], job.get("workdir") or "")  # the version that was there, as promised
         return 1
+    global _progress
+    if job.get("action") == "swap":  # RetLens is gone: say what happens until the new one is up
+        _progress = Progress(f"RetLens를 {job.get('to') or '새 버전'}(으)로 업데이트하는 중입니다.\n\n"
+                             "잠시 기다려 주세요. 끝나면 새 버전이 저절로 시작됩니다.")
     try:
         result = action(job)
     except Exception as e:  # never die silently: the next RetLens start shows it
@@ -629,6 +756,9 @@ def main(argv: list[str] | None = None) -> int:
         result = {"action": job.get("action"), "ok": False, "error": f"{type(e).__name__}: {e}"}
     finally:
         lock.release()
+        if _progress is not None:
+            _progress.close()
+            _progress = None
     if not (job.get("action") == "uninstall" and result.get("ok") and job.get("purge_settings")):
         write_json(job.get("result"), {**result, "time": time.time(), "log": _log_path})
     log(f"done: {json.dumps(result, ensure_ascii=True)}")
