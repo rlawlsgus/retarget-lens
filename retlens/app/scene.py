@@ -344,6 +344,10 @@ OBJECT_COLORS = [(214, 170, 92), (120, 170, 200), (160, 196, 120), (200, 140, 17
 OBJECT_MAX_FACES = 6000  # object meshes above this are simplified for the view (on a 5 mm grid)
 OBJECT_PATH_STEP_S = 0.1  # spacing of the path points
 OBJECT_DOT_M = 0.02  # radius of the dot on an object node without a shape (retlens.props)
+TAG_GAP_M = 0.25  # name tags start this far over the robot's highest point this frame (MotionScene._lift_tags)
+TAG_COMPARE_UP_M = 0.3  # overlay comparison: B's tag over A's
+FLOOR_MIN_M = 40.0  # the floor is at least this square, centred on what is open (MotionScene._update_floor)
+FLOOR_MARGIN_M = 4.0  # floor beyond the farthest robot path (skeleton beside it, props, name tags)
 DIFF_COLORS = ((245, 205, 40), (240, 130, 30), (220, 40, 35))  # at 1x, 2x, 3x the tolerance
 
 
@@ -435,8 +439,8 @@ class MotionScene:
         self.compare_now: dict | None = None  # the drawn frame's difference (set by tick)
         self._compare_cache: tuple = (None, None)
         server.scene.set_up_direction("+z")
-        server.scene.add_grid("/floor", width=40, height=40, cell_size=0.5, section_size=1.0,
-                              plane_color=(235, 235, 238), plane_opacity=1.0, shadow_opacity=0.25)
+        self._floor_key, self._floor_box = None, None
+        self._set_floor((-FLOOR_MIN_M / 2, -FLOOR_MIN_M / 2, FLOOR_MIN_M / 2, FLOOR_MIN_M / 2))
 
     # ---------------------------------------------------------------- events
     def listen(self, fn: Callable[[str, object], None]) -> None:
@@ -1069,11 +1073,28 @@ class MotionScene:
         worst = max(regions, key=regions.get) if regions else None
         self.compare_now = {"mean": float(dev.mean()), "regions": regions, "worst": worst,
                             "over": int((dev > c.tol_cm).sum()), "parts": K}
-        tag = T_base[a][:3, 3] + np.array([0.0, 0.0, 1.05])  # above A's label, where B is drawn
-        for key in ("label", "now"):  # B's segment label is in its name tag (_pose), or with names hidden here
-            h = self.items[b].handles.get(key)
-            if h is not None:
-                h.position = tag
+        return T
+
+    def _lift_tags(self, T: np.ndarray, visible: np.ndarray, pair) -> None:
+        """Put each robot's name tag (and segment tag) TAG_GAP_M over its highest point this frame, above its
+        pelvis: the tags grow upwards from there, so they never cover the robot whatever it does (arms raised,
+        a jump). In an overlay comparison B's tag goes above A's, where B is drawn."""
+        top = self.robots.top_z(T) if T.ndim == 4 and T.shape[1] == len(self.items) else None
+        pos = {}
+        for i, it in enumerate(self.items):
+            tag = it.handles.get("tag")
+            if not visible[i] or tag is None:
+                continue
+            z = tag[2] if top is None else max(float(top[i]) + TAG_GAP_M, float(it.handles["pos"][2]) + 0.3)
+            pos[i] = np.array([tag[0], tag[1], z])
+        if pair is not None and pair[0] in pos and pair[1] in pos:
+            pos[pair[1]] = pos[pair[0]] + np.array([0.0, 0.0, TAG_COMPARE_UP_M])
+        for i, p in pos.items():
+            h = self.items[i].handles
+            if h.get("tag_sent") is None or not np.allclose(h["tag_sent"], p, atol=1e-4):
+                h["tag_sent"] = p
+                h["label"].position = p
+                h["now"].position = p
 
     def _poses_at(self, item: Item, src: Item, local: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Base transforms (F, 4, 4) in display space and robot-model joint values (F, joints)
@@ -1146,8 +1167,8 @@ class MotionScene:
             self.log(f"  {item.label}: {len(missing)} robot joints not in the motion, held at 0")
         item.handles["label"] = s.scene.add_label(f"{node}/label", item.label, font_screen_scale=0.9,
                                                   anchor="bottom-center")
-        # the segment label being played: hangs from the name tag's point, so the two never overlap at any zoom
-        item.handles["now"] = s.scene.add_label(f"{node}/now", "", font_screen_scale=1.1, anchor="top-center")
+        # the segment labels being played, when names are hidden (shown, they are in the name tag): upwards too
+        item.handles["now"] = s.scene.add_label(f"{node}/now", "", font_screen_scale=1.1, anchor="bottom-center")
         self._set_visible(item, "now", False)
         if item.human is not None:  # drawn by the shared skeleton node (OverlayBatch)
             hm = item.human
@@ -1454,6 +1475,7 @@ class MotionScene:
         # one atomic group per frame: the client applies the frame at once, and viser wakes its
         # network thread once instead of once per message
         with self.lock, self.server.atomic():
+            self._update_floor()
             n = len(self.items)
             T_base = np.tile(np.eye(4), (n, 1, 1))
             cfg = np.zeros((n, len(self.robots.joint_names)))
@@ -1466,11 +1488,62 @@ class MotionScene:
                     visible[i] = True
             pair = self.compare_pair()
             if pair is not None and visible[pair[0]] and visible[pair[1]]:
-                self._compare_frame(T_base, cfg, visible, pair)
+                T = self._compare_frame(T_base, cfg, visible, pair)
             else:
-                self.robots.update(T_base, cfg, visible)
-                self.compare_now = None
+                T = self.robots.update(T_base, cfg, visible)
+                self.compare_now, pair = None, None
+            self._lift_tags(T, visible, pair)
             self.overlays.update(humans, balance)
+
+    def _set_floor(self, box: tuple) -> None:
+        """The floor grid over box (x0, y0, x1, y1 in m, on whole metres so the lines stay on the same spots)."""
+        x0, y0, x1, y1 = box
+        self.server.scene.add_grid("/floor", width=x1 - x0, height=y1 - y0, cell_size=0.5, section_size=1.0,
+                                   position=((x0 + x1) / 2, (y0 + y1) / 2, 0.0),
+                                   fade_distance=max(100.0, 1.5 * max(x1 - x0, y1 - y0)),
+                                   plane_color=(235, 235, 238), plane_opacity=1.0, shadow_opacity=0.25)
+        self._floor_box = box
+
+    def floor_box(self) -> tuple:
+        """The floor's (x0, y0, x1, y1) in m."""
+        return self._floor_box
+
+    def _path_box(self, item: Item) -> np.ndarray | None:
+        """(x0, y0, x1, y1) of the robot's root path over the whole clip in display space."""
+        qd, shift = self._display_transform(item)
+        h = item.handles
+        key = (id(item.robot), *np.round(qd, 6), *np.round(shift, 6))
+        if h.get("path_box_key") != key:
+            pos = np.asarray(item.robot.root_pos, dtype=float)
+            pos = pos[np.isfinite(pos).all(axis=1)]
+            if not len(pos):
+                return None
+            pos = pos[:: max(1, len(pos) // 400)]
+            p = pos @ quat_to_matrix(qd).T + shift
+            h["path_box_key"], h["path_box"] = key, np.r_[p[:, :2].min(0), p[:, :2].max(0)]
+        return h["path_box"]
+
+    def _update_floor(self) -> None:
+        """Grow / move the floor to cover every open motion's path with a margin (at least FLOOR_MIN_M square,
+        centred on them); the default floor when nothing is open. Sent only when it changes."""
+        v = self.view
+        key = (v.side_by_side, v.spacing, v.align, tuple((id(it), id(it.robot), it.handles.get("index"))
+                                                          for it in self.items))
+        if key == self._floor_key:
+            return
+        self._floor_key = key
+        boxes = [b for b in (self._path_box(it) for it in self.items) if b is not None]
+        if boxes:
+            b = np.array(boxes)
+            lo, hi = b[:, :2].min(0) - FLOOR_MARGIN_M, b[:, 2:].max(0) + FLOOR_MARGIN_M
+            mid, half = (lo + hi) / 2, np.maximum((hi - lo) / 2, FLOOR_MIN_M / 2)
+            lo, hi = np.floor(mid - half), np.ceil(mid + half)
+            hi += (hi - lo) % 2  # an even width keeps the centre on a whole metre: the 1 m lines stay on whole metres
+            box = (float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]))
+        else:
+            box = (-FLOOR_MIN_M / 2, -FLOOR_MIN_M / 2, FLOOR_MIN_M / 2, FLOOR_MIN_M / 2)
+        if box != self._floor_box:
+            self._set_floor(box)
 
     def robot_size(self) -> float:
         """Height of the robot (m; its model at the zero pose), G1_HEIGHT when unknown."""
@@ -1540,6 +1613,7 @@ class MotionScene:
         has_objects = item.human is not None and bool(item.human.objects)
         if not visible:
             self._set_visible(item, "now", False)
+            h["now_text"] = ""
             if has_objects:
                 self._pose_objects(item, 0.0, np.eye(3), np.zeros(3), False)
             return None
@@ -1559,8 +1633,8 @@ class MotionScene:
         T_base[:3, 3] = p
         jmap = src.handles.get("map", h["map"])
         cfg = np.array([dof[i] if i is not None else 0.0 for i in jmap])
-        tag = p + np.array([0.0, 0.0, self._tag_up()])
-        h["label"].position = tag
+        tag = p + np.array([0.0, 0.0, self._tag_up()])  # raised over the posed robot's top in tick (_lift_tags)
+        h["tag"] = tag
         text = item.label if inside else f"{item.label} (범위 밖)"
         if self.is_physics_result(item):
             note = self.fall_note(item, local)
@@ -1582,15 +1656,16 @@ class MotionScene:
         # one track per line: tags of robots side by side stay narrow
         labels = item.labels  # read once: opening and the API replace it from other threads
         now = labels.text_at(local, "\n") if labels is not None and inside and v.show_label_now else ""
-        if role == "B" and now and v.show_labels:  # B is drawn on A, between A's tags: one tag for B
+        # the segment labels go in the name tag: one tag that grows upwards from above the robot's head, so no
+        # number of tracks reaches down over the robot; with names hidden they are a tag of their own, also upwards
+        h["now_text"] = now  # the segment text shown over this robot, in whichever tag
+        if now and v.show_labels:
             text, now = f"{text}\n{now}", ""
         if h.get("label_text") != text:  # one message less per robot per frame
             h["label"].text = h["label_text"] = text
-        self._set_visible(item, "now", bool(now))  # hidden where nothing is labelled
-        if now:
-            h["now"].position = tag
-            if h.get("now_text") != now:
-                h["now"].text = h["now_text"] = now
+        self._set_visible(item, "now", bool(now))  # its own tag only with names hidden
+        if now and h.get("now_sent") != now:
+            h["now"].text = h["now_sent"] = now
         balance = self._pose_balance(item, src.balance, local, R, shift) if role is None else None
         if has_objects:  # with the robot (not beside it with the skeleton): the robot's hands are what is checked
             self._pose_objects(item, local, R, shift, role is None)

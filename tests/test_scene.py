@@ -87,6 +87,50 @@ def test_add_play_measure_remove(scene):
     assert scene.items == [] and scene.robots.handles == []
 
 
+def test_floor_grows_with_the_motions(scene):
+    from retlens.app.scene import FLOOR_MIN_M
+
+    scene.tick(0.0)
+    assert scene.floor_box() == (-FLOOR_MIN_M / 2, -FLOOR_MIN_M / 2, FLOOR_MIN_M / 2, FLOOR_MIN_M / 2)  # nothing open
+    scene.view.side_by_side, scene.view.align = True, True
+    items = [scene.add(SAMPLE) for _ in range(30)]  # 30 lanes of 1.8 m: 52 m, past the 40 m floor
+    try:
+        scene.tick(0.0)
+        x0, y0, x1, y1 = scene.floor_box()
+        for it in items:
+            b = scene._path_box(it)
+            assert x0 < b[0] and b[2] < x1 and y0 < b[1] and b[3] < y1  # every robot path is on the floor
+        assert y1 - y0 > FLOOR_MIN_M and x1 - x0 >= FLOOR_MIN_M and (x1 - x0) % 2 == 0 and (y1 - y0) % 2 == 0
+        assert all(float(v).is_integer() for v in (x0, y0, x1, y1))  # whole metres: grid lines stay put
+        for it in items[1:]:
+            scene.remove(it)
+        scene.tick(0.0)
+        assert scene.floor_box()[3] - scene.floor_box()[1] == FLOOR_MIN_M  # shrinks back with one motion
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)
+    scene.tick(0.0)
+    assert scene.floor_box() == (-FLOOR_MIN_M / 2, -FLOOR_MIN_M / 2, FLOOR_MIN_M / 2, FLOOR_MIN_M / 2)
+
+
+def test_name_tags_stay_over_the_robot(scene):
+    from retlens.app.scene import TAG_GAP_M
+
+    a = scene.add(SAMPLE)
+    try:
+        for t in np.linspace(0.0, a.robot.duration, 9):
+            scene.seek(float(t))
+            scene.tick(0.0)
+            T_base, cfg = scene._pose(a)[:2]
+            T = scene.robots.forward(T_base[None], cfg[None])
+            top = float(scene.robots.top_z(T)[0])
+            assert top > a.handles["pos"][2]  # the head is above the pelvis
+            tag = np.asarray(a.handles["label"].position)
+            assert tag[2] >= top + TAG_GAP_M - 1e-4 and np.allclose(tag[:2], a.handles["pos"][:2], atol=1e-4)
+    finally:
+        scene.remove(a)
+
+
 def test_labels_are_optional(scene, tmp_path):
     """A motion opens with or without a label file next to it; a broken one is kept with its error;
     labels can be put on, taken off and read again (inspector, timeline menu, /api/labels)."""
@@ -107,12 +151,13 @@ def test_labels_are_optional(scene, tmp_path):
         info = api_core.item_info(scene, labelled)["labels"]
         assert info["now"] == [{"track": "", "label": "idle"}] and info["count"] == 2 and len(info["segments"]) == 2
         assert "segments" not in api_core.status(scene)["motions"][1]["labels"]  # the overview stays short
-        scene.tick(0.0)  # the 3D view: the label being played under the robot's name tag
-        assert labelled.handles["now_visible"] and labelled.handles["now_text"] == "idle"
-        assert plain.handles["now_visible"] is False  # no labels: nothing over that robot
+        scene.tick(0.0)  # the 3D view: the label being played in the robot's name tag, which grows upwards
+        h = labelled.handles
+        assert h["now_text"] == "idle" and h["label_text"].endswith("\nidle") and h["now_visible"] is False
+        assert plain.handles["now_text"] == "" and plain.handles["now_visible"] is False  # no labels
         scene.view.show_label_now = False
         scene.tick(0.0)
-        assert labelled.handles["now_visible"] is False
+        assert labelled.handles["now_text"] == "" and not labelled.handles["label_text"].endswith("idle")
         scene.view.show_label_now = True
         scene.set_labels(labelled, None)
         scene.tick(0.0)
@@ -133,14 +178,16 @@ def test_labels_are_optional(scene, tmp_path):
         h = labelled.handles
         assert scene.compare_role(labelled) == "B" and h["now_visible"] is False
         assert h["label_text"].endswith("비교 대상 (벗어난 부위만 색칠)\nidle")
-        assert np.allclose(h["label"].position, plain.handles["pos"] + np.array([0.0, 0.0, 1.05]))
+        from retlens.app.scene import TAG_COMPARE_UP_M
+
+        assert np.allclose(h["label"].position, plain.handles["label"].position + np.array([0, 0, TAG_COMPARE_UP_M]))
         scene.view.show_labels = False  # names hidden: the segment label alone, moved there too
         scene.tick(0.0)
         assert h["now_visible"] and h["now_text"] == "idle" and np.allclose(h["now"].position, h["label"].position)
         scene.view.show_labels = True
         scene.set_compare(on=False)
         scene.tick(0.0)
-        assert h["now_visible"] and "비교 대상" not in h["label_text"]
+        assert h["label_text"].endswith("\nidle") and "비교 대상" not in h["label_text"]
     finally:
         scene.remove(plain)
         scene.remove(labelled)

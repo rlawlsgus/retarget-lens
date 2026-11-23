@@ -232,6 +232,15 @@ class RobotBatch:
             T[child] = A
         return T
 
+    def top_z(self, T: np.ndarray) -> np.ndarray:
+        """Height of each robot's highest part point (N,) for link transforms T (links, N, 4, 4) from forward():
+        the parts' sample points (centroid and extremities), close enough to the mesh top for placing a tag."""
+        if not len(self.meshes) or not T.shape[1]:
+            return np.zeros(T.shape[1])
+        M = T[self.mesh_links]  # (parts, N, 4, 4)
+        z = np.einsum("pnj,pkj->pnk", M[..., 2, :3], self.samples) + M[..., 2, 3][..., None]
+        return z.max(axis=(0, 2))
+
     def update(self, T_base: np.ndarray, cfg: np.ndarray, visible: np.ndarray) -> np.ndarray:
         """Pose every robot; returns the link transforms. Hidden robots are scaled to zero."""
         if not self.handles or len(T_base) != len(self.colors):
