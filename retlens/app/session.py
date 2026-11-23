@@ -372,13 +372,19 @@ def _solo_visible(scene: MotionScene) -> dict:
     return pl["visible"] if pl is not None and pl.get("solo") else {}
 
 
-def item_state(item: Item, base_dir: str | None, visible: bool | None = None) -> dict:
-    """One open motion as a session entry. visible: its own visibility when the view shows another for now (solo)."""
+def item_state(item: Item, base_dir: str | None, visible: bool | None = None, trim=((), ())) -> dict:
+    """One open motion as a session entry. visible: its own visibility when the view shows another for now (solo).
+    trim: its 시간 잘라내기 spans and 파일 나누기 times (MotionScene._trim), kept so a closed window keeps them."""
+    cuts, splits = trim
     e = {"file": portable(item.source, base_dir), "label": item.label, "kind": item.kind,
          "retarget": dict(item.retarget) if item.retarget else None,  # None: a robot motion, opened as it is
          "color": tuple(int(c) for c in item.color), "offset_s": float(item.offset),
          "visible": bool(item.visible if visible is None else visible), "show_human": bool(item.show_human),
          "labels": labels_state(item, base_dir)}
+    if cuts:
+        e["cuts"] = [[float(a), float(b)] for a, b in cuts]
+    if splits:
+        e["splits"] = [float(t) for t in splits]
     prev = item.info.get("previous_retarget")
     if prev:
         e["previous_retarget"] = dict(prev)
@@ -430,7 +436,7 @@ def capture(scene: MotionScene, base_dir: str | None, carry=()) -> dict:
     prof = scene.robot_profile
     data = {"format": FORMAT, "version": VERSION, "app_version": __version__,
             "robot": prof.key if prof.builtin else prof.name, "robot_ident": prof.ident,
-            "motions": [item_state(it, base_dir, solo.get(id(it), it.visible)) for it in items]
+            "motions": [item_state(it, base_dir, solo.get(id(it), it.visible), scene._trim(it)) for it in items]
             + [rebase_entry(e, None, base_dir) for e in carry],
             "compare": compare, "view": asdict(scene.view), "time_s": float(scene.t),
             "physics": {"on": bool(scene.physics_on), "balance": scene.balance, "assist": float(scene.assist)},
@@ -454,7 +460,7 @@ def fingerprint(scene: MotionScene, carry=()) -> tuple:
     solo = _solo_visible(scene)
     c = scene.compare
     return (tuple((it.source, tuple(sorted(it.retarget.items())), it.offset, solo.get(id(it), it.visible),
-                   it.show_human, tuple(it.color), it.labels) for it in items),
+                   it.show_human, tuple(it.color), it.labels, scene._trim(it)) for it in items),
             tuple(getattr(scene.view, f.name) for f in fields(ViewSettings) if f.name != "speed"),
             _pair(scene, items), c.heading, c.tol_cm, scene.balance, scene.assist,
             tuple(sorted(scene.retarget_settings().items())), len(carry))
@@ -546,7 +552,8 @@ def _entry(v, notes: list) -> dict:
          "retarget": _retarget_read(raw.get("retarget")), "color": _color(raw.get("color")),
          "offset_s": _float(raw.get("offset_s"), 0.0, *OFFSET_S),
          "visible": _bool(raw.get("visible"), True), "show_human": _bool(raw.get("show_human"), True),
-         "labels": _labels_read(raw.get("labels"), notes, name)}
+         "labels": _labels_read(raw.get("labels"), notes, name),
+         "cuts": _spans_read(raw.get("cuts")), "splits": _times_read(raw.get("splits"))}
     prev = raw.get("previous_retarget")
     e.pop("previous_retarget", None)
     if isinstance(prev, dict):
@@ -555,6 +562,21 @@ def _entry(v, notes: list) -> dict:
                                   "self_collision": _bool(prev.get("self_collision"), False),
                                   "score": _float(prev.get("score"), None)}
     return e
+
+
+def _spans_read(v) -> list:
+    """[[start_s, end_s], ...] of a session entry's cuts: numbers, start before end; anything else left out."""
+    out = []
+    for s in v if isinstance(v, list) else []:
+        if isinstance(s, (list, tuple)) and len(s) == 2:
+            a, b = _float(s[0], None, 0.0), _float(s[1], None, 0.0)
+            if a is not None and b is not None and b > a:
+                out.append([a, b])
+    return out
+
+
+def _times_read(v) -> list:
+    return [t for t in (_float(x, None, 0.0) for x in (v if isinstance(v, list) else [])) if t is not None]
 
 
 def _retarget_read(v) -> dict | None:
@@ -752,6 +774,11 @@ def apply_item_state(scene: MotionScene, item: Item, entry: dict, base_dir: str 
     item.show_human = bool(entry.get("show_human", True))
     if entry.get("previous_retarget"):
         item.info["previous_retarget"] = dict(entry["previous_retarget"])
+    dur = item.robot.duration  # its cuts and splits, inside the motion as it loaded now
+    cuts = tuple((round(min(a, dur), 6), round(min(b, dur), 6)) for a, b in entry.get("cuts") or () if min(b, dur) > a)
+    splits = tuple(sorted(round(t, 6) for t in entry.get("splits") or () if 0.0 < t < dur))
+    if cuts or splits:
+        scene._set_trim(item, (cuts, splits))
     return _apply_labels(scene, item, entry.get("labels") or {"from": "find"}, base_dir, entry_label(entry))
 
 
@@ -763,7 +790,7 @@ CANCELLED = "cancelled"  # load_entry's reason when the restore was cancelled wh
 
 
 def load_entry(scene: MotionScene, entry: dict, base_dir: str | None,
-               cancelled: Callable[[], bool] | None = None) -> tuple[Item | None, str, list[str]]:
+               cancelled: Callable[[], bool] | None = None, record: bool = True) -> tuple[Item | None, str, list[str]]:
     """Open one motion of a session: (item, '', notes), or (None, why not, notes) - never raises. Its file is found
     by resolve; it is retargeted with its own corrections, gets its colour when free, and its state before it is
     shown (apply_item_state). cancelled() true once it has loaded: it is not shown at all (CANCELLED)."""
@@ -781,7 +808,8 @@ def load_entry(scene: MotionScene, entry: dict, base_dir: str | None,
         notes.extend(apply_item_state(scene, it, entry, base_dir))
 
     try:
-        item = scene.add(path, retarget=entry.get("retarget"), color=entry.get("color"), prepare=prepare)
+        item = scene.add(path, retarget=entry.get("retarget"), color=entry.get("color"), prepare=prepare,
+                         record=record)
     except _Cancelled:
         return None, CANCELLED, notes
     except Exception as e:  # a broken file, Blender or the SMPL-X model missing: the others still open
@@ -911,6 +939,9 @@ class Restore:
                 self.notes.append(f"다른 로봇({robot})으로 저장한 작업 세션입니다. 지금 로봇({prof.name})으로 엽니다")
             if self.mode == "replace":
                 clear(scene)
+                # a work session in place of the work: its history starts here (the closed work is not undone into
+                # it, and opening its motions is no step); what is done in the window meanwhile is a step as usual
+                scene.clear_history()
                 self.notes += apply_before(scene, self.data, physics_ready)
             for i, entry in enumerate(self.entries):
                 if cancelled():
@@ -919,7 +950,7 @@ class Restore:
                 self.current = entry_label(entry)
                 if progress is not None:
                     progress(self.done, self.total, self.current)
-                item, err, notes = load_entry(scene, entry, self.base_dir, cancelled)
+                item, err, notes = load_entry(scene, entry, self.base_dir, cancelled, record=self.mode != "replace")
                 if err == CANCELLED:  # cancelled while it loaded: never shown, still to open
                     self.cancelled = True
                     break
@@ -936,8 +967,6 @@ class Restore:
             self.current = ""
             if self.mode == "replace" and not self.cancelled:
                 self.notes += apply_after(scene, self.data, self.items)
-            if self.mode == "replace":  # a work session in place of the work: its history starts here
-                scene.clear_history()
             if progress is not None:
                 progress(self.done, self.total, "")
         finally:

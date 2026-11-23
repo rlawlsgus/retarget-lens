@@ -171,6 +171,11 @@ class _PassShortcuts(QObject):
         return False
 
 
+def _names(items, n: int = 5) -> str:
+    """'a, b, c 외 2개' of motions."""
+    return ", ".join(it.label for it in items[:n]) + (f" 외 {len(items) - n}개" if len(items) > n else "")
+
+
 def _selection_of(win) -> list:
     """The window's selected motions (a test's stand-in window: only its selected one)."""
     fn = getattr(win, "selected_items", None)
@@ -945,7 +950,7 @@ class InspectorPanel(QScrollArea):
             + ["N / Shift+N 또는 타임라인의 '문제 ▶'로 다음 / 이전 문제로 갑니다"]))
         if not self.metrics_fold.is_open():  # nothing to fill while it is folded
             return
-        names, cols = sc.metric_table(self.win.analysis.ref_item())
+        names, cols = sc.metric_table(self.win.analysis.ref_item(), only=it)
         vals = next((v for c, v in cols if c is it), None)
         if vals is None:
             return
@@ -1342,10 +1347,11 @@ class TimelineTracks(QWidget):
         Motions and labels are compared as objects, not by id(): a freed label set's id can come
         back for the next one, which would look unchanged."""
         sc, sel, pal = self.win.scene, self.win.selected, self.palette()
-        rows = tuple((_Same(it), it.label, _Same(labels), it.offset, it.visible, it.color, sc.shown(it).robot.duration,
-                      it is sel, it in _selection_of(self.win), tuple(sc.falls(it)), _Same(sc.shown(it).metrics.get("_problems")),
+        many = {id(x) for x in _selection_of(self.win)}  # once: this runs every frame, for every row
+        rows = tuple((_Same(it), it.label, _Same(labels), it.offset, it.visible, it.color, shown.robot.duration,
+                      it is sel, id(it) in many, tuple(sc.falls(it)), _Same(shown.metrics.get("_problems")),
                       _cuts(sc, it), _splits(sc, it)) for it, _y, _h, _tracks, labels in
-                     (rows if rows is not None else self._rows()))
+                     (rows if rows is not None else self._rows()) for shown in (sc.shown(it),))
         return (self.width(), self.height(), self.devicePixelRatioF(), self._span(), rows, sc.view.show_problems,
                 pal.color(QPalette.Base).rgba(), pal.color(QPalette.Text).rgba(), self.font().key())
 
@@ -1464,9 +1470,9 @@ class TimelineTracks(QWidget):
         for _t, x in self._ruler_ticks(span):  # the grid; the ruler's numbers are drawn over it in view
             p.drawLine(int(x), self.RULER_H - 6, int(x), self.height())
         sc, sel = self.win.scene, self.win.selected
-        many = _selection_of(self.win)
+        many = {id(x) for x in _selection_of(self.win)}
         for it, y, h, tracks, labels in rows:
-            if it is sel or it in many:
+            if it is sel or id(it) in many:
                 p.fillRect(0, y, self.width(), h, pal.color(QPalette.Highlight).darker(250 if it is sel else 320))
             broken = labels is not None and bool(labels.error)  # its label file could not be used: say so
             p.setPen(QColor(230, 150, 60) if broken else text)
@@ -1550,7 +1556,9 @@ class TimelineTracks(QWidget):
         if e.position().x() < self.NAME_W:  # click a name: select that motion (Ctrl: one more); drag it: move it
             row = self._row_at(e.position().y())
             if row is not None:
-                if e.modifiers() & Qt.ControlModifier and hasattr(self.win, "toggle_select"):
+                if e.modifiers() & Qt.ShiftModifier and hasattr(self.win, "select_range"):
+                    self.win.select_range(row[0], add=bool(e.modifiers() & Qt.ControlModifier))
+                elif e.modifiers() & Qt.ControlModifier and hasattr(self.win, "toggle_select"):
                     self.win.toggle_select(row[0])
                 else:
                     if row[0] not in _selection_of(self.win):
@@ -1560,7 +1568,8 @@ class TimelineTracks(QWidget):
                     if hasattr(self.win, "move_motion"):
                         self._move = {"item": row[0], "y": e.position().y(), "moved": False, "to": None}
             return
-        if e.modifiers() & Qt.ShiftModifier and hasattr(self.win, "set_time_range"):  # Shift+drag: a time range
+        if e.modifiers() & Qt.ShiftModifier and hasattr(self.win, "set_time_range") and \
+                e.position().x() >= self.NAME_W:  # Shift+drag on the bars: a time range
             row = self._row_at(e.position().y())
             if row is not None:
                 t = self._motion_t(row[0], e.position().x())
@@ -2366,9 +2375,22 @@ class AnalysisPanel(QWidget):
         self.plot.set_data(series, key if key in GRAPH_FIXED else f"{key} [°]")
         self.update_view(force=True)
 
+    def refresh_content(self) -> None:
+        """Table and chart made again (a motion changed); while the tab is off screen only marked, and made when it
+        is on screen again (update_view, every tick): with many motions each table is many full-clip RMSEs."""
+        if self.showing():
+            self._stale = False
+            self.update_table()
+            self.rebuild_chart()
+        else:
+            self._stale = True
+
     def update_view(self, force: bool = False) -> None:
         """Move the playhead, and the time range too while following; skipped while off screen."""
         if not (force or self.showing()):
+            return
+        if getattr(self, "_stale", False):
+            self.refresh_content()
             return
         sc = self.win.scene
         if not force and sc.t == self._shown_t:
@@ -2721,6 +2743,12 @@ class BatchModel(QAbstractTableModel):
         self.rows.append(row)
         self.endInsertRows()
 
+    def set_rows(self, rows: list[dict]) -> None:
+        """All rows at once (the cache's): one reset, not a sort and a filter per row."""
+        self.beginResetModel()
+        self.rows = list(rows)
+        self.endResetModel()
+
     def clear(self) -> None:
         self.beginResetModel()
         self.rows = []
@@ -2748,10 +2776,16 @@ class BatchFilter(QSortFilterProxyModel):
         if self.qc == "falls" and not r.get("phys_falls"):
             return False
         if self.text:
-            hay = " ".join(str(r.get(k) or "") for k in ("name", "folder", "qc", "worst_problem", "main_loss", "error",
-                                                         "labels", "kind", "phys_first_cause")).lower() + " " + \
-                LABEL_SOURCES.get(r.get("labels"), "")
-            return all(w in hay for w in self.text.split())
+            cache = self.__dict__.setdefault("_hay", {})
+            hit = cache.get(id(r))
+            if hit is None or hit[0] is not r:  # (an id can be reused by a later row)
+                hay = " ".join(str(r.get(k) or "") for k in ("name", "folder", "qc", "worst_problem", "main_loss",
+                                                             "error", "labels", "kind", "phys_first_cause")).lower() \
+                    + " " + LABEL_SOURCES.get(r.get("labels"), "")
+                if len(cache) > 100000:
+                    cache.clear()
+                hit = cache[id(r)] = (r, hay)
+            return all(w in hit[1] for w in self.text.split())
         return True
 
     def lessThan(self, a, b):
@@ -2855,9 +2889,17 @@ class DatasetPanel(QWidget):
         head.setSectionResizeMode(QHeaderView.Interactive)
         head.setContextMenuPolicy(Qt.CustomContextMenu)
         head.customContextMenuRequested.connect(self._columns_menu)
-        self.table.setToolTip("머리글을 눌러 정렬합니다(점수 낮은 순, 문제 긴 순 등). 두 번 누르면 그 모션을 엽니다. "
-                              "머리글 우클릭: 보일 열")
+        self.table.setToolTip("머리글을 눌러 정렬합니다(점수 낮은 순, 문제 긴 순 등). 두 번 누르거나 Enter: 그 모션을 엽니다. "
+                              "Ctrl·Shift+클릭으로 여러 줄을 골라 한 번에 열고(Enter), Ctrl+C로 엑셀에 붙일 수 있게 "
+                              "복사합니다. 머리글 우클릭: 보일 열")
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.doubleClicked.connect(self._open)
+        for keys, fn in ((("Return", "Enter"), self.open_selected), (("Ctrl+C",), self.copy_selected)):
+            a = QAction(self.table)  # on the table only: Enter and Ctrl+C mean other things elsewhere
+            a.setShortcuts([QKeySequence(k) for k in keys])
+            a.setShortcutContext(Qt.WidgetShortcut)
+            a.triggered.connect(fn)
+            self.table.addAction(a)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._row_menu)
         lay.addWidget(self.table, 1)
@@ -3008,13 +3050,12 @@ class DatasetPanel(QWidget):
     def _cache_filled(self, token: int, total: int, rows: list[dict]) -> None:
         if token != self._cache_fill or self._running:
             return
-        self.model.clear()
         self._filled = set()
         self._total, self._from_cache = total, True
         for r in rows:
-            self.model.add(r)
             self._filled |= {k for k in BATCH_WHEN_FILLED
                              if r.get(k) not in (None, "") and (r.get(k) != 0 or k == "phys_falls")}
+        self.model.set_rows(rows)
         self._apply_columns()
         self.filter_row.setVisible(bool(rows))
         self.proxy.invalidate()
@@ -3146,7 +3187,10 @@ class DatasetPanel(QWidget):
             self._filled |= filled
             self._apply_columns()
         self.filter_row.setVisible(True)
-        self._show_totals()
+        now = time.monotonic()  # the totals go over every row: twice a second is enough while rows pour in
+        if done >= total or now - getattr(self, "_totals_at", 0.0) > 0.5:
+            self._totals_at = now
+            self._show_totals()
         if done == 1:
             self.table.resizeColumnsToContents()
 
@@ -3196,6 +3240,34 @@ class DatasetPanel(QWidget):
         if row.get("file"):
             self.win.add_paths([row["file"]])
 
+    def selected_rows(self) -> list[dict]:
+        """The rows picked in the table, in the order shown."""
+        idx = sorted(self.table.selectionModel().selectedRows(), key=lambda i: i.row())
+        return [self._row(i) for i in idx]
+
+    def open_selected(self) -> None:
+        """Enter / 선택한 N개 열기: the picked rows' motions (those that read), in the order shown."""
+        files = [r["file"] for r in self.selected_rows() if r.get("file") and not r.get("error")]
+        if files:
+            self.win.add_paths(files)
+
+    def copy_selected(self) -> None:
+        """Ctrl+C: the picked rows (all when none is), the columns shown, as tab-separated text with the column names
+        first: pastes into Excel as cells."""
+        rows = self.selected_rows() or [self.model.rows[self.proxy.mapToSource(self.proxy.index(r, 0)).row()]
+                                        for r in range(self.proxy.rowCount())]
+        cols = [c for c in range(len(batch.COLUMNS)) if not self.table.isColumnHidden(c)]
+        cols.sort(key=lambda c: self.table.horizontalHeader().visualIndex(c))
+
+        def text(r, c):
+            key, _t, fmt = batch.COLUMNS[c]
+            v = LABEL_SOURCES.get(r.get(key), r.get(key)) if key == "labels" else batch.cell(r, key, fmt)
+            return str(v if v is not None else "").replace("\t", " ").replace("\n", " ")
+
+        lines = ["\t".join(batch.COLUMNS[c][1] for c in cols)] + ["\t".join(text(r, c) for c in cols) for r in rows]
+        QApplication.clipboard().setText("\r\n".join(lines) + "\r\n")
+        self.win.status(f"데이터셋 표 {len(rows)}줄을 복사했습니다 (엑셀에 붙여 넣기)", 5000)
+
     def _row_menu(self, pos) -> None:
         index = self.table.indexAt(pos)
         if not index.isValid():
@@ -3203,9 +3275,15 @@ class DatasetPanel(QWidget):
         row = self._row(index)
         if not row.get("file"):
             return
+        picked = self.selected_rows()
         m = QMenu(self)
-        m.addAction("열기", lambda: self.win.add_paths([row["file"]]))
-        m.addAction("파일 위치 열기", lambda: self.win.open_path(os.path.dirname(row["file"])))
+        if row in picked and len(picked) > 1:
+            m.addAction(f"선택한 {len(picked)}개 열기", self.open_selected)
+            m.addAction(f"선택한 {len(picked)}줄 복사 (엑셀용)", self.copy_selected)
+        else:
+            m.addAction("열기", lambda: self.win.add_paths([row["file"]]))
+            m.addAction("파일 위치 열기", lambda: self.win.show_in_folder(row["file"]))
+            m.addAction("이 줄 복사 (엑셀용)", lambda: (self.table.selectRow(index.row()), self.copy_selected()))
         m.exec(self.table.viewport().mapToGlobal(pos))
 
     def _save_csv(self) -> None:
@@ -4234,8 +4312,7 @@ class EditorWindow(QMainWindow):
         self.a_split_file = act("재생 위치에서 파일 나누기", lambda: self.split_file_here(self.selected), "K",
                                 tip="다른 이름으로 저장할 때 고른 모션을 재생 위치에서 두 파일로 나눕니다(예: 왕복을 가기·오기로). "
                                     "라벨 구간 나누기(S)와 다릅니다")
-        self.a_save_as = act("모션 다른 이름으로 저장...", lambda: self.selected is not None and
-                             self.save_motion_as(self.selected), "Ctrl+Alt+S",
+        self.a_save_as = act("모션 다른 이름으로 저장...", self.save_as_selected, "Ctrl+Alt+S",
                              tip="고른 모션의 로봇 모션을 잘라낸 시간을 빼고 새 이름으로 저장합니다(라벨 함께)")
         self.a_save_all_as = act("모든 모션 다른 이름으로 저장...", self.save_all_as, "Ctrl+Alt+Shift+S",
                                  tip="타임라인의 모든 모션을 잘라낸 시간을 빼고 한 폴더에 새 이름으로 저장합니다(라벨 함께)")
@@ -4273,8 +4350,8 @@ class EditorWindow(QMainWindow):
         self.a_fit = act("카메라 맞추기", sc.fit_camera, "F", tip="보이는 모션이 모두 들어오게 카메라를 옮깁니다 (F)")
         self.a_reset = act("레이아웃 초기화", self.reset_layout)
         self.a_browser = act("브라우저에서 씬 열기", lambda: QDesktopServices.openUrl(QUrl(self.url)))
-        self.a_readme = act("사용 설명서", lambda: self.open_path(app_paths.doc("docs", "manual.md")))
-        self.a_labels = act("CMU 동작 목록", lambda: self.open_path(app_paths.doc("docs", "cmu_motion_labels.md")))
+        self.a_readme = act("사용 설명서", lambda: self.open_doc("manual.md"))
+        self.a_labels = act("CMU 동작 목록", lambda: self.open_doc("cmu_motion_labels.md"))
         self.a_folders = act("데이터 폴더 열기", lambda: self.open_path(app_paths.user_dir()),
                              tip="캐시·업로드·로그가 있는 폴더 (설치판: %LOCALAPPDATA%\\RetLens)")
         self.a_setup = act("설치 도우미...", lambda: self.open_setup(), icon=QStyle.SP_DriveNetIcon,
@@ -4570,6 +4647,19 @@ class EditorWindow(QMainWindow):
             keep.add(id(self.selected))
         return [it for it in self.scene.items if id(it) in keep]
 
+    def select_range(self, item: Item, add: bool = False) -> None:
+        """Shift+click: the motions from the main selected one to this one (in list order) selected; Ctrl+Shift+click
+        adds them to the selection. The main one stays where the range started (the next Shift+click goes from it)."""
+        items = self.scene.items
+        anchor = self.selected if self.selected in items else None
+        if anchor is None or item not in items:
+            self.select(item)
+            return
+        i, j = sorted((items.index(anchor), items.index(item)))
+        span = items[i:j + 1]
+        many = [*[it for it in self.selected_items() if it not in span], *span] if add else span
+        self.select(anchor, many=many)
+
     def toggle_select(self, item: Item) -> None:
         """Ctrl+click: the motion added to the selection (the main one now), or taken out of it."""
         cur = self.selected_items()
@@ -4594,6 +4684,8 @@ class EditorWindow(QMainWindow):
         self.a_video.setEnabled(item is not None)
         self.a_remove.setEnabled(item is not None)
         self.a_remove.setText(f"선택한 모션 {len(self.selection)}개 제거" if len(self.selection) > 1 else "선택한 모션 제거")
+        self.a_save_as.setText(f"선택한 모션 {len(self.selection)}개 다른 이름으로 저장..." if len(self.selection) > 1
+                               else "모션 다른 이름으로 저장...")
         self.a_save_as.setEnabled(item is not None)
         self._refresh_label_actions()
 
@@ -4608,12 +4700,14 @@ class EditorWindow(QMainWindow):
         if not items:
             return
         if any(self.scene.labels_dirty(it) for it in items):  # its question says it all
-            if not self._confirm_discard_labels(items, "제거하면"):
+            if not self._confirm_discard_labels(items, "제거하면", trims=False):
                 return
         elif self.confirm_unsaved:
-            names = ", ".join(it.label for it in items[:5]) + (f" 외 {len(items) - 5}개" if len(items) > 5 else "")
+            cut = [it for it in items if self.scene.trim_unsaved(it)]
             if QMessageBox.question(self, "모션 제거", (f"모션 {len(items)}개를 제거할까요?\n\n" if len(items) > 1 else
-                                                     "이 모션을 제거할까요?\n\n") + names
+                                                     "이 모션을 제거할까요?\n\n") + _names(items)
+                                    + (f"\n\n{_names(cut)}에는 아직 다른 이름으로 저장하지 않은 잘라낸 시간이 있습니다."
+                                       if cut else "")
                                     + "\n\n(파일은 그대로입니다. Ctrl+Z로 되돌릴 수 있습니다)") != QMessageBox.Yes:
                 return
         if len(items) == 1:
@@ -4653,7 +4747,7 @@ class EditorWindow(QMainWindow):
         if not items:
             return
         if any(self.scene.labels_dirty(it) for it in items):  # its question says it all
-            if not self._confirm_discard_labels(items, "모두 제거하면"):
+            if not self._confirm_discard_labels(items, "모두 제거하면", trims=False):
                 return
         elif QMessageBox.question(self, "모두 제거", f"열린 모션 {len(items)}개를 모두 제거할까요?\n"
                                                     "(파일은 그대로입니다)") != QMessageBox.Yes:
@@ -4988,6 +5082,7 @@ class EditorWindow(QMainWindow):
         if not kept:
             QMessageBox.warning(self, "다른 이름으로 저장", f"{it.label}: 모든 시간을 잘라내 저장할 것이 없습니다.")
             return
+        trim, lab = sc._trim(it), it.labels  # as the dialog shows them (the timeline can change meanwhile)
         while True:
             dlg = export_dialogs.SaveMotionAsDialog(
                 self, self.settings, it.label, it.robot.duration, kept, sc.cut_spans(it),
@@ -4996,10 +5091,11 @@ class EditorWindow(QMainWindow):
             if dlg.exec() != QDialog.Accepted:
                 return
             out, names, formats = dlg.folder.path(), dlg.names(), dlg.formats.value()
-            files = export_dialogs.save_as_files(out, names, formats, dlg.labels.isChecked() and it.labels is not None)
-            if self._own_files(it) & {_file_key(p) for p in files}:
-                QMessageBox.warning(self, "다른 이름으로 저장", f"원본 파일이나 이 모션의 라벨 파일을 덮어쓰게 됩니다.\n\n{out}\n\n"
-                                    "다른 이름이나 폴더를 고르세요.")
+            files = export_dialogs.save_as_files(out, names, formats, dlg.labels.isChecked() and lab is not None)
+            owner = self._owner_of(files)
+            if owner is not None:
+                QMessageBox.warning(self, "다른 이름으로 저장", f"{owner.label}의 원본 파일이나 라벨 파일을 덮어쓰게 됩니다."
+                                    f"\n\n{out}\n\n다른 이름이나 폴더를 고르세요.")
                 continue
             there = [p for p in files if os.path.exists(p)]
             if there and QMessageBox.question(
@@ -5008,7 +5104,7 @@ class EditorWindow(QMainWindow):
                 continue
             break
         try:
-            res = self._write_saved_as(it, out, names, formats, dlg.labels.isChecked())
+            res = self._write_saved_as(it, out, names, formats, dlg.labels.isChecked(), trim, lab)
         except Exception as e:
             QMessageBox.warning(self, "다른 이름으로 저장", f"{type(e).__name__}: {e}")
             return
@@ -5027,17 +5123,27 @@ class EditorWindow(QMainWindow):
         """The motion's own files (its file, a C3D's solve, its label file): never written over."""
         return {_file_key(p) for p in (it.source, it.info.get("solved_motion"), it.labels.path if it.labels else None) if p}
 
-    def _write_saved_as(self, it: Item, out: str, names, formats, labels: bool) -> dict:
-        """Write the motion as 다른 이름으로 저장 does (any thread); 파일 위치 열기 opens the first file from now on."""
+    def _owner_of(self, files) -> Item | None:
+        """The open motion one of these files would write over (its file, a C3D's solve, its label file), if any."""
+        keys = {_file_key(p) for p in files}
+        return next((it for it in list(self.scene.items) if self._own_files(it) & keys), None)
+
+    def _write_saved_as(self, it: Item, out: str, names, formats, labels: bool, trim=None, lab=None) -> dict:
+        """Write the motion as 다른 이름으로 저장 does (any thread): trim / lab are its (cuts, splits) and labels as the
+        dialog showed them (now when not given). 파일 위치 열기 opens the first file from now on, and that trim counts
+        as saved (MotionScene.trim_unsaved)."""
         sc = self.scene
+        cuts, splits = trim if trim is not None else sc._trim(it)
+        lab = lab if trim is not None else it.labels
         os.makedirs(out, exist_ok=True)
         res = dataset.export_motion(
-            it.robot, out, names[0], labels=it.labels if labels else None, removed=sc.cut_spans(it),
-            splits=sc.split_points(it), names=names, exact_name=True, formats=formats, limits=sc.limits, source=it.source,
+            it.robot, out, names[0], labels=lab if labels else None, removed=cuts,
+            splits=splits, names=names, exact_name=True, formats=formats, limits=sc.limits, source=it.source,
             fk=sc.fk, info={"retarget": it.retarget or None, "kind": it.kind, "source_sha256": dataset.sha256(it.source),
                             "saved_as": True})
         first = next((f for p in res["pieces"] for f in p["files"][:1]), None)
         it.info["saved_as"] = os.path.abspath(first or out)
+        sc.trim_saved[it] = (tuple(cuts), tuple(splits))
         return res
 
     def trim_motion(self, it: Item, side: str, t: float, base=None) -> None:
@@ -5048,31 +5154,42 @@ class EditorWindow(QMainWindow):
                         "(다른 이름으로 저장할 때 빠짐, Ctrl+Z로 되돌림)", 8000)
         self._refresh_label_actions()
 
-    def save_all_as(self) -> None:
-        """모두 다른 이름으로 저장: every motion on the timeline as 다른 이름으로 저장 would (its cut time left out, one file
-        per part), into one folder, in the background; the status bar says how it went (no window), a window lists
-        the ones that failed."""
+    def save_as_selected(self) -> None:
+        """Ctrl+Alt+S: the selected motion, or the selected ones together (save_all_as) when several are."""
+        many = self.selected_items()
+        if len(many) > 1:
+            self.save_all_as(many)
+        elif self.selected is not None:
+            self.save_motion_as(self.selected)
+
+    def save_all_as(self, items=None) -> None:
+        """모두 다른 이름으로 저장: every motion on the timeline (or these) as 다른 이름으로 저장 would (its cut time left
+        out, one file per part), into one folder, in the background, each with its cuts, splits and labels as the
+        dialog showed them; the status bar says how it went (no window), a window lists the ones that failed."""
         sc = self.scene
-        items = [it for it in sc.items if not sc.is_sim_result(it)]
+        chosen = items is not None
+        items = [it for it in (items if chosen else sc.items) if it in sc.items and not sc.is_sim_result(it)]
         if not items:
             self.status("저장할 모션이 없습니다", 4000)
             return
         if getattr(self, "_saving_all", False):
             self.status("모두 다른 이름으로 저장하는 중입니다", 4000)
             return
+        snap = {id(it): (sc._trim(it), it.labels) for it in items}  # what is written, as listed now
         names = export_dialogs.unique_names([self._save_as_name(it) for it in items])
         rows = [(it.label, n, len(sc.parts(it)), sum(b - a for a, b in sc.kept_spans(it)), it.robot.duration)
                 for it, n in zip(items, names)]
         start = os.path.join(os.path.dirname(items[0].source), "retlens_export")
+        title = f"선택한 모션 {len(items)}개 다른 이름으로 저장" if chosen else "모두 다른 이름으로 저장"
         while True:
-            dlg = export_dialogs.SaveAllAsDialog(self, self.settings, rows, start)
+            dlg = export_dialogs.SaveAllAsDialog(self, self.settings, rows, start, title=title)
             if dlg.exec() != QDialog.Accepted:
                 return
             out, formats, labels = dlg.folder.path(), dlg.formats.value(), dlg.labels.isChecked()
             jobs = [(it, fs) for it, fs in zip(items, dlg.files()) if fs]
             files = [(it, p) for it, fs in jobs
-                     for p in export_dialogs.save_as_files(out, fs, formats, labels and it.labels is not None)]
-            own = next((it for it, p in files if _file_key(p) in self._own_files(it)), None)
+                     for p in export_dialogs.save_as_files(out, fs, formats, labels and snap[id(it)][1] is not None)]
+            own = self._owner_of([p for _it, p in files])  # any open motion's, not only the one written
             if own is not None:
                 QMessageBox.warning(self, "모두 다른 이름으로 저장", f"{own.label}의 원본 파일이나 라벨 파일을 덮어쓰게 "
                                     f"됩니다.\n\n{out}\n\n다른 이름이나 폴더를 고르세요.")
@@ -5091,7 +5208,7 @@ class EditorWindow(QMainWindow):
             for k, (it, fs) in enumerate(jobs):
                 self.bridge.gui.emit(lambda k=k, it=it: self.status(f"모두 다른 이름으로 저장 {k + 1}/{len(jobs)}: {it.label}"))
                 try:
-                    res = self._write_saved_as(it, out, fs, formats, labels)
+                    res = self._write_saved_as(it, out, fs, formats, labels, *snap[id(it)])
                     done += len(res["pieces"])
                     secs += sum(p["duration_s"] for p in res["pieces"])
                 except Exception as e:
@@ -5126,16 +5243,25 @@ class EditorWindow(QMainWindow):
         lab = self.selected.labels if self.selected is not None else None
         self.a_save_labels.setEnabled(lab is not None and (bool(lab.segments) or lab.edited))
 
-    def _confirm_discard_labels(self, items: list[Item], action: str) -> bool:
-        """Unsaved label edits on these motions: save them (each to a CSV), let them go, or not do it at all."""
+    def _confirm_discard_labels(self, items: list[Item], action: str, trims: bool = True) -> bool:
+        """Unsaved label edits on these motions: save them (each to a CSV), let them go, or not do it at all. trims:
+        cut time and split points not written by 다른 이름으로 저장 yet are asked about too (not when they can come
+        back: closing a motion is undone with them)."""
         dirty = [it for it in items if self.scene.labels_dirty(it)]
-        if not dirty or not self.confirm_unsaved:
+        cut = [it for it in items if self.scene.trim_unsaved(it)] if trims else []
+        if (not dirty and not cut) or not self.confirm_unsaved:
             return True
-        names = ", ".join(it.label for it in dirty[:5]) + (f" 외 {len(dirty) - 5}개" if len(dirty) > 5 else "")
+        cut_text = (f"\n\n{_names(cut)}의 잘라낸 시간·파일 나누기도 아직 다른 이름으로 저장하지 않아 함께 사라집니다 "
+                    "(작업 세션에 저장하면 남습니다)." if cut else "")
+        if not dirty:
+            return QMessageBox.question(
+                self, "저장하지 않은 시간 잘라내기", f"{_names(cut)}의 잘라낸 시간·파일 나누기를 아직 다른 이름으로 저장하지 "
+                f"않았습니다. {action} 사라집니다(작업 세션에 저장하면 남습니다).\n\n계속할까요?") == QMessageBox.Yes
+        names = _names(dirty)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("저장하지 않은 라벨 편집")
-        box.setText(f"{names}의 라벨을 고친 내용이 아직 저장되지 않았습니다. {action} 고친 내용이 사라집니다.")
+        box.setText(f"{names}의 라벨을 고친 내용이 아직 저장되지 않았습니다. {action} 고친 내용이 사라집니다.{cut_text}")
         save = box.addButton("저장...", QMessageBox.AcceptRole)
         drop = box.addButton("저장하지 않음", QMessageBox.DestructiveRole)
         box.addButton("취소", QMessageBox.RejectRole)
@@ -5156,7 +5282,11 @@ class EditorWindow(QMainWindow):
         else:
             m.addAction("파일 위치 열기", lambda: self.show_in_folder(it.source))
         m.addAction("로봇 모션 내보내기...", lambda: self.export_motion(it))
-        m.addAction("다른 이름으로 저장...", lambda: self.save_motion_as(it))
+        sel = self.selected_items()
+        if it in sel and len(sel) > 1:
+            m.addAction(f"선택한 모션 {len(sel)}개 다른 이름으로 저장...", lambda: self.save_all_as(sel))
+        else:
+            m.addAction("다른 이름으로 저장...", lambda: self.save_motion_as(it))
         if len(self.scene.items) > 1:
             m.addAction(self.a_save_all_as)
         n = len(self.scene.cut_spans(it)) + len(self.scene.split_points(it))
@@ -5819,6 +5949,30 @@ class EditorWindow(QMainWindow):
         if path and os.path.exists(path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path)))
 
+    def open_doc(self, name: str) -> None:
+        """도움말's documents. A built RetLens opens a copy in the user folder (docs\\<version>), not the one in its
+        program folder: an editor that keeps the file open (VS Code watches its folder) would block the program
+        folder's swap when RetLens updates."""
+        src = app_paths.doc("docs", name)
+        if getattr(sys, "frozen", False) and os.path.isfile(src):
+            import shutil
+
+            from .. import __version__
+
+            root = os.path.join(app_paths.user_dir(), "docs")
+            dst = os.path.join(root, __version__)
+            try:
+                if not os.path.isfile(os.path.join(dst, name)):
+                    shutil.copytree(os.path.dirname(src), dst, dirs_exist_ok=True,
+                                    ignore=shutil.ignore_patterns("internal"))
+                for old in os.listdir(root):  # other versions' copies (one still open in an editor stays)
+                    if old != __version__:
+                        shutil.rmtree(os.path.join(root, old), ignore_errors=True)
+                src = os.path.join(dst, name)
+            except OSError as e:  # the program folder's own then
+                self.scene.log(f"could not copy the documents to {dst}: {e}")
+        self.open_path(src)
+
     def show_in_folder(self, path: str | None) -> None:
         """파일 위치 열기: the file's folder with the file picked (Windows Explorer), else the folder."""
         if path and os.path.isfile(path) and sys.platform == "win32":
@@ -5842,20 +5996,9 @@ class EditorWindow(QMainWindow):
                 self.select(rest[-1] if rest else None, many=rest)
             elif len(self.selection) != len(self.selected_items()):
                 self.select(self.selected, many=self.selected_items())
-            self.a_remove_all.setEnabled(bool(self.scene.items))
-            self.a_save_all_as.setEnabled(bool(self.scene.items))
-            self._refresh_label_actions()
-            self.hierarchy.rebuild()
-            self.analysis.refresh_lists()
-            self.scene_settings.refresh()
-            self.timeline.relayout()
-            self.refresh_analysis()
+            self._later("items")
         elif event in ("item", "status"):
-            if event == "item":
-                self.timeline.relayout()  # labels may have added or removed lanes
-            self.hierarchy.refresh()
-            self.refresh_analysis()  # the inspector too
-            self._refresh_status()
+            self._later(event)
         elif event == "labels":  # edited, loaded or taken off: only what shows labels
             self.timeline.relayout()
             self.inspector.refresh(metrics=False)
@@ -5864,18 +6007,45 @@ class EditorWindow(QMainWindow):
             self._append_log(str(payload))
         elif event == "history":
             self._refresh_label_actions()
-        if event in ("items", "item", "status", "compare"):
-            self.compare_panel.refresh()
-            on = self.scene.compare_pair() is not None
-            if self.a_compare.isChecked() != on:
-                self.a_compare.blockSignals(True)
-                self.a_compare.setChecked(on)
-                self.a_compare.blockSignals(False)
+        if event == "compare":
+            self._later("compare")
+        self.timeline.refresh()
+
+    def _later(self, what: str) -> None:
+        """Panels to make again after scene events, once for all the events of a burst (opening 100 motions, 시간 자동
+        정렬, a 되돌리기 of many steps, physics jobs finishing): made when the GUI gets to it (_flush_scene)."""
+        pending = self.__dict__.setdefault("_pending", set())
+        if not pending:
+            QTimer.singleShot(0, self._flush_scene)
+        pending.add(what)
+
+    def _flush_scene(self) -> None:
+        pending, self._pending = self.__dict__.get("_pending", set()), set()
+        if not pending:
+            return
+        if "items" in pending:
+            self.a_remove_all.setEnabled(bool(self.scene.items))
+            self.a_save_all_as.setEnabled(bool(self.scene.items))
+            self._refresh_label_actions()
+            self.hierarchy.rebuild()
+            self.analysis.refresh_lists()
+            self.scene_settings.refresh()
+        else:
+            self.hierarchy.refresh()
+        if pending & {"items", "item"}:
+            self.timeline.relayout()  # labels may have added or removed lanes
+        self.refresh_analysis()  # the inspector too
+        self._refresh_status()
+        self.compare_panel.refresh()
+        on = self.scene.compare_pair() is not None
+        if self.a_compare.isChecked() != on:
+            self.a_compare.blockSignals(True)
+            self.a_compare.setChecked(on)
+            self.a_compare.blockSignals(False)
         self.timeline.refresh()
 
     def refresh_analysis(self) -> None:
-        self.analysis.update_table()
-        self.analysis.rebuild_chart()
+        self.analysis.refresh_content()
         self.inspector.refresh()
 
     def _refresh_status(self) -> None:

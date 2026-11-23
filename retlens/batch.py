@@ -19,6 +19,11 @@ the rule file and its modification time), so a run that was stopped or a folder 
 folder's label table (labels.csv / labels.json) is not in the key: a cached row's labels are read again from the
 label files, so editing one row of the table does not make every row of the folder again. A row whose physics
 check failed (phys_error) is not cached: it is tried again next time.
+
+A robot motion RetLens saved (다른 이름으로 저장, 데이터셋 내보내기: <name>.npz with its <name>.json) whose JSON names the
+human motion it came from (source, and where in it: source_start_s / source_end_s) is measured as that part of its
+source: the source retargeted as the JSON says (cached), cut to those times and shown as the saved robot motion, so
+its row has the 리타게팅 점수, 주된 감점, 자동 라벨 and props of what it holds (export_origin).
 """
 
 from __future__ import annotations
@@ -34,11 +39,12 @@ from typing import Callable
 
 from . import paths
 
-BATCH_VERSION = 4  # bump when a row's meaning changes (old cached rows are then computed again)
+BATCH_VERSION = 5  # bump when a row's meaning changes (old cached rows are then computed again)
 # 2: rows keep where the problems are (problem_spans, qc_bad_spans, phys_fall_times_s) for retlens.dataset
 # 3: a C3D's solved motion is the one next to it (compare.find_take); label files and physics config in the key
 # 4: a C3D's solved motion in the key and its objects in the row; take_warning, solved_motion, solved_elsewhere,
 #    file_warnings, phys_torque_limits_missing; folder label tables read again for a cached row (not in the key)
+# 5: a saved robot motion with its source named in its JSON is measured as that part of its source (export_origin)
 
 EXPORT_FOLDER = "retlens_export"  # the window's default folder for 로봇 모션 내보내기, below the motion's own folder
 
@@ -176,8 +182,11 @@ class Batch:
                   if os.path.basename(p).lower() not in FOLDER_TABLES and os.path.isfile(p)]
         if labels:
             parts.append(labels)
-        for f in (path, solve):  # props of the take in a file of their own (retlens.props): only when there are
-            if f and f.lower().endswith(".fbx"):  # some, so other files keep their rows
+        origin = export_origin(path)
+        if origin is not None:  # a saved robot motion measured as part of its source: its JSON and the source too
+            parts.append([_stat(origin["json"]), origin["source"], *_stat(origin["source"])])
+        for f in (path, solve, origin["source"] if origin else None):  # props of the take in a file of their own
+            if f and f.lower().endswith(".fbx"):  # (retlens.props): only when there are some, so other files keep rows
                 props = signature(f)
                 if props:
                     parts.append(props)
@@ -281,13 +290,56 @@ class Batch:
         return {**row, "cached": False}
 
     def load_item(self, path: str):
-        """The motion as the options make it (a human one retargeted with their corrections; cached)."""
+        """The motion as the options make it (a human one retargeted with their corrections; cached); a saved robot
+        motion whose JSON names its source: that part of the source (load_export)."""
         from .compare import load_item
 
+        origin = export_origin(path)
+        if origin is not None:
+            return self.load_export(path, origin)
         o = self.opts
         return load_item(path, robot=o.robot, smooth=o.smooth, fps=o.fps, csv_fps=o.csv_fps, smpl_model_dir=o.smpl_model_dir,
                          swing_clearance=o.swing_clearance_cm / 100.0, foot_flat=o.foot_flat,
                          self_collision=o.self_collision, log=None)
+
+    def load_export(self, path: str, origin: dict):
+        """A saved robot motion as part of its source: the source retargeted as the JSON says (its corrections, the
+        options' robot and rates), its human skeleton (and props) cut to source_start_s..source_end_s, and the saved
+        robot motion itself as the robot (it has as many frames). Raises when the source no longer matches."""
+        from .compare import Item, load_item
+        from .io.robot import load_robot_npz
+
+        o, r = self.opts, origin.get("retarget") or {}
+        src = load_item(origin["source"], robot=o.robot, smooth=float(r.get("smooth_hz", o.smooth)), fps=o.fps,
+                        csv_fps=o.csv_fps, smpl_model_dir=o.smpl_model_dir,
+                        swing_clearance=float(r.get("swing_clearance_cm", 0.0) or 0.0) / 100.0,
+                        foot_flat=bool(r.get("foot_flat", False)), self_collision=bool(r.get("self_collision", False)),
+                        log=None)
+        from .dataset import slice_motion
+        from .robot_profile import load as load_robot, same_robot
+
+        saved = load_robot_npz(path)
+        t0, t1 = float(origin["start_s"]), float(origin["end_s"])
+        if src.human is None or t1 > src.robot.duration + 1.0 / src.robot.fps:
+            raise ValueError(f"원본이 저장할 때와 다릅니다({os.path.basename(origin['source'])}: "
+                             f"{src.robot.duration:.2f}초, 저장한 구간 {t0:.2f}–{t1:.2f}초)")
+        # the saved robot motion when it is of this robot (another robot's: that part retargeted for this one)
+        i0 = int(round(t0 * src.robot.fps))
+        if same_robot(saved.meta.get("robot_ident"), load_robot(o.robot).ident) and saved.fps == src.robot.fps:
+            robot = saved
+        else:
+            robot = slice_motion(src.robot, i0, min(src.robot.num_frames, i0 + int(round((t1 - t0) * src.robot.fps))))
+            robot.name, robot.source = saved.name, os.path.abspath(path)
+        item = Item(label=os.path.splitext(os.path.basename(path))[0], source=os.path.abspath(path),
+                    kind=f"{src.kind} · 원본 {t0:.2f}–{t1:.2f}s를 저장한 것", robot=robot,
+                    human=cut_skeleton(src.human, t0, t0 + robot.duration),
+                    # not the source's solved motion (a C3D's): its label files are on the whole take's times
+                    info={**{k: v for k, v in src.info.items() if k != "solved_motion"},
+                          "saved_from": origin["source"], "saved_range_s": [t0, t1]},
+                    retarget=src.retarget)
+        if src.solved_human is not None:
+            item.solved_human = cut_skeleton(src.solved_human, t0, t0 + robot.duration)
+        return item
 
     def labels(self, path: str, item):
         """(labels, "file" | "auto" | None): the label file next to the motion, else 자동 라벨 by the options'
@@ -452,6 +504,43 @@ def _by_name(files) -> dict:
     for i, f in enumerate(files):
         out.setdefault(os.path.splitext(os.path.basename(f).lower())[0], []).append((i, f))
     return out
+
+
+def export_origin(path: str) -> dict | None:
+    """What a robot motion RetLens saved came from, read from the <name>.json next to its <name>.npz: {"json",
+    "source" (the human motion file, which is there), "start_s", "end_s", "retarget"}; None for any other file, or
+    when the JSON names no human motion file that is there (an older save named the retarget cache)."""
+    if not path.lower().endswith(".npz"):
+        return None
+    js = os.path.splitext(path)[0] + ".json"
+    try:
+        with open(js, encoding="utf-8") as f:
+            j = json.load(f)
+    except (OSError, ValueError):
+        return None
+    from .compare import human_format
+
+    src = j.get("source") if isinstance(j, dict) and j.get("retlens") else None
+    if not isinstance(src, str) or not src or not os.path.isfile(src) or human_format(src) is None:
+        return None
+    try:
+        t0, t1 = float(j["source_start_s"]), float(j["source_end_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"json": js, "source": os.path.abspath(src), "start_s": t0, "end_s": t1,
+            "retarget": j.get("retarget") if isinstance(j.get("retarget"), dict) else {}}
+
+
+def cut_skeleton(h, t0: float, t1: float):
+    """Frames of a human skeleton (and its objects) from t0 to before t1 seconds, as a skeleton of its own."""
+    import dataclasses
+
+    k0 = max(0, int(round(t0 * h.fps)))
+    k1 = min(h.num_frames, max(k0 + 1, int(round(t1 * h.fps))))
+    objs = [dataclasses.replace(ob, positions=ob.positions[k0:k1], rotations=ob.rotations[k0:k1]) for ob in h.objects]
+    return dataclasses.replace(h, positions=h.positions[k0:k1],
+                               rotations=h.rotations[k0:k1] if h.rotations is not None else None, objects=objs,
+                               meta={**h.meta, "cut_s": [round(k0 / h.fps, 4), round(k1 / h.fps, 4)]})
 
 
 def _stat(path: str) -> list:

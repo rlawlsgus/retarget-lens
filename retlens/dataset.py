@@ -92,13 +92,17 @@ class ExportOptions:
 
 
 # ------------------------------------------------------------------ cutting
+FRAME_EPS = 1e-3  # of a frame: a time this close to a frame is on it (cut_mask)
+
+
 def cut_mask(frames: int, fps: float, spans: list[tuple[float, float, str]], pad_s: float = 0.0) -> np.ndarray:
     """(T,) bool: the frames inside any of the spans (start_s, end_s, kind), each widened by pad_s. A span
     holds the frames from start to before end (retlens.problems), so a frame is cut when start <= t < end."""
     m = np.zeros(frames, dtype=bool)
-    for a, b, _k in spans:
-        i0 = max(0, int(np.floor((a - pad_s) * fps + 1e-6)))
-        i1 = min(frames, int(np.ceil((b + pad_s) * fps - 1e-6)))
+    for a, b, _k in spans:  # a time on a frame stays on it: times are kept rounded (to 6 decimals: 3e-5 of a frame
+        # at 30 fps), so within FRAME_EPS of a frame is that frame (1e-6 lost a frame at about 2 edges in 3)
+        i0 = max(0, int(np.floor((a - pad_s) * fps + FRAME_EPS)))
+        i1 = min(frames, int(np.ceil((b + pad_s) * fps - FRAME_EPS)))
         if i1 > i0:
             m[i0:i1] = True
     return m
@@ -110,7 +114,7 @@ def kept_ranges(mask: np.ndarray, fps: float, min_s: float) -> tuple[list[tuple[
     keep = ~np.asarray(mask, dtype=bool)
     d = np.diff(np.concatenate([[0], keep.astype(np.int8), [0]]))
     runs = list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist()))
-    need = int(np.ceil(min_s * fps - 1e-6))
+    need = int(np.ceil(min_s * fps - FRAME_EPS))
     out = [(a, b) for a, b in runs if b - a >= max(1, need)]
     return out, sum(b - a for a, b in runs) - sum(b - a for a, b in out)
 
@@ -455,7 +459,9 @@ def export_motion(robot, out_dir: str, stem: str, *, labels=None, cut: CutOption
                 entry["label_seconds"] = label_seconds(lab)
         entry["info"] = base + ".json"
         with open(entry["info"], "w", encoding="utf-8") as f:
-            json.dump({"retlens": __version__, "name": name, "source": robot.source,
+            # the file it came from (a human motion: the person's file, not its retarget cache), so a batch can measure
+            # this piece as that part of it (retlens.batch.export_origin)
+            json.dump({"retlens": __version__, "name": name, "source": os.path.abspath(source) if source else robot.source,
                        "source_start_s": entry["start_s"], "source_end_s": entry["end_s"], "fps": fps,
                        "frames": entry["frames"], "joint_names": list(robot.joint_names),
                        **({"csv_fps": entry["csv_fps"], "csv_frames": entry["csv_frames"]} if "csv_fps" in entry else {}),

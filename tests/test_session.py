@@ -586,3 +586,29 @@ def test_a_restore_cancelled_before_it_starts_leaves_the_scene(scene):
     r = session.Restore(data, None, "replace").run(scene, cancelled=lambda: True)
     assert r.cancelled and scene.items == [a]
 
+
+
+def test_cuts_and_splits_are_kept_and_opening_starts_the_history(scene, tmp_path):
+    """시간 잘라내기 and 파일 나누기 go into the session (and its unsaved mark) and come back; opening a session in
+    place of the work starts the 되돌리기 history there: the closed work is not undone into it, and opening its
+    motions is no step."""
+    a, b = scene.add(SAMPLE), scene.add(SAMPLE)
+    dur, fps = a.robot.duration, a.robot.fps
+    before = session.fingerprint(scene)
+    assert scene.trim(a, "end", dur - 0.5) and scene.split_file(b, 1.0)
+    assert session.fingerprint(scene) != before  # a cut is a change of the work
+    assert scene.trim_unsaved(a) and scene.trim_unsaved(b)
+    scene.trim_saved[a] = scene._trim(a)  # as 다른 이름으로 저장 leaves it
+    assert not scene.trim_unsaved(a) and scene.trim_unsaved(b)
+    cuts_a, splits_b = scene.cut_spans(a), scene.split_points(b)
+    path, data = _saved(scene, tmp_path)
+    assert data["motions"][0]["cuts"] == [list(c) for c in cuts_a] and data["motions"][1]["splits"] == list(splits_b)
+    other = scene.add(SAMPLE)
+    r = session.restore(scene, data, str(tmp_path), physics_ready=lambda balance: "")
+    ra, rb = r.items[0], r.items[1]
+    assert scene.cut_spans(ra) == cuts_a and scene.split_points(rb) == splits_b and scene.cut_spans(rb) == ()
+    assert other not in scene.items and scene.undo_text() == (None, None)  # nothing of the closed work to undo
+    assert session.parse({"format": "retlens-session", "version": 1, "motions": [
+        {"file": {"abs": SAMPLE}, "cuts": [[1, 0.5], "x", [0.2, 0.4]], "splits": [0.3, "y"]}]})["motions"][0][
+        "cuts"] == [[0.2, 0.4]]
+    assert round(dur * fps) == a.robot.num_frames

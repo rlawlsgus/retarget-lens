@@ -103,6 +103,27 @@ def _fbx_stems(folder: str) -> list[tuple[str, str]]:
     return [(n[:-4].lower(), os.path.join(folder, n)) for n, d in _entries(folder) if not d and n.lower().endswith(".fbx")]
 
 
+_HEADS: dict[str, tuple] = {}  # folder -> (its listing, {take: [prop files]}): made again when the listing is
+
+
+def _prop_index(folder: str) -> dict[str, list[str]]:
+    """{take: prop files named for it} of a folder (prop_head of each FBX, in listing order), made once per listing:
+    a batch asks it for every take of a folder of thousands of FBX files."""
+    entries = _entries(folder)
+    hit = _HEADS.get(folder)
+    if hit is not None and hit[0] is entries:
+        return hit[1]
+    index: dict[str, list[str]] = {}
+    for s, f in _fbx_stems(folder):
+        h = prop_head(s)
+        if h is not None:
+            index.setdefault(h, []).append(f)
+    if len(_HEADS) > 512:
+        _HEADS.clear()
+    _HEADS[folder] = (entries, index)
+    return index
+
+
 def _subfolders(folder: str) -> list[str]:
     return [os.path.join(folder, n) for n, d in _entries(folder) if d]
 
@@ -172,8 +193,8 @@ def find_props(path: str) -> tuple[list[str], list[dict]]:
     folders = _search_folders(path)
     found: list[str] = []
     for take in take_names(path):
-        found = [f for folder in folders for s, f in _fbx_stems(folder)
-                 if prop_head(s) == take and os.path.normcase(f) != me]
+        found = [f for folder in folders for f in _prop_index(folder).get(take, ())
+                 if os.path.normcase(f) != me]
         if found:
             break
     mine = set()

@@ -242,10 +242,21 @@ class RobotBatch:
         return z.max(axis=(0, 2))
 
     def update(self, T_base: np.ndarray, cfg: np.ndarray, visible: np.ndarray) -> np.ndarray:
-        """Pose every robot; returns the link transforms. Hidden robots are scaled to zero."""
+        """Pose every robot; returns the link transforms. Hidden robots are scaled to zero and not posed: they keep
+        the transforms they had (hundreds of motions open, most hidden, is a common way to work)."""
         if not self.handles or len(T_base) != len(self.colors):
             return np.empty((len(self.links), 0, 4, 4))
-        T = self.forward(T_base, cfg)
+        vis = np.asarray(visible, bool)
+        last = getattr(self, "_last_T", None)
+        if vis.all() or last is None or last.shape[1] != len(T_base):
+            T = self.forward(T_base, cfg)
+        else:
+            T = last.copy()
+            if vis.any():
+                T[:, vis] = self.forward(T_base[vis], cfg[vis])
+        self._last_T = T
+        if not vis.any() and self._scales is not None and not self._scales.any():
+            return T  # all hidden and already sent hidden: nothing to send
         self.send(T, visible)
         return T
 
@@ -310,6 +321,7 @@ class OverlayBatch:
         if not n or ("human" in self.handles) != (nb > 0):
             self.remove()
         self.layout = layout
+        self._shown_last = None  # a new layout: the next update sends
         if not n:
             return
         fresh = not self.handles
@@ -346,6 +358,10 @@ class OverlayBatch:
         if self.layout is None or not self.handles:
             return
         bones = self.layout[0]
+        now = any(h is not None for h in humans) or any(b is not None for b in balance)
+        if not now and getattr(self, "_shown_last", True) is False:
+            return  # nothing shown, and nothing was last time: the nodes are already empty
+        self._shown_last = now
         if "human" in self.handles:
             pts = np.concatenate([(h if h is not None else np.zeros((k, 2, 3)))
                                   for h, k in zip(humans, bones) if k]).astype(np.float32)

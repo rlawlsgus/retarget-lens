@@ -411,6 +411,8 @@ class MotionScene:
         # 파일 나누기 per motion: (time_s, ...) sorted, inside the motion: 다른 이름으로 저장 writes one file per part
         # between them (a round trip into its legs). A step of the label undo history too (split_file)
         self.splits: dict[Item, tuple] = {}
+        # (cuts, splits) each motion had when 다른 이름으로 저장 wrote it: a trim not written yet is trim_unsaved
+        self.trim_saved: dict[Item, tuple] = {}
         # label definition (자동 라벨 rule) files read for the label pick lists: {path: ((mtime, size), labels)}; one
         # entry per file, replaced whole (the window and the API threads read it: no step iterates or deletes)
         self._rule_label_cache: dict[str, tuple] = {}
@@ -466,7 +468,7 @@ class MotionScene:
 
     # ---------------------------------------------------------------- items
     def add(self, path: str, retarget: dict | None = None, color: tuple | None = None,
-            prepare: Callable[[Item], None] | None = None) -> Item:
+            prepare: Callable[[Item], None] | None = None, record: bool = True) -> Item:
         """Load (retarget when needed) and show a motion file; raises on failure.
         retarget: this motion's corrections instead of the 리타게팅 menu's ({smooth_hz, foot_flat,
         swing_clearance_cm, self_collision}, any of them; a saved work session). color: its colour when no other
@@ -504,7 +506,8 @@ class MotionScene:
         self.log(f"added {item.label}: {item.kind}, {item.robot.num_frames} frames @ {item.robot.fps:g} fps")
         self.emit("items", item)  # payload: the motion just opened (the window drops its unresolved session entry)
         self._request_physics(item)
-        self._record({"kind": "add", "item": item, "what": f"모션 열기 ({item.label})"})
+        if record:  # (a work session opened in place of the work: its motions are where its history starts)
+            self._record({"kind": "add", "item": item, "what": f"모션 열기 ({item.label})"})
         return item
 
     def _robot_regions(self) -> None:
@@ -979,6 +982,11 @@ class MotionScene:
             self.splits[item] = tuple(splits)
         else:
             self.splits.pop(item, None)
+
+    def trim_unsaved(self, item: Item) -> bool:
+        """The motion has cut time or split points that 다른 이름으로 저장 has not written as they are now."""
+        trim = self._trim(item)
+        return bool(trim[0] or trim[1]) and self.trim_saved.get(item) != trim
 
     def split_points(self, item: Item | None) -> tuple:
         """The motion's 파일 나누기 times (its own time), sorted."""
@@ -1636,6 +1644,8 @@ class MotionScene:
                 self.cuts[new] = cuts
             if splits:
                 self.splits[new] = splits
+            if item in self.trim_saved:
+                self.trim_saved[new] = self.trim_saved[item]
             for k, it in enumerate(self.items):
                 it.handles["index"] = k
             self._build_item(new, i)
@@ -2735,8 +2745,8 @@ class MotionScene:
             out.append((it, tt[sel], y[sel]))
         return out
 
-    def metric_table(self, ref: Item | None) -> tuple[list[str], list[tuple[Item, list[str]]]]:
-        """Row labels and, per motion, its formatted values (physics results in physics mode)."""
+    def metric_table(self, ref: Item | None, only: Item | None = None) -> tuple[list[str], list[tuple[Item, list[str]]]]:
+        """Row labels and, per motion (only: that one), its formatted values (physics results in physics mode)."""
 
         def f(v, fmt):
             if v is None or (isinstance(v, float) and not np.isfinite(v)):
@@ -2747,15 +2757,12 @@ class MotionScene:
         names = ["재생 방식"] + [r[0] for r in METRIC_ROWS[:qc]] + ["기준 대비 다리 RMSE (°)", "기준 대비 전체 RMSE (°)"] \
             + [r[0] for r in METRIC_ROWS[qc:]]
         cols = []
-        for it in list(self.items):
+        for it in list(self.items) if only is None else [only]:
             shown = self.shown(it)
             m = shown.metrics
             legs = whole = "기준" if it is ref else "-"
             if ref is not None and it is not ref:
-                joints, rmse, ov = analysis.joint_rmse(self.shown(ref).robot, shown.robot, ref.offset, it.offset)
-                if ov > 0:
-                    li = [i for i, n in enumerate(joints) if any(k in n for k in analysis.LEG_KEYS)]
-                    legs, whole = f(float(np.median(rmse[li])), "{:.1f}"), f(float(np.median(rmse)), "{:.1f}")
+                legs, whole = self._rmse_cells(self.shown(ref).robot, shown.robot, ref.offset, it.offset, f)
             mode = (f"물리 x{shown.info['physics'].get('harness_scale', 1):g}" if self.is_physics_result(shown)
                     else f"MuJoCo · {MODE_SHORT.get(shown.info['policy_replay'].get('controller'), '없음')}"
                     if self.is_policy_result(shown)
@@ -2764,6 +2771,24 @@ class MotionScene:
             vals = [mode] + vals[:qc] + [legs, whole] + vals[qc:]
             cols.append((it, vals))
         return names, cols
+
+    def _rmse_cells(self, a, b, off_a: float, off_b: float, f) -> tuple[str, str]:
+        """(legs, whole) RMSE cells of robot motion b against a at these offsets, remembered: the table is made
+        again on every change of any motion, and each RMSE samples both clips in full."""
+        cache = self.__dict__.setdefault("_rmse_memo", {})
+        key = (id(a), id(b), float(off_a), float(off_b))
+        hit = cache.get(key)
+        if hit is not None and hit[0] is a and hit[1] is b:  # the same objects (an id can be reused)
+            return hit[2]
+        legs = whole = "-"
+        joints, rmse, ov = analysis.joint_rmse(a, b, off_a, off_b)
+        if ov > 0:
+            li = [i for i, n in enumerate(joints) if any(k in n for k in analysis.LEG_KEYS)]
+            legs, whole = f(float(np.median(rmse[li])), "{:.1f}"), f(float(np.median(rmse)), "{:.1f}")
+        if len(cache) > 4096:
+            cache.clear()
+        cache[key] = (a, b, (legs, whole))
+        return legs, whole
 
     def joint_rmse(self, ref: Item) -> list[tuple[Item, list[str], np.ndarray]]:
         out = []

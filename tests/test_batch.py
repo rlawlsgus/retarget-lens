@@ -183,3 +183,39 @@ def test_dataset_table_qc_sorts_worst_first():
         QTest.mouseClick(head.viewport(), Qt.LeftButton, pos=QPoint(head.sectionViewportPosition(col) + 5, 5))
         assert order() == ["FAIL", "WARN", "WARN", "PASS", "PASS"]
     view.close()
+
+
+def test_a_saved_part_is_measured_as_its_source(session, tmp_path):
+    """다른 이름으로 저장한 로봇 모션 (npz + json naming its source and where in it): its row is that part of the source,
+    retargeted as the json says: 리타게팅 점수, 주된 감점, 자동 라벨 of what it holds; a json naming no human motion (an
+    older save named the retarget cache) leaves it a robot motion's row."""
+    from retlens import dataset
+
+    walk = str(session / "walk.bvh")
+    b = batch.Batch(batch.BatchOptions(), cache_dir=str(tmp_path / "batch"))
+    full = b.load_item(walk)
+    out = tmp_path / "saved"
+    out.mkdir()
+    dur = full.robot.duration
+    res = dataset.export_motion(full.robot, str(out), "walk_part", removed=[(0.0, 0.5), (dur - 0.4, dur)],
+                                exact_name=True, source=walk, info={"retarget": full.retarget, "saved_as": True})
+    (piece,) = res["pieces"]
+    npz = str(out / "walk_part.npz")
+    origin = batch.export_origin(npz)
+    assert origin["source"] == os.path.abspath(walk) and origin["start_s"] == piece["start_s"] == 0.5
+    item = b.load_item(npz)
+    assert item.human is not None and item.robot.num_frames == piece["frames"]
+    assert abs(item.human.duration - item.robot.duration) < 2.0 / item.human.fps
+    row = b.process(npz)
+    assert row.get("error") is None and row["retarget_score"] is not None and "저장한 것" in row["kind"]
+    assert row["duration_s"] == pytest.approx(piece["duration_s"], abs=1e-3) and row["name"] == "walk_part"
+    assert b.process(npz)["cached"]
+    # an older save: the json names the retarget cache, not the person's file
+    import json
+    js = out / "walk_part.json"
+    j = json.loads(js.read_text(encoding="utf-8"))
+    j["source"] = full.robot.source
+    js.write_text(json.dumps(j), encoding="utf-8")
+    assert batch.export_origin(npz) is None
+    row = b.process(npz)  # the json is in the key: a new row
+    assert not row["cached"] and row["retarget_score"] is None

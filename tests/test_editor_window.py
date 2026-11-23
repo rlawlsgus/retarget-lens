@@ -374,7 +374,7 @@ def test_drag_a_bar_end_to_trim_and_save_all(tmp_path, monkeypatch):
     seen = {}
 
     class Dlg:  # 모두 다른 이름으로 저장 answered as it comes: this folder, npz with labels
-        def __init__(self, parent, store, rows, start):
+        def __init__(self, parent, store, rows, start, title=""):
             seen["rows"] = rows
             self.folder = type("F", (), {"path": lambda _s: str(out)})()
             self.formats = type("F", (), {"value": lambda _s: ("npz",)})()
@@ -528,6 +528,97 @@ def test_select_several_delete_and_reorder(tmp_path, monkeypatch):
         assert [win.item_by_id(win.hierarchy.topLevelItem(i).data(0, Qt.UserRole))
                 for i in range(win.hierarchy.topLevelItemCount())] == [b, c, a]
         assert win.a_undo.text() == f"되돌리기: 순서 바꾸기 ({a.label})"
+    finally:
+        if win is not None:
+            win.hide()
+            win.deleteLater()
+            QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+            APP.processEvents()
+        sc.runner.shutdown()
+        server.stop()
+
+
+def test_ranges_selected_saves_dataset_rows_and_documents(tmp_path, monkeypatch):
+    """Shift+click a range of names (Ctrl+Shift: added); Ctrl+Alt+S with several selected saves those; a save
+    writes the cuts it was given, not ones made since, and never over another open motion's file; the 데이터셋
+    table opens and copies the picked rows; a built RetLens opens its documents from a copy in the user folder."""
+    import viser
+
+    from retlens.app import editor
+    from retlens.app import scene as scmod
+
+    user = tmp_path / "user"
+    user.mkdir()
+    (user / "settings.json").write_text(json.dumps({"api_enabled": False}), encoding="utf-8")
+    monkeypatch.setenv("RETLENS_USER_DIR", str(user))
+    monkeypatch.setattr(editor, "app_settings", lambda: QSettings(str(tmp_path / "layout.ini"), QSettings.IniFormat))
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server = viser.ViserServer(host="127.0.0.1", port=port, verbose=False)
+    sc = scmod.MotionScene(server, scmod.load_robot_urdf(DEFAULT_URDF, 0.02, log=lambda *_: None),
+                           scmod.SceneOptions(video_dir=str(tmp_path / "videos")), log=lambda *_: None)
+    win = None
+    try:
+        win = editor.EditorWindow(sc, f"http://127.0.0.1:{port}")
+        win.auto_setup = False
+        win.show()
+        APP.processEvents()
+        items = [sc.add(SAMPLE) for _ in range(4)]
+        APP.processEvents()
+        tr = win.timeline.tracks
+        name_y = lambda it: next(r[1] for r in tr._rows() if r[0] is it) + tr.ROW_H // 2  # noqa: E731
+        QTest.mouseClick(tr, Qt.LeftButton, Qt.NoModifier, QPoint(20, name_y(items[1])))
+        QTest.mouseClick(tr, Qt.LeftButton, Qt.ShiftModifier, QPoint(20, name_y(items[3])))
+        assert win.selected is items[1] and win.selected_items() == items[1:]
+        QTest.mouseClick(tr, Qt.LeftButton, Qt.NoModifier, QPoint(20, name_y(items[3])))
+        QTest.mouseClick(tr, Qt.LeftButton, Qt.ShiftModifier, QPoint(20, name_y(items[2])))
+        assert win.selected_items() == items[2:]
+        QTest.mouseClick(tr, Qt.LeftButton, Qt.ControlModifier | Qt.ShiftModifier, QPoint(20, name_y(items[0])))
+        assert win.selected_items() == items  # added: 0..3 (from the main one, 3)
+        win.select(items[0], many=items[:2])
+        asked = []
+        monkeypatch.setattr(win, "save_all_as", lambda its=None: asked.append(its))
+        win.a_save_as.trigger()  # Ctrl+Alt+S with two selected: those two
+        assert asked == [items[:2]] and win.a_save_as.text() == "선택한 모션 2개 다른 이름으로 저장..."
+        # what a save writes: the cuts it was given (the dialog's), not the ones made since
+        a = items[0]
+        trim = ((round(round((a.robot.duration - 0.5) * a.robot.fps) / a.robot.fps, 6), round(a.robot.duration, 6)),), ()
+        sc.cut_time(a, 0.0, 0.4)
+        res = win._write_saved_as(a, str(tmp_path / "out"), ["a_saved"], ("npz",), False, trim, None)
+        (piece,) = res["pieces"]
+        assert piece["start_s"] == 0.0 and piece["frames"] == round(trim[0][0][0] * a.robot.fps)
+        assert sc.trim_saved[a] == trim and sc.trim_unsaved(a)  # the cut made since is not saved
+        assert win._owner_of([items[1].source]) is items[0]  # every open motion's own file (the same file here)
+        # the 데이터셋 table: Enter opens the picked rows, Ctrl+C copies them for Excel
+        ds = win.dataset
+        rows = [{"file": SAMPLE, "name": f"r{k}", "folder": "f", "qc": "PASS", "retarget_score": 90 - k} for k in range(3)]
+        ds.model.set_rows(rows)
+        APP.processEvents()
+        from PySide6.QtCore import QItemSelectionModel
+        for r in (0, 2):  # as Ctrl+click picks them
+            ds.table.selectionModel().select(ds.proxy.index(r, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        assert [r["name"] for r in ds.selected_rows()] == ["r0", "r2"]
+        opened = []
+        monkeypatch.setattr(win, "add_paths", lambda paths: opened.append(list(paths)))
+        ds.open_selected()
+        assert opened == [[SAMPLE, SAMPLE]]
+        ds.copy_selected()
+        lines = QApplication.clipboard().text().splitlines()
+        assert lines[0].split("\t")[0] == "모션" and [ln.split("\t")[0] for ln in lines[1:]] == ["r0", "r2"]
+        # documents: a built RetLens opens a copy in the user folder
+        docs = tmp_path / "prog" / "docs"
+        (docs / "images").mkdir(parents=True)
+        (docs / "manual.md").write_text("# m", encoding="utf-8")
+        (docs / "images" / "a.png").write_bytes(b"x")
+        monkeypatch.setattr(editor.app_paths, "doc", lambda *p: str(tmp_path / "prog" / os.path.join(*p)))
+        monkeypatch.setattr(editor.app_paths, "user_dir", lambda: str(user))
+        monkeypatch.setattr(editor.sys, "frozen", True, raising=False)
+        shown = []
+        monkeypatch.setattr(win, "open_path", shown.append)
+        win.open_doc("manual.md")
+        from retlens import __version__
+        assert shown == [str(user / "docs" / __version__ / "manual.md")] and (user / "docs" / __version__ / "images" / "a.png").is_file()
     finally:
         if win is not None:
             win.hide()

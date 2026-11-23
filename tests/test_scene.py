@@ -918,3 +918,35 @@ def test_moving_a_motion_in_the_list(scene):
         for it in list(scene.items):
             scene.remove(it)
         scene.clear_history()
+
+
+def test_hidden_robots_are_not_posed(scene, monkeypatch):
+    """Hidden robots keep the transforms they had (no forward kinematics for them), and nothing is sent once all
+    are hidden; shown again, they are posed at the time shown."""
+    a, b = scene.add(SAMPLE), scene.add(SAMPLE)
+    try:
+        scene.seek(0.5)
+        scene.tick(0.0)
+        posed = []
+        real = scene.robots.forward
+        monkeypatch.setattr(scene.robots, "forward", lambda T, cfg: posed.append(len(T)) or real(T, cfg))
+        scene.set_visible(b, False)
+        scene.seek(1.0)
+        scene.tick(0.0)
+        assert posed == [1]  # a only
+        sent = []
+        monkeypatch.setattr("retlens.app.robots.set_props", lambda h, **kw: sent.append(kw))
+        scene.set_visible(a, False)
+        scene.seek(1.2)
+        scene.tick(0.0)  # all hidden: hidden once more (scales), then nothing
+        scene.seek(1.4)
+        n = len(sent)
+        scene.tick(0.0)
+        assert len(sent) == n
+        scene.set_visible(b, True)
+        scene.seek(1.6)
+        scene.tick(0.0)
+        assert posed[-1] == 1 and len(sent) > n
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)

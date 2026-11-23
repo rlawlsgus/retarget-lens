@@ -456,12 +456,12 @@ class SaveAllAsDialog(QDialog):
     out, one file per part), into one folder. rows: (motion label, default name, number of files, seconds kept,
     seconds in all) per motion; a motion with nothing kept is listed and left out."""
 
-    def __init__(self, parent, store, rows, start_folder: str):
+    def __init__(self, parent, store, rows, start_folder: str, title: str = "모두 다른 이름으로 저장"):
         from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
 
         super().__init__(parent)
         self.store, self.rows = store, list(rows)
-        self.setWindowTitle(f"모두 다른 이름으로 저장 - 모션 {len(self.rows)}개")
+        self.setWindowTitle(f"{title} - 모션 {len(self.rows)}개")
         lay = QVBoxLayout(self)
         form = QFormLayout()
         self.folder = FolderRow(_get(store, "save_as_folder", start_folder), "저장할 폴더", self)
