@@ -400,6 +400,11 @@ class MotionScene:
         self.playlist: dict | None = None  # 라벨 구간 이어 재생 (play_segments)
         # label edits per motion: {"undo": [(labels, segment before, segment after, what)], "redo": [...]}
         self.label_history: dict[Item, dict] = {}
+        # 되돌리기 / 다시 실행 (Ctrl+Z / Ctrl+Y): every undoable action of the work in the order done, the label
+        # edits among them ({"kind": "labels"}: the step itself is the motion's label_history); see undo()
+        self.history: dict[str, list[dict]] = {"undo": [], "redo": []}
+        self._replaying = False  # undo / redo applying a step: what it does is not a new step
+        self._group: list | None = None  # history_group(): the steps made one
         # 시간 잘라내기 per motion: ((start_s, end_s), ...) sorted, apart, in the motion's time; left out by 다른 이름으로
         # 저장 (the motion itself plays as it is). A change is a step of the label undo history (cut_time)
         self.cuts: dict[Item, tuple] = {}
@@ -499,6 +504,7 @@ class MotionScene:
         self.log(f"added {item.label}: {item.kind}, {item.robot.num_frames} frames @ {item.robot.fps:g} fps")
         self.emit("items", item)  # payload: the motion just opened (the window drops its unresolved session entry)
         self._request_physics(item)
+        self._record({"kind": "add", "item": item, "what": f"모션 열기 ({item.label})"})
         return item
 
     def _robot_regions(self) -> None:
@@ -564,11 +570,17 @@ class MotionScene:
             item.info["robot_mismatch"] = "; ".join(why)
             self.log(f"{item.label}: 다른 로봇의 모션일 수 있습니다 - {item.info['robot_mismatch']}")
 
-    def remove(self, item: Item) -> None:
+    def remove(self, item: Item, record: bool = True) -> dict | None:
+        """Take the motion out of the scene (its jobs cancelled); a step of 되돌리기 that puts it back as it was
+        (record=False: not one). Returns what putting it back needs (_reinsert), None when it was not open."""
         with self.lock:
             if item not in self.items:
-                return
-            jobs = [*item.handles.get("phys_jobs", {}).values(), item.handles.get("video_job")]
+                return None
+            c = self.compare
+            keep = {"index": self.items.index(item), "history": self.label_history.get(item),
+                    "cuts": self.cuts.get(item), "splits": self.splits.get(item),
+                    "compare": (c.on, c.ref is item, c.item is item)}
+            jobs =[*item.handles.get("phys_jobs", {}).values(), item.handles.get("video_job")]
             for job in jobs:
                 if job is not None and job.active and not any(
                         job in [*it.handles.get("phys_jobs", {}).values(), it.handles.get("video_job")]
@@ -591,10 +603,219 @@ class MotionScene:
                 self.compare.on = False
             self._sync_robots()
         self.emit("items")
+        if record:
+            self._record({"kind": "remove", "item": item, "keep": keep, "what": f"모션 닫기 ({item.label})"})
+        return keep
+
+    def _reinsert(self, item: Item, keep: dict) -> None:
+        """Put a removed motion back where it was, with its labels and their history, its 시간 잘라내기 and 나누기
+        and its place in the overlay comparison (되돌리기 of 닫기, 다시 실행 of 열기)."""
+        with self.lock:
+            if item in self.items:
+                return
+            # what was drawn went with it; a finished physics result stays (shown again at once), a cancelled run
+            # starts again
+            item.handles = {k: v for k, v in item.handles.items() if k == "phys"}
+            base, n = re.sub(r" \(\d+\)$", "", item.label), 2
+            while any(it.label == item.label for it in self.items):  # another one opened meanwhile has its name
+                item.label = f"{base} ({n})"
+                n += 1
+            i = min(int(keep.get("index", len(self.items))), len(self.items))
+            self.items.insert(i, item)
+            for d, k in ((self.label_history, "history"), (self.cuts, "cuts"), (self.splits, "splits")):
+                if keep.get(k):
+                    d[item] = keep[k]
+            for k, it in enumerate(self.items):
+                it.handles["index"] = k
+            c = self.compare
+            was_on, was_ref, was_item = keep.get("compare", (False, False, False))
+            if was_ref:
+                c.ref = item
+            if was_item:
+                c.item = item
+            if (was_ref or was_item) and was_on and c.ref in self.items and c.item in self.items:
+                c.on = True
+            self._build_item(item, i)
+            if self.view.body_mesh and item.kind.startswith("SMPL-X"):
+                self._add_body_mesh(item)
+            self._sync_robots()
+        self.emit("items")
+        if was_ref or was_item:
+            self.emit("compare")
+        self._request_physics(item)
 
     def set_offset(self, item: Item, value: float) -> None:
-        item.offset = float(value)
+        self._set_attr(item, "offset", float(value), "시간 오프셋", merge=True)
+
+    def move_item(self, item: Item, index: int, record: bool = True) -> bool:
+        """Put the motion at this place in the list (the timeline's rows, the 3D view's lanes side by side, the
+        work session's order); one 되돌리기 step. False when it is not open or already there."""
+        with self.lock:
+            if item not in self.items:
+                return False
+            old = self.items.index(item)
+            new = max(0, min(int(index), len(self.items) - 1))
+            if new == old:
+                return False
+            self.items.remove(item)
+            self.items.insert(new, item)
+            for k, it in enumerate(self.items):
+                it.handles["index"] = k
+            self._sync_robots()
+        self.emit("items")
+        if record:
+            self._record({"kind": "move", "item": item, "old": old, "new": new, "what": f"순서 바꾸기 ({item.label})"})
+        return True
+
+    def _set_attr(self, item: Item, attr: str, value, what: str, merge: bool = False) -> None:
+        """A motion's own setting, one 되돌리기 step; merge: changes of the same setting of the same motion
+        close together (a number box's arrows held, a value being typed) are one step."""
+        old = getattr(item, attr)
+        setattr(item, attr, value)
         self.emit("item", item)
+        if old == value:
+            return
+        with self.lock:
+            top = self.history["undo"][-1] if self.history["undo"] and self._group is None else None
+            if merge and not self._replaying and top is not None and top["kind"] == "set" and top["item"] is item \
+                    and top["attr"] == attr and time.monotonic() - top["at"] < self.MERGE_S and not self.history["redo"]:
+                top["new"], top["at"] = value, time.monotonic()
+                if top["new"] == top["old"]:  # back where it started: no step
+                    self.history["undo"].pop()
+                    self.emit("history")
+                return
+        self._record({"kind": "set", "item": item, "attr": attr, "old": old, "new": value, "at": time.monotonic(),
+                      "what": f"{what} ({item.label})"})
+
+    # ---------------------------------------------------------------- 되돌리기 / 다시 실행
+    # One history of the work (self.history), last done first: label edits, 시간 잘라내기 and 나누기 (each motion keeps
+    # its own step in label_history; the history says which motion's comes next), a motion's 시간 오프셋, 보이기, 사람
+    # 스켈레톤 and 다시 리타게팅, and opening and closing motions (a closed motion is kept, labels and all, while
+    # its step can still be redone or undone). Opening a work session in place of the work starts a new history.
+    HISTORY_LIMIT = 200
+    MERGE_S = 1.5
+
+    def _record(self, step: dict) -> None:
+        if self._replaying:
+            return
+        with self.lock:
+            if self._group is not None:
+                self._group.append(step)
+                return
+            self.history["undo"].append(step)
+            del self.history["undo"][:-self.HISTORY_LIMIT]
+            self.history["redo"].clear()
+            for h in self.label_history.values():  # one line of history: what was undone before is gone
+                h["redo"].clear()
+        self.emit("history")
+
+    class _Group:
+        def __init__(self, scene, what):
+            self.scene, self.what = scene, what
+
+        def __enter__(self):
+            sc = self.scene
+            with sc.lock:
+                self.outer = sc._group
+                sc._group = [] if self.outer is None else self.outer
+            return self
+
+        def __exit__(self, *exc):
+            sc = self.scene
+            with sc.lock:
+                steps, sc._group = sc._group, self.outer
+            if self.outer is None and steps:
+                sc._record({"kind": "group", "steps": steps, "what": self.what})
+            return False
+
+    def history_group(self, what: str):
+        """with scene.history_group("모두 제거"): the steps made inside are one step of 되돌리기."""
+        return self._Group(self, what)
+
+    def clear_history(self) -> None:
+        with self.lock:
+            self.history = {"undo": [], "redo": []}
+            for h in self.label_history.values():
+                h["undo"].clear()
+                h["redo"].clear()
+        self.emit("history")
+
+    def undo_text(self) -> tuple[str | None, str | None]:
+        """What 되돌리기 and 다시 실행 would do (None: nothing)."""
+        with self.lock:
+            return tuple(self._step_text(self.history[k]) for k in ("undo", "redo"))
+
+    def _step_text(self, steps: list) -> str | None:
+        for step in reversed(steps):  # a step left behind (its motion's label history undone through the API) is skipped
+            if self._doable(step, steps is self.history["redo"]):
+                if step["kind"] == "labels":
+                    h = self.label_history[step["item"]]["redo" if steps is self.history["redo"] else "undo"]
+                    return f"{h[-1][3]} ({step['item'].label})"
+                return step["what"]
+        return None
+
+    def _doable(self, step: dict, redo: bool) -> bool:
+        k, items = step["kind"], self.items
+        if k == "labels":
+            h = self.label_history.get(step["item"])
+            return step["item"] in items and bool(h and h["redo" if redo else "undo"])
+        if k in ("set", "move"):
+            return step["item"] in items
+        if k in ("add", "remove"):
+            return (step["item"] in items) == ((k == "add") != redo)
+        if k == "swap":
+            return step["old" if redo else "new"] in items
+        return any(self._doable(s, redo) for s in step["steps"])
+
+    def undo(self, redo: bool = False) -> dict | None:
+        """되돌리기 (or 다시 실행) of the work's last step: {"what", "item" (the motion to show, or None), "segment"
+        (a label step: the one to pick)}; None when there is nothing to undo."""
+        src, dst = ("redo", "undo") if redo else ("undo", "redo")
+        while True:
+            with self.lock:
+                if not self.history[src]:
+                    return None
+                step = self.history[src].pop()
+            if not self._doable(step, redo):  # left behind: dropped
+                continue
+            self._replaying = True
+            try:
+                done = self._apply(step, redo)
+            finally:
+                self._replaying = False
+            with self.lock:
+                self.history[dst].append(step)
+            self.emit("history")
+            return done
+
+    def _apply(self, step: dict, redo: bool) -> dict:
+        k = step["kind"]
+        out = {"what": step.get("what"), "item": step.get("item"), "segment": None, "kind": k}
+        if k == "labels":
+            what, seg = self.undo_labels(step["item"], redo=redo)
+            out.update(what=f"{what} ({step['item'].label})", segment=seg)
+        elif k == "set":
+            value = step["new" if redo else "old"]
+            setattr(step["item"], step["attr"], value)
+            self.emit("item", step["item"])
+        elif k == "move":
+            self.move_item(step["item"], step["new" if redo else "old"], record=False)
+        elif k in ("add", "remove") and (k == "add") == redo:  # 다시 실행 of 열기, 되돌리기 of 닫기
+            self._reinsert(step["item"], step.get("keep") or {})
+        elif k in ("add", "remove"):
+            step["keep"] = self.remove(step["item"], record=False)
+            out["item"] = None
+        elif k == "swap":
+            a, b = (step["old"], step["new"]) if redo else (step["new"], step["old"])
+            self._put_in_place(a, b)
+            out["item"], out["replaced"] = b, a
+        else:  # a group: its steps in turn, the last first when undone
+            last = None
+            for s in (step["steps"] if redo else reversed(step["steps"])):
+                if self._doable(s, redo):
+                    last = self._apply(s, redo)
+            out["item"] = last["item"] if last and len(step["steps"]) == 1 else None
+        return out
 
     # ---------------------------------------------------------------- labels (retlens.motion_labels)
     def _find_labels(self, item: Item) -> None:
@@ -682,6 +903,7 @@ class MotionScene:
         h["undo"].append((old, before, after, what, self._trim(item)))  # its 시간 잘라내기 and 나누기 then too
         del h["undo"][:-self.UNDO_LIMIT]
         h["redo"].clear()
+        self._record({"kind": "labels", "item": item, "what": what})
 
     def _replace_labels(self, item: Item, lab, what: str) -> None:
         with self.lock:
@@ -842,6 +1064,48 @@ class MotionScene:
         self._labels_changed(item)
         return True
 
+    def kept_bounds(self, item: Item, cuts=None) -> tuple[float, float]:
+        """Where the motion's kept time starts and ends: after a cut from its start, before a cut to its end (the
+        edges 트리밍 drags)."""
+        cuts, dur = self.cut_spans(item) if cuts is None else cuts, item.robot.duration
+        lo = next((b for a, b in cuts if a <= 1e-6), 0.0)
+        hi = next((a for a, b in cuts if b >= dur - 1e-6), dur)
+        return lo, hi
+
+    def trimmed(self, item: Item, side: str, t: float, cuts=None) -> tuple:
+        """The cuts with the motion's start (side "start") or end ("end") trimmed at t, its own time: the cut from
+        that end replaced by one to t (none when t is the end itself), joined with the cuts it reaches; t is put on
+        a frame and kept a frame inside the other kept edge."""
+        fps, dur = item.robot.fps, item.robot.duration
+        cuts = self.cut_spans(item) if cuts is None else cuts
+        lo, hi = self.kept_bounds(item, cuts)
+        t = round(float(t) * fps) / fps
+        if side == "end":
+            t = min(max(t, lo + 1.0 / fps), dur)
+            rest, new = [c for c in cuts if c[1] < dur - 1e-6], (t, dur)
+        else:
+            t = max(min(t, hi - 1.0 / fps), 0.0)
+            rest, new = [c for c in cuts if c[0] > 1e-6], (0.0, t)
+        merged: list[list[float]] = []
+        for s, e in sorted([*rest, *([new] if new[1] - new[0] > 0.5 / fps else [])]):
+            if merged and s <= merged[-1][1] + 1e-6:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        return tuple((round(s, 6), round(e, 6)) for s, e in merged)
+
+    def trim(self, item: Item, side: str, t: float, cuts=None) -> bool:
+        """트리밍: the motion's start or end edge dragged to t (trimmed()), one undo step; cuts: the ones the drag
+        began from. False when nothing changed or the motion is gone."""
+        new = self.trimmed(item, side, t, cuts)
+        with self.lock:
+            if item not in self.items or new == self.cut_spans(item):
+                return False
+            self._push_undo(item, item.labels, None, None, "시작 트리밍" if side == "start" else "끝 트리밍")
+            self._set_cuts(item, new)
+        self._labels_changed(item)
+        return True
+
     @staticmethod
     def labels_dirty(item: Item) -> bool:
         """The motion's labels have edits that are not in a file yet."""
@@ -989,12 +1253,10 @@ class MotionScene:
         raise ValueError("사람 골격이 없는 로봇 모션입니다. 자동 라벨은 BVH·FBX·AMASS 모션에 붙습니다")
 
     def set_visible(self, item: Item, value: bool) -> None:
-        item.visible = bool(value)
-        self.emit("item", item)
+        self._set_attr(item, "visible", bool(value), "보이기" if value else "숨기기")
 
     def set_show_human(self, item: Item, value: bool) -> None:
-        item.show_human = bool(value)
-        self.emit("item", item)
+        self._set_attr(item, "show_human", bool(value), "사람 스켈레톤 " + ("켜기" if value else "끄기"))
 
     def _sync_robots(self) -> None:
         """Robot meshes and overlays: one instance per motion, in list order, in its colour
@@ -1334,11 +1596,23 @@ class MotionScene:
         new = self._load_with(item, ff, sw, scol)
         new.info["previous_retarget"] = {**{k: r.get(k) for k in ("foot_flat", "swing_clearance_cm", "self_collision")},
                                          "score": item.metrics.get("retarget_score")}
+        if not self._put_in_place(item, new):
+            raise ValueError(f"{item.label}: 이미 제거된 모션입니다")
+        self.log(f"retargeted again {new.label}: {new.kind} (score {item.metrics.get('retarget_score')} -> "
+                 f"{new.metrics.get('retarget_score')})")
+        self._record({"kind": "swap", "old": item, "new": new, "what": f"다시 리타게팅 ({new.label})"})
+        return new
+
+    def _put_in_place(self, item: Item, new: Item) -> bool:
+        """Show `new` in the open motion `item`'s place: its name, colour, time offset, visibility, labels (and
+        their history), 시간 잘라내기 and 나누기 and its place in the overlay comparison (다시 리타게팅, and its
+        되돌리기 back to the one it replaced). False when `item` is no longer open."""
         new.label, new.color, new.offset = item.label, item.color, item.offset
         new.visible, new.show_human = item.visible, item.show_human
+        new.handles = {k: v for k, v in new.handles.items() if k == "phys"}  # a motion put back: drawn anew
         with self.lock:
             if item not in self.items:
-                raise ValueError(f"{item.label}: 이미 제거된 모션입니다")
+                return False
             new.labels = item.labels  # under the lock: an edit made while it retargeted stays
             history = self.label_history.pop(item, None)
             cuts = self.cuts.pop(item, None)  # the same file and times: its 시간 잘라내기 stays
@@ -1346,8 +1620,10 @@ class MotionScene:
             i = self.items.index(item)
             c = self.compare  # its place in the overlay comparison too (remove() would turn it off)
             was_on, was_ref, was_item = c.on, c.ref is item, c.item is item
-            self.remove(item)
+            self.remove(item, record=False)
             self.items.insert(i, new)
+            for steps in self.history.values():  # the steps of the motion are the new one's now
+                self._repoint(steps, item, new)
             if was_ref:
                 c.ref = new
             if was_item:
@@ -1366,13 +1642,18 @@ class MotionScene:
             if self.view.body_mesh and new.kind.startswith("SMPL-X"):
                 self._add_body_mesh(new)
             self._sync_robots()
-        self.log(f"retargeted again {new.label}: {new.kind} (score {item.metrics.get('retarget_score')} -> "
-                 f"{new.metrics.get('retarget_score')})")
         self.emit("items")
         if was_ref or was_item:
             self.emit("compare")
         self._request_physics(new)
-        return new
+        return True
+
+    def _repoint(self, steps: list, old: Item, new: Item) -> None:
+        for s in steps:
+            if s["kind"] == "group":
+                self._repoint(s["steps"], old, new)
+            elif s.get("item") is old:
+                s["item"] = new
 
     def recommend_retarget(self, item: Item, progress: Callable[[int, int, str], None] | None = None) -> list[dict]:
         """추천 보정: this motion retargeted with each of the 8 combinations of the three corrections (디딤발 평평,
@@ -2497,11 +2778,11 @@ class MotionScene:
     def auto_align(self, ref: Item) -> list[str]:
         """Time offsets that best match every motion's legs to the reference's."""
         notes = []
-        for it in list(self.items):
-            if it is ref:
-                continue
-            off, rms = analysis.estimate_offset(ref.robot, it.robot, max_shift=float(self.opts.max_shift))
-            it.offset = ref.offset + off
-            notes.append(f"{it.label}: {it.offset:+.3f} s (다리 RMS {rms:.1f}°)")
-            self.emit("item", it)
+        with self.history_group(f"시간 자동 정렬 (기준 {ref.label})"):  # one step of 되돌리기
+            for it in list(self.items):
+                if it is ref:
+                    continue
+                off, rms = analysis.estimate_offset(ref.robot, it.robot, max_shift=float(self.opts.max_shift))
+                self._set_attr(it, "offset", ref.offset + off, "시간 오프셋")
+                notes.append(f"{it.label}: {it.offset:+.3f} s (다리 RMS {rms:.1f}°)")
         return notes

@@ -451,6 +451,98 @@ class SaveMotionAsDialog(QDialog):
         super().accept()
 
 
+class SaveAllAsDialog(QDialog):
+    """모두 다른 이름으로 저장: every motion on the timeline at once, each as 다른 이름으로 저장 would (its cut time left
+    out, one file per part), into one folder. rows: (motion label, default name, number of files, seconds kept,
+    seconds in all) per motion; a motion with nothing kept is listed and left out."""
+
+    def __init__(self, parent, store, rows, start_folder: str):
+        from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
+
+        super().__init__(parent)
+        self.store, self.rows = store, list(rows)
+        self.setWindowTitle(f"모두 다른 이름으로 저장 - 모션 {len(self.rows)}개")
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.folder = FolderRow(_get(store, "save_as_folder", start_folder), "저장할 폴더", self)
+        form.addRow("저장할 폴더", self.folder)
+        self.formats = FormatRow(store, self)
+        form.addRow("형식", self.formats)
+        self.labels = QCheckBox("라벨 함께 (창에서 고친 라벨 그대로, 파일마다 그 파일의 시작이 0초)")
+        self.labels.setChecked(_get(store, "labels", True))
+        form.addRow("", self.labels)
+        lay.addLayout(form)
+        lay.addWidget(QLabel("모션마다 잘라낸 시간을 빼고 저장합니다. 나누기 지점이 있거나 가운데를 잘랐으면 <이름>_01, "
+                             "<이름>_02, ...로 나눠 씁니다. 이름 칸을 두 번 눌러 바꿀 수 있습니다."))
+        t = self.table = QTableWidget(len(self.rows), 4, self)
+        t.setHorizontalHeaderLabels(["모션", "남는 시간 (s)", "파일 수", "이름"])
+        t.verticalHeader().setVisible(False)
+        t.setSelectionMode(QAbstractItemView.NoSelection)
+        t.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        for r, (label, name, n, kept, total) in enumerate(self.rows):
+            cells = [label, f"{kept:.2f} / {total:.2f}", str(n) if n else "없음 (모두 잘라냄)"]
+            for c, v in enumerate(cells):
+                cell = QTableWidgetItem(v)
+                cell.setFlags(Qt.ItemIsEnabled)
+                if c:
+                    cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                t.setItem(r, c, cell)
+            cell = QTableWidgetItem(name if n else "")
+            if not n:
+                cell.setFlags(Qt.ItemIsEnabled)
+            t.setItem(r, 3, cell)
+        t.resizeColumnsToContents()
+        t.setMinimumWidth(640)
+        t.setMinimumHeight(min(360, 40 + 28 * len(self.rows)))
+        lay.addWidget(t)
+        lay.addWidget(_buttons(self, "저장"))
+
+    def names(self) -> list[str | None]:
+        """Per motion its name (its parts are <name>_01, ...), None for one with nothing to save."""
+        return [_strip_ext(self.table.item(r, 3).text()) if row[2] else None for r, row in enumerate(self.rows)]
+
+    def files(self) -> list[list[str]]:
+        """Per motion the file names of its parts (part_names), [] for one with nothing to save."""
+        return [part_names(n, row[2]) if n is not None else [] for n, row in zip(self.names(), self.rows)]
+
+    def accept(self) -> None:
+        if not self.folder.path():
+            QMessageBox.warning(self, "모두 다른 이름으로 저장", "저장할 폴더를 고르세요.")
+            return
+        bad = next((n for n in self.names() if n is not None and bad_name(n)), None)
+        if bad is not None:
+            QMessageBox.warning(self, "모두 다른 이름으로 저장", f"쓸 수 없는 이름입니다: {bad or '(빈칸)'}\n({BAD_NAME} 는 쓸 수 없음)")
+            return
+        seen: set[str] = set()
+        for n in (f for fs in self.files() for f in fs):
+            if n.lower() in seen:
+                QMessageBox.warning(self, "모두 다른 이름으로 저장", f"파일 이름이 겹칩니다: {n}\n이름 칸을 고치세요.")
+                return
+            seen.add(n.lower())
+        if not seen:
+            QMessageBox.warning(self, "모두 다른 이름으로 저장", "저장할 모션이 없습니다(모든 시간을 잘라냄).")
+            return
+        if not self.formats.value():
+            QMessageBox.warning(self, "모두 다른 이름으로 저장", "형식을 하나 이상 고르세요.")
+            return
+        _put(self.store, "save_as_folder", self.folder.path())
+        _put(self.store, "labels", self.labels.isChecked())
+        self.formats.save(self.store)
+        super().accept()
+
+
+def unique_names(names: list[str]) -> list[str]:
+    """Default names made apart (the same file opened twice, two folders' 01.bvh): a later one gets _2, _3, ..."""
+    out, seen = [], set()
+    for n in names:
+        m, k = n, 2
+        while m.lower() in seen:
+            m, k = f"{n}_{k}", k + 1
+        seen.add(m.lower())
+        out.append(m)
+    return out
+
+
 def confirm_folder(parent, out: str, title: str) -> bool:
     """Ask before writing into a folder that already has files: an earlier export's files (its manifest) are
     replaced; files of the same names are overwritten."""

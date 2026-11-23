@@ -187,6 +187,7 @@ def test_closing_while_the_dataset_tab_runs_waits_for_it(monkeypatch):
     win = types.SimpleNamespace(_close_pending=False, _restore=None, session_path="s.retlens", confirm_unsaved=True,
                                 _confirm_session=lambda what: confirms.append(what) or True, dataset=ds,
                                 status=lambda *a: None, scene=None, _carry_list=lambda: [],
+                                _fp=lambda: editor.work.fingerprint(None, []),
                                 updates=types.SimpleNamespace(stop_for_close=lambda: False,
                                                               close_withdrawn=lambda: None))
     e = QCloseEvent()
@@ -235,6 +236,7 @@ def test_a_close_waiting_for_the_dataset_tab_asks_again_after_changes(monkeypatc
     win = types.SimpleNamespace(_close_pending=False, _restore=None, session_path="s.retlens", confirm_unsaved=True,
                                 _confirm_session=lambda what: confirms.append(what) or answer["ok"], dataset=ds,
                                 status=lambda *a: None, scene=None, _carry_list=lambda: [],
+                                _fp=lambda: editor.work.fingerprint(None, []),
                                 updates=types.SimpleNamespace(stop_for_close=lambda: closing.append(1) or False,
                                                               close_withdrawn=lambda: withdrawn.append(1)))
     editor.EditorWindow.closeEvent(win, QCloseEvent())

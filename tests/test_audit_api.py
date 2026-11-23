@@ -449,6 +449,14 @@ def test_http_ids_open_and_compare(tmp_path, monkeypatch):
         code, out = _call(f"{u}/api/remove", t, {"id": CSV})  # by its path: that one, not the first
         assert code == 200 and out["removed"] == b
         assert [m["id"] for m in _call(f"{u}/api/status", t)[1]["motions"]] == [a]
+        assert _call(f"{u}/api/undo", t)[1]["undo"] == f"모션 닫기 ({b})"  # 되돌리기: the window's Ctrl+Z
+        code, out = _call(f"{u}/api/undo", t, {})
+        assert code == 200 and out["id"] == b and out["redo"] == f"모션 닫기 ({b})"
+        motions = _call(f"{u}/api/status", t)[1]["motions"]
+        assert [m["id"] for m in motions] == [a, b] and motions[1]["visible"] is False  # back as it was
+        assert _call(f"{u}/api/undo", t, {"redo": True})[1]["undo"] == f"모션 닫기 ({b})"
+        assert [m["id"] for m in _call(f"{u}/api/status", t)[1]["motions"]] == [a]
+        assert _call(f"{u}/api/undo", t, {"redo": True})[0] == 409  # nothing to redo
         _call(f"{u}/api/open", t, {"paths": NPZ})
         assert _call(f"{u}/api/motion?id=synthetic_g1_walk.npz", t)[0] == 409  # the same file twice
     finally:

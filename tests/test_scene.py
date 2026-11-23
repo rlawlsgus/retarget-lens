@@ -667,6 +667,83 @@ def scene_module_load(item):
     return new
 
 
+def test_one_history_undoes_the_work(scene, monkeypatch):
+    """되돌리기 / 다시 실행: one history of the work, last first, whichever motion: opening and closing motions (a
+    closed one comes back as it was: place, offset, labels and their history, the overlay comparison), a motion's
+    offset (a box's quick changes one step), visibility and 다시 리타게팅, label edits, 시간 자동 정렬 (one step);
+    something new done after undoing drops what could be redone."""
+    from retlens import motion_labels as ml
+
+    scene.clear_history()
+    a = scene.add(SAMPLE)
+    b = scene.add(SAMPLE)
+    try:
+        assert scene.undo_text() == (f"모션 열기 ({b.label})", None)
+        scene.set_offset(b, 0.3)
+        scene.set_offset(b, 0.5)  # the box's arrows held: one step
+        assert scene.undo_text()[0] == f"시간 오프셋 ({b.label})" and len(scene.history["undo"]) == 3
+        scene.set_visible(a, False)
+        scene.set_visible(a, False)  # nothing changed: no step
+        base = ml.MotionLabels(path="a.labels.csv", segments=[ml.Segment(label="걷기", start=0.0, end=1.0)])
+        b.labels = base
+        new, seg = ml.split(base, base.segments[0], 0.4, b.robot.fps)
+        assert scene.edit_labels(b, base, new, "구간 나누기", before=base.segments[0], after=seg)
+        scene.set_compare(on=True, ref=a, item=b)
+        scene.remove(b)
+        assert b not in scene.items and not scene.compare.on
+        assert scene.undo_text()[0] == f"모션 닫기 ({b.label})"
+
+        done = scene.undo()  # 닫기 undone: b back in its place, as it was
+        assert done["item"] is b and scene.items == [a, b] and b.offset == 0.5 and b.labels is new
+        assert scene.compare.on and scene.compare.ref is a and scene.compare.item is b
+        assert "label" in b.handles and scene.undo_text() == (f"구간 나누기 ({b.label})", f"모션 닫기 ({b.label})")
+        done = scene.undo()  # the label edit, on the motion that came back
+        assert done["kind"] == "labels" and done["segment"] == base.segments[0] and b.labels is base
+        scene.undo()
+        assert a.visible
+        scene.undo()
+        assert b.offset == 0.0
+        scene.undo()  # 열기 undone
+        assert scene.items == [a] and scene.undo_text() == (f"모션 열기 ({a.label})", f"모션 열기 ({b.label})")
+        for _ in range(4):  # and done again: b opened, offset, a hidden, the label edit
+            assert scene.undo(redo=True) is not None
+        assert scene.items == [a, b] and b.offset == 0.5 and not a.visible and b.labels is new
+        assert scene.undo_text()[1] == f"모션 닫기 ({b.label})"
+        scene.set_offset(a, 1.0)  # something new: what was undone is gone
+        assert scene.undo_text() == (f"시간 오프셋 ({a.label})", None) and scene.undo(redo=True) is None
+        assert not scene.label_history[b]["redo"]
+
+        scene.auto_align(a)  # every other motion's offset: one step
+        assert scene.undo_text()[0] == f"시간 자동 정렬 (기준 {a.label})"
+        scene.set_offset(b, 0.25)
+        scene.undo()
+        scene.undo()
+        assert b.offset == 0.5
+
+        b.retarget = {"foot_flat": False, "swing_clearance_cm": 0.0, "self_collision": False}
+        monkeypatch.setattr(scene, "_load_with", lambda item, ff, sw, sc: scene_module_load(item))
+        c = scene.retarget_again(b, foot_flat=True)
+        assert scene.items == [a, c] and scene.undo_text()[0] == f"다시 리타게팅 ({c.label})"
+        scene.set_offset(c, 2.0)
+        done = scene.undo()  # the step made on the new one
+        assert c.offset == 0.5
+        done = scene.undo()  # back to the motion it replaced, with what it has now
+        assert done["item"] is b and done["replaced"] is c and scene.items == [a, b] and b.labels is new
+        assert scene.label_history.get(b) is not None and scene.compare.item is b
+        scene.undo()
+        assert a.offset == 0.0
+        scene.undo()  # b's label edit, made before the retarget: still b's
+        assert b.labels is base
+
+        scene.clear_history()  # a new work
+        assert scene.undo_text() == (None, None) and scene.undo() is None
+    finally:
+        scene.set_compare(on=False)
+        for it in list(scene.items):
+            scene.remove(it)
+        scene.clear_history()
+
+
 def test_undo_after_saving_over_the_file_is_unsaved(scene, tmp_path):
     """Saved over the file the labels came from, then undone: what comes back is no longer in that file."""
     from retlens import motion_labels as ml
@@ -789,3 +866,55 @@ def test_label_choices_come_from_the_label_definition_files(scene, tmp_path, mon
         scene.remove(a)
         if human is not None:
             scene.remove(human)
+
+
+def test_trimming_a_motion_end(scene):
+    """트리밍 (a bar's end dragged): the cut from that end set to the edge, on frames, a frame kept at least; dragged
+    back out it gives the time back; dragged in past a middle cut it takes it in; one undo step each."""
+    a = scene.add(SAMPLE)
+    try:
+        dur, fps = a.robot.duration, a.robot.fps
+        f = lambda t: round(round(t * fps) / fps, 6)  # noqa: E731
+        assert scene.kept_bounds(a) == (0.0, dur)
+        assert scene.trim(a, "end", dur - 0.5)
+        assert scene.cut_spans(a) == ((f(dur - 0.5), round(dur, 6)),) and scene.kept_bounds(a)[1] == f(dur - 0.5)
+        assert scene.undo_text()[0] == f"끝 트리밍 ({a.label})"
+        assert scene.trim(a, "end", dur - 0.2)  # back out: less is cut
+        assert scene.cut_spans(a) == ((f(dur - 0.2), round(dur, 6)),)
+        assert scene.trim(a, "end", dur + 5)  # past the end: nothing cut from it
+        assert scene.cut_spans(a) == () and not scene.trim(a, "end", dur)
+        assert scene.trim(a, "start", 0.3) and scene.kept_bounds(a) == (f(0.3), dur)
+        assert scene.cut_time(a, 0.6, 0.8)  # a cut in the middle stays while the end is trimmed apart from it
+        assert scene.trim(a, "end", 1.0) and scene.cut_spans(a) == ((0.0, f(0.3)), (0.6, 0.8), (1.0, round(dur, 6)))
+        assert scene.trim(a, "end", 0.7, scene.cut_spans(a))  # in past it: joined with it
+        assert scene.cut_spans(a) == ((0.0, f(0.3)), (0.6, round(dur, 6)))
+        assert scene.trim(a, "start", 5.0)  # never past the other edge: a frame stays
+        assert scene.kept_spans(a) == [(round(0.6 - 1 / fps, 6), 0.6)]
+        scene.undo()
+        assert scene.kept_bounds(a) == (f(0.3), 0.6)
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)
+
+
+def test_moving_a_motion_in_the_list(scene):
+    """순서 바꾸기: the motion's place in the list is its lane in the 3D view side by side (and the timeline row);
+    an undo step."""
+    scene.clear_history()
+    a, b, c = scene.add(SAMPLE), scene.add(SAMPLE), scene.add(SAMPLE)
+    try:
+        assert scene.move_item(c, 0) and scene.items == [c, a, b]
+        assert [it.handles["index"] for it in scene.items] == [0, 1, 2]
+        assert not scene.move_item(c, 0) and not scene.move_item(c, -5)  # already there
+        assert scene.undo_text()[0] == f"순서 바꾸기 ({c.label})"
+        scene.tick(0.0)
+        lanes = {id(it): float(np.asarray(it.handles["pos"])[1]) for it in scene.items}
+        assert lanes[id(c)] > lanes[id(a)] > lanes[id(b)]  # side by side in list order (-index * spacing)
+        scene.undo()
+        assert scene.items == [a, b, c] and c.handles["index"] == 2
+        scene.undo(redo=True)
+        assert scene.items == [c, a, b]
+    finally:
+        for it in list(scene.items):
+            scene.remove(it)
+        scene.clear_history()

@@ -15,6 +15,10 @@
     POST /api/remove    {"id": .., "discard_edits"?}   409 when its labels have unsaved edits, unless discard_edits
     GET  /api/motion?id=..              one motion: QC, metrics, C3D QC, physics state
     POST /api/item      {"id", "visible"?, "offset_s"?, "show_human"?}
+    GET  /api/undo                      되돌리기 / 다시 실행: what each would do now (null: nothing)
+    POST /api/undo      {"redo"?}       undo (redo) the work's last step, as Ctrl+Z (Ctrl+Y) in the window: label
+                                         edits, 시간 잘라내기, a motion's offset / visibility / skeleton / 다시
+                                         리타게팅, opening and closing motions. 409 when there is nothing to undo
     POST /api/labels    {"id", "path"?}  labelled segments on the timeline: load this file / "path": null takes
                                          them off / no "path" reads the motion's label file again
                         {"id", "auto": true, "rules"?}  label the motion by a rule file (the 자동 라벨 setting
@@ -239,7 +243,8 @@ class ApiBackend:
             (g, "/api/library"): lambda q: api_core.library(_text(q, "query"), _int(q, "limit", 200, lo=0)),
             (p, "/api/open"): self.open, (p, "/api/retarget"): self.retarget, (p, "/api/remove"): self.remove,
             (g, "/api/motion"): self.motion,
-            (p, "/api/item"): self.item, (p, "/api/labels"): self.labels, (p, "/api/playback"): self.playback,
+            (p, "/api/item"): self.item, (p, "/api/labels"): self.labels,
+            (g, "/api/undo"): self.undo_state, (p, "/api/undo"): self.undo, (p, "/api/playback"): self.playback,
             (g, "/api/segments"): self.segments, (p, "/api/segments"): self.segments,
             (g, "/api/batch"): self.batch, (p, "/api/batch"): self.batch,
             (g, "/api/session"): self.session, (p, "/api/session"): self.session,
@@ -346,6 +351,21 @@ class ApiBackend:
         if show_human is not None:
             self.scene.set_show_human(item, show_human)
         return api_core.item_info(self.scene, item, metrics=False)
+
+    def undo_state(self, q: dict) -> dict:
+        u, r = self.scene.undo_text()
+        return {"undo": u, "redo": r}
+
+    def undo(self, q: dict) -> dict:
+        redo = bool(_flag(q, "redo", False))
+        win = self.window  # the window's own 되돌리기: the motion selected, a label step's segment picked
+        done = self.on_gui(lambda: win.label_undo(redo=redo) if hasattr(win, "label_undo")
+                           else self.scene.undo(redo=redo))
+        if done is None:
+            raise ApiError(f"nothing to {'redo' if redo else 'undo'}", 409)
+        u, r = self.scene.undo_text()
+        return {"done": done["what"], "id": done["item"].label if done.get("item") in self.scene.items else None,
+                "undo": u, "redo": r}
 
     def labels(self, q: dict) -> dict:
         item = self._item(q.get("id"))

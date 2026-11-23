@@ -528,7 +528,7 @@ def parse(raw, name: str = "") -> dict:
            "time_s": _float(raw.get("time_s"), 0.0), "camera": _camera_read(raw.get("camera")),
            "physics": _physics_read(raw.get("physics"), notes),
            "retarget_next": _retarget_next_read(raw.get("retarget_next")), "analysis": _analysis_read(raw.get("analysis"), n),
-           "label_colors": _label_colors_read(raw.get("label_colors"))}
+           "label_colors": _label_colors_read(raw.get("label_colors")), "dataset": _dataset_read(raw.get("dataset"))}
     if "dirty" in raw:  # 자동 저장 only
         out["dirty"] = _bool(raw["dirty"], False)
     if "session_path" in raw:
@@ -644,6 +644,32 @@ def _analysis_read(v, n: int) -> dict | None:
     return out
 
 
+DATASET_QC = ("", "FAIL", "WARN", "PASS", "falls", "error")  # the 데이터셋 tab's filter choices
+
+
+def dataset_state(folders: list[str], physics: bool, auto_labels: bool, find: str = "", qc: str = "",
+                  sort: str | None = None, descending: bool = False, base_dir: str | None = None) -> dict:
+    """The 데이터셋 tab as a session keeps it: its folders (located like motion files), its options and the
+    table's filter and sort. Not its rows: opening fills them from the batch cache (retlens.batch), so they are
+    the files as they are now, and computes nothing."""
+    return {"folders": [portable(f, base_dir) for f in folders], "physics": bool(physics),
+            "auto_labels": bool(auto_labels), "find": str(find), "qc": qc if qc in DATASET_QC else "",
+            "sort": sort, "descending": bool(descending)}
+
+
+def _dataset_read(v) -> dict | None:
+    """The 데이터셋 tab as saved (dataset_state), checked; None when the session has none (made before 0.12.4)."""
+    if not isinstance(v, dict):
+        return None
+    folders = [r for r in (_ref(f) for f in (v.get("folders") if isinstance(v.get("folders"), list) else ())) if r]
+    qc = v.get("qc")
+    sort = v.get("sort")
+    return {"folders": folders, "physics": _bool(v.get("physics"), False),
+            "auto_labels": _bool(v.get("auto_labels"), False), "find": _str(v.get("find")),
+            "qc": qc if qc in DATASET_QC else "", "sort": sort if isinstance(sort, str) and sort else None,
+            "descending": _bool(v.get("descending"), False)}
+
+
 def _label_colors_read(v) -> dict:
     if not isinstance(v, dict):
         return {}
@@ -663,8 +689,9 @@ def clear(scene: MotionScene) -> None:
         scene.set_playing(False)
     if scene.compare.on:
         scene.set_compare(on=False)
-    for it in list(scene.items):
-        scene.remove(it)
+    with scene.history_group("모두 제거"):
+        for it in list(scene.items):
+            scene.remove(it)
     with scene.lock:  # the pair would keep the removed motions (and their arrays) alive
         scene.compare.ref = scene.compare.item = None
 
@@ -909,6 +936,8 @@ class Restore:
             self.current = ""
             if self.mode == "replace" and not self.cancelled:
                 self.notes += apply_after(scene, self.data, self.items)
+            if self.mode == "replace":  # a work session in place of the work: its history starts here
+                scene.clear_history()
             if progress is not None:
                 progress(self.done, self.total, "")
         finally:
