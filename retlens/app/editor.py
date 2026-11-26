@@ -1042,6 +1042,12 @@ class SceneSettingsPanel(QScrollArea):
         form.addRow(check("이름표", v.show_labels, lambda on: setattr(v, "show_labels", on)))
         form.addRow(check("지금 구간 라벨", v.show_label_now, lambda on: setattr(v, "show_label_now", on),
                           "라벨 파일이 있는 모션은 재생 중인 구간의 라벨을 로봇 이름표 아래에 띄웁니다(라벨이 없는 시간에는 안 보임)"))
+        self.tag_tracks = QLineEdit(v.label_tracks)
+        self.tag_tracks.setPlaceholderText("첫 트랙만 (예: 단계)")
+        self.tag_tracks.setToolTip("이름표에 띄울 라벨 트랙. 쉼표로 여러 개(예: 단계, 왼손, 오른손), *는 모든 트랙, "
+                                   "비우면 라벨 파일의 첫 트랙만")
+        self.tag_tracks.editingFinished.connect(lambda: setattr(v, "label_tracks", self.tag_tracks.text().strip()))
+        form.addRow("이름표 라벨 트랙", self.tag_tracks)
         form.addRow(check("균형 표시", v.show_balance, lambda on: setattr(v, "show_balance", on),
                           "바닥에 지지다각형(초록), CoM 투영(파랑), ZMP(빨강)를 그립니다"))
 
@@ -4674,6 +4680,7 @@ class EditorWindow(QMainWindow):
         if self.label_sel is not None and self.label_sel[0] is not item:
             self.label_sel = None
         self.selected = item
+        self.scene.select_tag(item)  # its name tag in front of the others
         self.selection = [it for it in (many or []) if it is not None] or ([item] if item is not None else [])
         if item is not None and item not in self.selection:
             self.selection.append(item)

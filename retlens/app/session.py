@@ -604,6 +604,8 @@ def _view_read(v) -> dict:
         default = out[f.name]
         if isinstance(default, bool):
             out[f.name] = _bool(raw[f.name], default)
+        elif isinstance(default, str):  # label_tracks: a short list of track names
+            out[f.name] = raw[f.name][:500] if isinstance(raw[f.name], str) else default
         elif f.name == "spacing":
             out[f.name] = _float(raw[f.name], default, *SPACING)
         elif f.name == "speed":

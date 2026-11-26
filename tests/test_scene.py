@@ -131,6 +131,74 @@ def test_name_tags_stay_over_the_robot(scene):
         scene.remove(a)
 
 
+def test_long_tag_lines_wrap():
+    """A tag line wider than TAG_WRAP_EM (Hangul counted wider than Latin) wraps at a break (' · ', ' + ', '/',
+    '_', ' '), kept at the line's end; a run with no break is cut; short lines stay."""
+    from retlens.app.scene import TAG_WRAP_EM, _text_width, tag_lines
+
+    name = "demo/a_very_long_motion_name_with_many_words_in_it_01"
+    lines = tag_lines(name).split("\n")
+    assert len(lines) > 1 and all(_text_width(x) <= TAG_WRAP_EM for x in lines) and "".join(lines) == name
+    assert lines[0].endswith(("/", "_"))
+    both = tag_lines("운반: Crate_Blue_01 + Crate_Blue_02").split("\n")
+    assert both == ["운반: Crate_Blue_01 +", "Crate_Blue_02"]
+    assert tag_lines("이동: 걷기\n왼손: 뻗기") == "이동: 걷기\n왼손: 뻗기"
+    assert all(_text_width(x) <= 5 for x in tag_lines("x" * 30, 5).split("\n"))
+    assert _text_width("가나") > _text_width("ab")  # Hangul counts wider
+
+
+def test_tags_go_to_the_page_with_the_selected_in_front(scene):
+    """The viser label nodes stay hidden; the tags the view page draws (TAG_NODE's JSON) list each shown motion's
+    tag node and text, and the selected motion; a hidden motion's tag is left out."""
+    import json
+
+    a, b = scene.add(SAMPLE), scene.add(SAMPLE)
+    try:
+        scene.select_tag(b)
+        scene.tick(0.0)
+        state = json.loads(scene._tags_sent)
+        assert [t["m"] for t in state["tags"]] == [a.handles["tag_node"], b.handles["tag_node"]]
+        assert state["sel"] == b.handles["tag_node"] and all(t["n"].endswith("/label") for t in state["tags"])
+        assert not a.handles["label"].visible and scene._tag_state.text == scene._tags_sent
+        a.visible = False
+        scene.emit("item", a)
+        scene.tick(0.0)
+        assert [t["m"] for t in json.loads(scene._tags_sent)["tags"]] == [b.handles["tag_node"]]
+    finally:
+        scene.select_tag(None)
+        scene.remove(a)
+        scene.remove(b)
+
+
+def test_tag_shows_the_chosen_tracks(scene, tmp_path):
+    """The name tag shows the labels' first track by default, the tracks listed in label_tracks, or every one
+    with '*'; a segment named like the motion itself is left out."""
+    from retlens.app.scene import tag_tracks
+
+    assert tag_tracks("", ["단계", "왼손"]) == ["단계"] and tag_tracks("*", ["단계"]) is None
+    assert tag_tracks("오른손, 왼손", ["단계", "왼손", "오른손"]) == ["왼손", "오른손"]
+    assert tag_tracks("", []) == []
+    src = tmp_path / "walk.npz"
+    src.write_bytes(open(SAMPLE, "rb").read())
+    (tmp_path / "walk.labels.csv").write_text(
+        "track,label,start_s,end_s\n단계,대기,0,100\n왼손,휴지,0,100\n최소단위,walk,0,100\n", encoding="utf-8")
+    a = scene.add(str(src))
+    try:
+        assert a.labels is not None and a.labels.tracks == ["단계", "왼손", "최소단위"]
+        scene.seek(0.1)
+        scene.tick(0.0)
+        assert a.handles["now_text"] == "단계: 대기"
+        scene.view.label_tracks = "*"
+        scene.tick(0.0)
+        assert a.handles["now_text"] == "단계: 대기\n왼손: 휴지"  # the 최소단위 lane names the motion itself
+        scene.view.label_tracks = "왼손"
+        scene.tick(0.0)
+        assert a.handles["now_text"] == "왼손: 휴지"
+    finally:
+        scene.view.label_tracks = ""
+        scene.remove(a)
+
+
 def test_labels_are_optional(scene, tmp_path):
     """A motion opens with or without a label file next to it; a broken one is kept with its error;
     labels can be put on, taken off and read again (inspector, timeline menu, /api/labels)."""

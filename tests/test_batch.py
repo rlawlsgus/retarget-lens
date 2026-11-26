@@ -210,10 +210,19 @@ def test_a_saved_part_is_measured_as_its_source(session, tmp_path):
     assert row.get("error") is None and row["retarget_score"] is not None and "저장한 것" in row["kind"]
     assert row["duration_s"] == pytest.approx(piece["duration_s"], abs=1e-3) and row["name"] == "walk_part"
     assert b.process(npz)["cached"]
-    # an older save: the json names the retarget cache, not the person's file
     import json
     js = out / "walk_part.json"
     j = json.loads(js.read_text(encoding="utf-8"))
+    # the source relative to the json's folder (shared without absolute paths), from any working folder
+    j["source"] = os.path.relpath(walk, str(out)).replace("\\", "/")
+    js.write_text(json.dumps(j), encoding="utf-8")
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        assert batch.export_origin(npz)["source"] == os.path.abspath(walk)
+    finally:
+        os.chdir(cwd)
+    # an older save: the json names the retarget cache, not the person's file
     j["source"] = full.robot.source
     js.write_text(json.dumps(j), encoding="utf-8")
     assert batch.export_origin(npz) is None

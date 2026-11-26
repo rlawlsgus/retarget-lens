@@ -14,6 +14,7 @@ toolkit that needs its own thread has to marshal them (the Qt editor uses a sign
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -330,6 +331,9 @@ class ViewSettings:
     robot_translucent: bool = False
     show_labels: bool = True
     show_label_now: bool = True  # the labelled segment being played, under each robot's name tag (motion_labels)
+    # which tracks' segments the name tag shows (tag_tracks): comma separated names, "" = the labels' first track
+    # only (a labeler's main lane, e.g. 단계), "*" = every track
+    label_tracks: str = ""
     show_balance: bool = True
     show_objects: bool = True  # props and furniture of the capture (FBX), with the robot
     show_object_paths: bool = True  # where the moving ones go over the clip
@@ -346,6 +350,191 @@ OBJECT_PATH_STEP_S = 0.1  # spacing of the path points
 OBJECT_DOT_M = 0.02  # radius of the dot on an object node without a shape (retlens.props)
 TAG_GAP_M = 0.25  # name tags start this far over the robot's highest point this frame (MotionScene._lift_tags)
 TAG_COMPARE_UP_M = 0.3  # overlay comparison: B's tag over A's
+# Name tags: fixed size on screen, drawn by the view page itself (TAG_JS) as HTML boxes over the 3D view. Their
+# backgrounds are see-through (TAG_BG_ALPHA: the motions matter more than the tags), and where two meet the one
+# behind is cut away under the one in front, so the motions show through every tag but a tag never shows through
+# another (viser's own labels draw every label's text over every label's background). Each motion's viser label
+# nodes ("label", "now") stay hidden and only carry the tag's place (their pose) and text; TAG_NODE carries, as
+# JSON, which tags show, their text and the selected motion's.
+TAG_BG_ALPHA = 0.35  # opacity of a tag's white background (its text has a white halo to stay readable)
+TAG_NODE = "/retlens_tags"
+TAG_WRAP_EM = 16.0  # a tag line wider than this (in letter heights, _text_width) wraps (tag_lines)
+TAG_CHAR_EM = 0.62  # an upper bound of a narrow (Latin) letter's width, in letter heights; a wide one (Hangul) 1.0
+TAG_BREAKS = (" · ", " + ", "/", "_", " ")  # where a long tag line may wrap, tried in this order
+TAG_TIE_M = 0.3  # two tags whose depths differ less than this: the one further right on screen is in front
+# Wheel zoom (also in TAG_JS): viser dollies by a fixed ratio per wheel step, so far out each step shrinks an
+# already small picture by few pixels and zooming out feels slower and slower. Beyond DOLLY_NEAR_M the step grows
+# with the square root of the distance, up to DOLLY_MAX_X times the base speed.
+DOLLY_SPEED = 0.3  # viser's own speed: the step near the robots
+DOLLY_NEAR_M = 8.0
+DOLLY_MAX_X = 4.0
+# The view page's tag layer: reads TAG_NODE and the hidden label nodes from viser's client state (window.
+# __viserSceneTree, window.__viserMutable: camera, nodes), and every frame places one box per shown tag at its
+# node's screen point (bottom-centre), in front-to-back order: the selected motion's tag first, then the nearer
+# (camera depth), then, within TAG_TIE_M, the one further right. A tag is clipped (clip-path, even-odd) to its box
+# minus the boxes of the tags in front of it.
+TAG_JS = r"""
+(() => {
+  if (window.__retlensTags) return;
+  window.__retlensTags = true;
+  const NODE = "%NODE%", TIE = %TIE%;
+  let layer = null, last = "", state = {sel: "", tags: []};
+  const boxes = new Map();
+  const style = document.createElement("style");
+  style.textContent = ".rl-tag{position:absolute;left:0;top:0;transform:translate(-50%,-100%);" +
+    "background:rgba(255,255,255,%BGALPHA%);color:#111;font:11px/1.3 'Malgun Gothic',sans-serif;padding:2px 6px;" +
+    "border-radius:3px;white-space:pre;border:1px solid rgba(0,0,0,.22);pointer-events:none;user-select:none;" +
+    "text-shadow:0 0 2px #fff,0 0 2px #fff,0 0 3px #fff}" +
+    ".rl-tag.rl-sel{border-color:#2a78d6;box-shadow:0 0 0 1px #2a78d6}";
+  document.head.appendChild(style);
+  function cutaway(w, h, holes) {
+    // clip-path keeping the box (w x h) minus the union of holes ([x0, y0, x1, y1] in the box): the union as
+    // disjoint cells on the holes' edges, so even-odd cuts each covered spot once
+    const xs = [...new Set(holes.flatMap(q => [q[0], q[2]]))].sort((a, b) => a - b);
+    const ys = [...new Set(holes.flatMap(q => [q[1], q[3]]))].sort((a, b) => a - b);
+    const f = v => v.toFixed(1);
+    let d = `M0 0H${f(w)}V${f(h)}H0Z`;
+    for (let j = 0; j + 1 < ys.length; j++) {
+      const y0 = ys[j], y1 = ys[j + 1], ym = (y0 + y1) / 2;
+      let run = null;
+      for (let i = 0; i + 1 < xs.length; i++) {
+        const xm = (xs[i] + xs[i + 1]) / 2;
+        const covered = holes.some(q => xm > q[0] && xm < q[2] && ym > q[1] && ym < q[3]);
+        if (covered && run === null) run = xs[i];
+        if (!covered && run !== null) { d += `M${f(run)} ${f(y0)}H${f(xs[i])}V${f(y1)}H${f(run)}Z`; run = null; }
+      }
+      if (run !== null) d += `M${f(run)} ${f(y0)}H${f(xs[xs.length - 1])}V${f(y1)}H${f(run)}Z`;
+    }
+    return `path(evenodd, "${d}")`;
+  }
+  function rotate(q, v) {  // quaternion (w, x, y, z) applied to v
+    const [w, x, y, z] = q, [a, b, c] = v;
+    const tx = 2 * (y * c - z * b), ty = 2 * (z * a - x * c), tz = 2 * (x * b - y * a);
+    return [a + w * tx + y * tz - z * ty, b + w * ty + z * tx - x * tz, c + w * tz + x * ty - y * tx];
+  }
+  function world(M, name) {
+    // the node's position in three.js's world: its own and its ancestors' poses (none: identity), up to the root
+    // node "" (viser's turn of its Z-up scene into three.js's Y-up)
+    if (!M.nodePoseData[name]) return null;
+    let p = [0, 0, 0];
+    for (let n = name; ; n = n.slice(0, n.lastIndexOf("/"))) {
+      const pose = M.nodePoseData[n];
+      if (pose) {
+        const r = rotate(pose.wxyz, p);
+        p = [r[0] + pose.position[0], r[1] + pose.position[1], r[2] + pose.position[2]];
+      }
+      if (!n) break;
+    }
+    return p;
+  }
+  function frame() {
+    requestAnimationFrame(frame);
+    const M = window.__viserMutable, T = window.__viserSceneTree;
+    if (!M || !T || !M.camera || !M.canvas) return;
+    const cc = M.cameraControl;  // wheel zoom: a bigger step the further out (DOLLY_* in scene.py)
+    if (cc) cc.dollySpeed = %DOLLY% * Math.min(%DOLLYMAX%, Math.max(1, Math.sqrt(cc.distance / %DOLLYNEAR%)));
+    if (!layer || !layer.isConnected) {
+      const host = M.canvas.parentElement;
+      if (!host) return;
+      layer = document.createElement("div");
+      layer.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%;overflow:hidden;" +
+        "pointer-events:none;z-index:1";
+      host.appendChild(layer);
+      boxes.clear();
+    }
+    const st = T.getState();
+    const node = st[NODE];
+    const text = node && node.message && node.message.props ? node.message.props.text : "";
+    if (text !== last) {
+      last = text;
+      try { state = JSON.parse(text || "{}"); } catch (e) { state = {sel: "", tags: []}; }
+    }
+    const cam = M.camera;
+    cam.updateMatrixWorld();
+    const V = cam.matrixWorldInverse.elements, P = cam.projectionMatrix.elements;
+    const W = layer.clientWidth, H = layer.clientHeight;
+    const shown = [];
+    for (const t of state.tags || []) {
+      const p = world(M, t.n);
+      if (!p) continue;
+      const x = V[0] * p[0] + V[4] * p[1] + V[8] * p[2] + V[12], y = V[1] * p[0] + V[5] * p[1] + V[9] * p[2] + V[13],
+            z = V[2] * p[0] + V[6] * p[1] + V[10] * p[2] + V[14];
+      const cx = P[0] * x + P[4] * y + P[8] * z + P[12], cy = P[1] * x + P[5] * y + P[9] * z + P[13],
+            cw = P[3] * x + P[7] * y + P[11] * z + P[15];
+      if (cw <= 1e-6) continue;  // behind the camera
+      shown.push({t, sx: (cx / cw + 1) / 2 * W, sy: (1 - cy / cw) / 2 * H, depth: -z, sel: t.m === state.sel});
+    }
+    shown.sort((a, b) => (b.sel - a.sel) || (Math.abs(a.depth - b.depth) >= TIE ? a.depth - b.depth : b.sx - a.sx));
+    const keep = new Set(), front = [];  // front: the screen boxes of the tags placed so far (all in front)
+    shown.forEach((s, i) => {
+      keep.add(s.t.n);
+      let el = boxes.get(s.t.n);
+      if (!el) { el = document.createElement("div"); el.className = "rl-tag"; layer.appendChild(el); boxes.set(s.t.n, el); }
+      el.style.display = "";
+      if (el.textContent !== s.t.x || !el.__w) {  // its size, measured when its text changes
+        el.textContent = s.t.x;
+        el.__w = el.offsetWidth;
+        el.__h = el.offsetHeight;
+      }
+      el.classList.toggle("rl-sel", s.sel);
+      el.style.zIndex = String(10000 - i);
+      el.style.transform = `translate(${s.sx.toFixed(1)}px,${s.sy.toFixed(1)}px) translate(-50%,-100%)`;
+      const w = el.__w, h = el.__h, x0 = s.sx - w / 2, y0 = s.sy - h;
+      const holes = [];
+      for (const b of front) {
+        const l = Math.max(x0, b[0]), t = Math.max(y0, b[1]), r = Math.min(x0 + w, b[2]), u = Math.min(y0 + h, b[3]);
+        if (r > l && u > t) holes.push([l - x0, t - y0, r - x0, u - y0]);
+      }
+      const clip = holes.length ? cutaway(w, h, holes) : "";
+      if (el.__clip !== clip) { el.style.clipPath = clip; el.__clip = clip; }
+      front.push([x0, y0, x0 + w, y0 + h]);
+    });
+    for (const [n, el] of boxes) if (!keep.has(n)) el.style.display = "none";
+  }
+  requestAnimationFrame(frame);
+})();
+"""
+
+
+def tag_tracks(setting: str, tracks: list[str]) -> list[str] | None:
+    """The tracks a name tag shows (ViewSettings.label_tracks): the names listed (comma separated) that the labels
+    have, in the labels' track order; "" = the first track only; "*" = all (None)."""
+    want = [x.strip() for x in (setting or "").split(",") if x.strip()]
+    if "*" in want:
+        return None
+    if not want:
+        return tracks[:1]
+    return [t for t in tracks if t in want]
+
+
+def _text_width(s: str) -> float:
+    """Upper bound of a line's width in letter heights: wide (East Asian) letters 1, the rest TAG_CHAR_EM."""
+    return sum(1.0 if ord(ch) >= 0x1100 else TAG_CHAR_EM for ch in s)
+
+
+def tag_lines(text: str, width: float = TAG_WRAP_EM) -> str:
+    """The tag text with every line wider than width (letter heights, _text_width) wrapped at the last break
+    (TAG_BREAKS: ' · ', ' + ', '/', '_', ' ') that fits, the break kept at the end of the line
+    ('a_long_motion_' / 'name_01'); a run with no break that fits is cut where it reaches the width."""
+    out = []
+    for line in text.split("\n"):
+        while _text_width(line) > width:
+            fit = 1  # the longest start of the line that fits (at least one letter)
+            while fit < len(line) and _text_width(line[:fit + 1]) <= width:
+                fit += 1
+            cut = 0
+            for b in TAG_BREAKS:
+                k = line.rfind(b, 1, fit - len(b) + 1)
+                if k > 0:
+                    cut = k + len(b)
+                    break
+            cut = cut or fit
+            out.append(line[:cut].rstrip())
+            line = line[cut:].lstrip()
+        out.append(line)
+    return "\n".join(out)
+
+
 FLOOR_MIN_M = 40.0  # the floor is at least this square, centred on what is open (MotionScene._update_floor)
 FLOOR_MARGIN_M = 4.0  # floor beyond the farthest robot path (skeleton beside it, props, name tags)
 DIFF_COLORS = ((245, 205, 40), (240, 130, 30), (220, 40, 35))  # at 1x, 2x, 3x the tolerance
@@ -441,6 +630,21 @@ class MotionScene:
                                                  robot=self.opts.robot)
         self.robots = RobotBatch(server, urdf)  # every robot's meshes, posed together each tick
         self._robot_regions()
+        # name tags: drawn by the view page (TAG_JS) from TAG_NODE's text (_send_tags); tag_selected: the motion the
+        # window has selected (timeline / 계층), whose tag stays in front
+        self.tag_selected: Item | None = None
+        self._tags_sent = ""
+        self._tag_state = server.scene.add_label(TAG_NODE, "", visible=False)
+        ws = getattr(server, "_websock_server", None)
+        if ws is not None:  # kept with the scene: a page that connects later gets it too
+            from viser import _messages
+
+            js = TAG_JS
+            for k, v in {"%NODE%": TAG_NODE, "%TIE%": repr(TAG_TIE_M), "%BGALPHA%": repr(TAG_BG_ALPHA),
+                         "%DOLLY%": repr(DOLLY_SPEED),
+                         "%DOLLYMAX%": repr(DOLLY_MAX_X), "%DOLLYNEAR%": repr(DOLLY_NEAR_M)}.items():
+                js = js.replace(k, v)
+            ws.queue_message(_messages.RunJavascriptMessage(source=js))
         self.overlays = OverlayBatch(server)  # skeletons, support polygons, CoM / ZMP of all motions
         self.compare = CompareSettings()
         self.compare_now: dict | None = None  # the drawn frame's difference (set by tick)
@@ -455,6 +659,12 @@ class MotionScene:
         opened, else None), "item" (one item's state, payload the item), "status" (physics / video
         jobs), "log" (payload text)."""
         self._listeners.append(fn)
+
+    def select_tag(self, item: Item | None) -> None:
+        """The motion the window has selected: its name tag is drawn in front of the others (TAG_JS)."""
+        if item is not self.tag_selected:
+            self.tag_selected = item
+            self._version += 1  # the next tick sends it (_send_tags), playing or not
 
     def emit(self, event: str, payload=None) -> None:
         self._version += 1  # something may look different: the next tick redraws
@@ -1435,10 +1645,11 @@ class MotionScene:
         missing = [n for n, i in zip(names, item.handles["map"]) if i is None]
         if missing:
             self.log(f"  {item.label}: {len(missing)} robot joints not in the motion, held at 0")
-        item.handles["label"] = s.scene.add_label(f"{node}/label", item.label, font_screen_scale=0.9,
-                                                  anchor="bottom-center")
+        # hidden: they carry the name tag's place and text; the view page draws the tag (TAG_JS, _send_tags)
+        item.handles["label"] = s.scene.add_label(f"{node}/label", item.label, visible=False, anchor="bottom-center")
         # the segment labels being played, when names are hidden (shown, they are in the name tag): upwards too
-        item.handles["now"] = s.scene.add_label(f"{node}/now", "", font_screen_scale=1.1, anchor="bottom-center")
+        item.handles["now"] = s.scene.add_label(f"{node}/now", "", visible=False, anchor="bottom-center")
+        item.handles["tag_node"] = node
         self._set_visible(item, "now", False)
         if item.human is not None:  # drawn by the shared skeleton node (OverlayBatch)
             hm = item.human
@@ -1784,6 +1995,7 @@ class MotionScene:
                 T = self.robots.update(T_base, cfg, visible)
                 self.compare_now, pair = None, None
             self._lift_tags(T, visible, pair)
+            self._send_tags()
             self.overlays.update(humans, balance)
 
     def _set_floor(self, box: tuple) -> None:
@@ -1883,10 +2095,32 @@ class MotionScene:
 
     @staticmethod
     def _set_visible(item: Item, key: str, on: bool) -> None:
-        """Visibility of a per-motion node, sent only when it changes."""
+        """Visibility of a per-motion node, sent only when it changes. The name tags ("label", "now") stay hidden
+        nodes: whether their tag shows goes to the view page with their text (_send_tags)."""
         h = item.handles
         if h.get(key) is not None and h.get(f"{key}_visible") != on:
-            h[key].visible = h[f"{key}_visible"] = on
+            h[f"{key}_visible"] = on
+            if key not in ("label", "now"):
+                h[key].visible = on
+
+    def _send_tags(self) -> None:
+        """The name tags the view page draws (TAG_JS): per shown tag its hidden node, text and motion, and the
+        selected motion's node; sent (as TAG_NODE's text) only when it changes."""
+        tags = []
+        for it in self.items:
+            h = it.handles
+            node = h.get("tag_node")
+            if node is None:
+                continue
+            for key in ("label", "now"):
+                text = h.get(f"{key}_shown_text")
+                if h.get(f"{key}_visible") and text:
+                    tags.append({"n": f"{node}/{key}", "x": text, "m": node})
+        sel = self.tag_selected.handles.get("tag_node", "") if self.tag_selected in self.items else ""
+        blob = json.dumps({"sel": sel, "tags": tags}, ensure_ascii=False)
+        if blob != self._tags_sent:
+            self._tags_sent = blob
+            self._tag_state.text = blob
 
     def _pose(self, item: Item):
         """Move this motion's label (and body mesh); returns (robot base transform, joint
@@ -1946,17 +2180,24 @@ class MotionScene:
             text += " · 비교 기준 (반투명)" if role == "A" else " · 비교 대상 (벗어난 부위만 색칠)"
         # one track per line: tags of robots side by side stay narrow
         labels = item.labels  # read once: opening and the API replace it from other threads
-        now = labels.text_at(local, "\n") if labels is not None and inside and v.show_label_now else ""
+        now = ""
+        if labels is not None and inside and v.show_label_now:
+            shown = tag_tracks(v.label_tracks, labels.tracks)  # by default the first track only (e.g. 단계)
+            stem = os.path.basename(item.label)  # a track whose label is the motion's own name says nothing new
+            now = "\n".join(f"{s.track}: {s.label}" if s.track else s.label for s in labels.at(local)
+                            if (shown is None or s.track in shown) and s.label != stem)
         # the segment labels go in the name tag: one tag that grows upwards from above the robot's head, so no
         # number of tracks reaches down over the robot; with names hidden they are a tag of their own, also upwards
         h["now_text"] = now  # the segment text shown over this robot, in whichever tag
         if now and v.show_labels:
             text, now = f"{text}\n{now}", ""
-        if h.get("label_text") != text:  # one message less per robot per frame
-            h["label"].text = h["label_text"] = text
+        if h.get("label_text") != text:
+            h["label_text"] = text
+            h["label_shown_text"] = tag_lines(text)
         self._set_visible(item, "now", bool(now))  # its own tag only with names hidden
         if now and h.get("now_sent") != now:
-            h["now"].text = h["now_sent"] = now
+            h["now_sent"] = now
+            h["now_shown_text"] = tag_lines(now)
         balance = self._pose_balance(item, src.balance, local, R, shift) if role is None else None
         if has_objects:  # with the robot (not beside it with the skeleton): the robot's hands are what is checked
             self._pose_objects(item, local, R, shift, role is None)

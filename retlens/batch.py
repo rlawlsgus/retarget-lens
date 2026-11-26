@@ -515,7 +515,8 @@ def _by_name(files) -> dict:
 def export_origin(path: str) -> dict | None:
     """What a robot motion RetLens saved came from, read from the <name>.json next to its <name>.npz: {"json",
     "source" (the human motion file, which is there), "start_s", "end_s", "retarget"}; None for any other file, or
-    when the JSON names no human motion file that is there (an older save named the retarget cache)."""
+    when the JSON names no human motion file that is there (an older save named the retarget cache). A relative
+    "source" is from the json's folder (a folder shared without the saving PC's paths)."""
     if not path.lower().endswith(".npz"):
         return None
     js = os.path.splitext(path)[0] + ".json"
@@ -527,6 +528,8 @@ def export_origin(path: str) -> dict | None:
     from .compare import human_format
 
     src = j.get("source") if isinstance(j, dict) and j.get("retlens") else None
+    if isinstance(src, str) and src and not os.path.isabs(src):
+        src = os.path.join(os.path.dirname(os.path.abspath(js)), src)
     if not isinstance(src, str) or not src or not os.path.isfile(src) or human_format(src) is None:
         return None
     try:
