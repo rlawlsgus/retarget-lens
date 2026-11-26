@@ -142,7 +142,13 @@ class Batch:
         o = asdict(self.opts)
         rules = o.pop("rules")
         o.pop("smpl_model_dir")
-        rule_id = [os.path.abspath(rules), os.path.getmtime(rules)] if rules and os.path.isfile(rules) else rules
+        # the rule file, and for a labeler its code and data files: editing them labels again
+        if rules and os.path.isfile(rules):
+            from . import autolabel
+
+            rule_id = autolabel.rules_stamp(rules)
+        else:
+            rule_id = rules
         # the retargeting pipeline and the robot model's content: a row made by another pipeline or an
         # edited model is made again (as the retarget cache would retarget)
         from .compare import PIPELINE_VERSION

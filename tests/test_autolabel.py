@@ -1,6 +1,7 @@
 """Automatic labels (retlens/autolabel): movement tracks from a skeleton, named by a rule file."""
 
 import os
+import re
 import sys
 import types
 
@@ -684,3 +685,107 @@ def test_defined_labels_per_track_in_the_files_order():
         {"tracks": [{"track": "자세", "axis": "자세", "skip": ["선 자세→앉음"]}]}))["자세"]]
     assert posture[:len(segment.POSTURE_RANK)] == list(segment.POSTURE_RANK)  # the postures, then the changes
     assert "선 자세→쪼그림" in posture and "선 자세→앉음" not in posture and all("→" in x for x in posture[8:])
+
+
+# ------------------------------------------------------------------ labeler: a project's own function labels
+LABELER_CODE = '''
+import os
+CALLS = []
+
+
+def label(human, context):
+    CALLS.append(context)
+    T = len(human.positions) / human.fps
+    return {"segments": [("단계", "대기", 0.0, 1.0), {"track": "단계", "label": "집기", "start": 1.0, "end": 2.5,
+                         "note": "물체 Box"}, ("단계", "없는 라벨", 2.5, 3.0), ("왼손", "작업", 0.5, T + 5),
+                         ("단계", "빈", 3.0, 3.0)],
+            "notes": ["라벨러 메모", os.path.basename(context["rules"])]}
+
+
+def broken(human, context):
+    return [("단계", "대기", 0.0)]
+
+
+def raises(human, context):
+    raise RuntimeError("모델 파일 없음")
+'''
+
+
+def _labeler_files(tmp_path, function="label", extra=""):
+    (tmp_path / "lab").mkdir(exist_ok=True)
+    (tmp_path / "lab" / "my_labeler.py").write_text(LABELER_CODE, encoding="utf-8")
+    rule = tmp_path / "lab" / "모션.yaml"
+    rule.write_text(f"name: 우리 라벨러\nlabeler: {{file: my_labeler.py, function: {function}}}\n{extra}tracks:\n"
+                    "  - {track: 단계, labels: [대기, {label: 집기, name: 물건 집기, color: '#1baf7a'}]}\n"
+                    "  - {track: 왼손, labels: [휴지, 작업]}\n", encoding="utf-8")
+    return str(rule)
+
+
+def test_a_labeler_file_labels_with_its_own_function(tmp_path):
+    """labeler: RetLens calls the file's function with the motion and the context, and takes its segments as
+    automatic labels: names and colours from the rule file's label list, clipped to the duration, an empty or
+    reversed one left out and a label the list lacks kept and named in notes."""
+    path = _labeler_files(tmp_path)
+    rs = autolabel.check_rules(path)
+    assert rs["labeler"] == {"file": str(tmp_path / "lab" / "my_labeler.py"), "function": "label"}
+    assert rules.defined_labels(rs)["단계"][1] == {"label": "집기", "name": "물건 집기", "color": "#1baf7a"}
+    lab = autolabel.label_motion(_reach(4.0), path, duration=3.5)
+    assert lab.error == "" and lab.auto == "우리 라벨러" and lab.path == path
+    got = [(s.track, s.label, s.start, s.end) for s in lab.segments]
+    assert got == [("단계", "대기", 0.0, 1.0), ("단계", "집기", 1.0, 2.5), ("단계", "없는 라벨", 2.5, 3.0),
+                   ("왼손", "작업", 0.5, 3.5)]
+    picked = lab.segments[1]
+    assert picked.name == "물건 집기" and picked.note == "물체 Box" and picked.color is not None
+    assert "라벨러 메모" in lab.notes and "모션.yaml" in lab.notes
+    assert any("없는 라벨" in n for n in lab.notes) and any("1개는 뺐습니다" in n for n in lab.notes)
+    mod = sys.modules[next(k for k in sys.modules if k.startswith("retlens_labeler_"))]
+    ctx = mod.CALLS[-1]
+    assert ctx["duration"] == 3.5 and ctx["fps"] == segment.FPS and ctx["tracks"]["왼손"] == ["휴지", "작업"]
+    assert ctx["version"] == __import__("retlens").__version__
+
+
+@pytest.mark.parametrize("function, why", [("broken", "구간 1번째를 읽지 못함"), ("raises", "라벨러 오류 (my_labeler.py my_labeler.py:")
+                                           , ("nothere", "함수 nothere가 없습니다")])
+def test_a_labelers_mistakes_are_the_labels_error(tmp_path, function, why):
+    lab = autolabel.label_motion(_reach(2.0), _labeler_files(tmp_path, function))
+    assert why in lab.error and lab.segments == []
+
+
+@pytest.mark.parametrize("data, why", [
+    ({"labeler": "x.txt", "tracks": [{"track": "a", "labels": ["b"]}]}, ".py 파일"),
+    ({"labeler": "none.py", "tracks": [{"track": "a", "labels": ["b"]}]}, "labeler file이 없습니다"),
+    ({"labeler": {"file": "my_labeler.py", "function": "1x"}, "tracks": [{"track": "a", "labels": ["b"]}]}, "함수 이름"),
+    ({"labeler": "my_labeler.py", "params": {}, "tracks": [{"track": "a", "labels": ["b"]}]}, "params를 쓸 수 없습니다"),
+    ({"labeler": "my_labeler.py"}, "labels(라벨 목록)"),
+    ({"labeler": "my_labeler.py", "tracks": [{"track": "a", "rules": [{"label": "b"}]}]}, "track과 labels만"),
+    ({"labeler": "my_labeler.py", "tracks": [{"track": "a", "labels": ["b", "b"]}]}, "같은 라벨이 두 번"),
+    ({"labeler": "my_labeler.py", "tracks": [{"track": "a", "labels": [{"label": "b", "color": "red"}]}]}, "#rrggbb"),
+])
+def test_labeler_rule_file_mistakes(tmp_path, data, why):
+    _labeler_files(tmp_path)
+    with pytest.raises(rules.RuleError, match=re.escape(why)):
+        rules.check(data, base=str(tmp_path / "lab"))
+
+
+def test_a_labeler_imports_again_when_its_file_changes_and_its_folder_is_in_the_cache_stamp(tmp_path):
+    """Editing the labeler's code labels with the new code; its stamp (the dataset cache's key) changes with any
+    file in its folder (a model's weights), not with __pycache__."""
+    path = _labeler_files(tmp_path)
+    s0 = autolabel.rules_stamp(path)
+    assert autolabel.rules_stamp(path) == s0
+    (tmp_path / "lab" / "__pycache__").mkdir()
+    (tmp_path / "lab" / "__pycache__" / "x.pyc").write_bytes(b"0")
+    assert autolabel.rules_stamp(path) == s0
+    (tmp_path / "lab" / "model").mkdir()
+    (tmp_path / "lab" / "model" / "w.npz").write_bytes(b"1")
+    s1 = autolabel.rules_stamp(path)
+    assert s1 != s0 and s1[:2] == s0[:2]
+    code = tmp_path / "lab" / "my_labeler.py"
+    code.write_text(LABELER_CODE.replace('"대기", 0.0, 1.0', '"대기", 0.0, 0.5'), encoding="utf-8")
+    os.utime(code, ns=(os.stat(code).st_atime_ns, os.stat(code).st_mtime_ns + 10**9))
+    lab = autolabel.label_motion(_reach(4.0), path)
+    assert lab.segments[0].end == 0.5
+    assert autolabel.rules_stamp(path) != s1
+    plain = tmp_path / "plain.yaml"
+    plain.write_text("rules: [{label: 서기}]\n", encoding="utf-8")
+    assert len(autolabel.rules_stamp(str(plain))) == 2  # a rule file without a labeler: itself only

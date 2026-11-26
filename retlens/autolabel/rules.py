@@ -27,6 +27,24 @@ A single lane may also be written with rules (and min_seg, approach) at the top 
 Track names and values are checked against segment.VALUES, so a misspelt one is an error, not a
 rule that never holds; so is a key written twice (the second would silently replace the first).
 min_seg joins short labelled pieces to a labelled neighbour; frames no rule labels stay unlabelled.
+
+A labeler instead of rules: a project's own code (a trained model, its own signals) labels the motion,
+and the rule file only says which function and which labels there are:
+
+    name: 우리 라벨러
+    labeler: {file: my_labeler.py, function: label}   # or "my_labeler.py:label"; function defaults to label
+    tracks:                                           # the label definitions: names to pick when editing
+      - {track: 단계, labels: [대기, 이동, {label: 집기, name: 물건 집기, color: "#1baf7a"}]}
+      - {track: 왼손, labels: [휴지, 작업]}
+
+file is relative to the rule file (or absolute) and must exist. RetLens imports it and calls
+function(human, context) for each motion: human is the retlens.motion.SkeletonMotion as opened (its
+source is the motion's file, its objects the props), context a dict (rules: the rule file, duration: s
+or None, fps: segment.FPS, version: RetLens's, tracks: {track: [labels]}). The function returns its
+segments, [(track, label, start s, end s)] or dicts {track, label, start, end, name?, note?}, or
+{"segments": [...], "notes": [...]}. It runs the user's chosen file with the app's rights, like any
+script they run; the file imports what it needs itself (numpy and scipy are there in the installed app).
+A labeler file has only name, labeler and tracks (with track and labels): no rules, axis or params.
 """
 
 from __future__ import annotations
@@ -42,6 +60,10 @@ from . import segment
 
 RULE_KEYS = {"label", "name", "color", "when", "then", "within"}
 TRACK_KEYS = {"track", "rules", "min_seg", "approach", "axis", "skip"}
+LABELER_KEYS = {"name", "labeler", "tracks"}  # a rule file whose labels a labeler gives (see the module notes)
+LABEL_KEYS = {"label", "name", "color"}
+PY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 MAX_NUMBER = 1e5  # s or steps: no time in a rule file is longer than a day (bigger ones overflow frame counts)
 # YAML errors by kind, with no text of the file (PyYAML's own message quotes it)
 YAML_KINDS = {"ScannerError": "들여쓰기·따옴표·특수 문자", "ParserError": "목록·표의 구조",
@@ -113,7 +135,7 @@ def load(path: str) -> dict:
             mark = getattr(e, "problem_mark", None)
             where = f" ({mark.line + 1}행 {mark.column + 1}열)" if mark is not None else ""
             raise RuleError(f"읽지 못함: YAML 형식 오류{where}: {YAML_KINDS.get(type(e).__name__, '형식이 맞지 않음')}") from None
-    return check(data)
+    return check(data, base=os.path.dirname(os.path.abspath(path)))
 
 
 def _num(v, where: str, lo: float = 0.0, integer: bool = False) -> float:
@@ -132,11 +154,14 @@ def _names(v, where: str) -> list[str]:
     return [str(x).strip() for x in v]
 
 
-def check(data) -> dict:
-    """The rules in their one form ({name, params, tracks: [...]}); RuleError on anything off, so
-    applying them later cannot fail."""
+def check(data, base: str | None = None) -> dict:
+    """The rules in their one form ({name, params, tracks: [...]}, and labeler {file, function} for a labeler
+    file); RuleError on anything off, so applying them later cannot fail. base: the folder a labeler file is
+    relative to (the rule file's; the working folder when not given)."""
     if not isinstance(data, dict):
         raise RuleError("규칙 파일의 맨 위는 name / params / tracks (또는 rules)를 가진 표여야 합니다")
+    if "labeler" in data:
+        return _check_labeler(data, base)
     unknown = set(data) - {"name", "params", "tracks"} - TRACK_KEYS
     if unknown:
         raise RuleError(f"모르는 항목: {', '.join(sorted(map(str, unknown)))}")
@@ -189,6 +214,76 @@ def check(data) -> dict:
         if t.get("approach"):
             tr["approach"] = _approach(t["approach"], {r["label"] for r in checked}, where)
         out["tracks"].append(tr)
+    names = [t["track"] for t in out["tracks"]]
+    if len(set(names)) != len(names):
+        raise RuleError("레인 이름이 겹칩니다: " + ", ".join(names))
+    return out
+
+
+def _check_labeler(data: dict, base: str | None) -> dict:
+    """A rule file whose labels a labeler gives: {name, params (the defaults, unused), labeler: {file (absolute),
+    function}, tracks: [{track, labels: [{label, name, color}]}]}."""
+    unknown = set(data) - LABELER_KEYS
+    if unknown:
+        raise RuleError(f"labeler가 있는 규칙 파일에는 {', '.join(sorted(map(str, unknown)))}를 쓸 수 없습니다 "
+                        "(name, labeler, tracks만: 라벨은 라벨러가 붙이고 tracks에는 라벨 정의만 적음)")
+    spec = data["labeler"]
+    if isinstance(spec, str):
+        file, _, fn = spec.partition(":")
+        spec = {"file": file, "function": fn or "label"}
+    if not isinstance(spec, dict) or set(spec) - {"file", "function"} or not isinstance(spec.get("file"), str) \
+            or not spec["file"].strip():
+        raise RuleError("labeler: {file: 파이썬 파일, function: 함수 이름} 또는 '파일.py:함수'여야 합니다")
+    fn = spec.get("function", "label")
+    if not isinstance(fn, str) or not PY_NAME.fullmatch(fn):
+        raise RuleError(f"labeler function: 파이썬 함수 이름이어야 합니다 (받은 값: {fn!r})")
+    file = os.path.expanduser(spec["file"].strip())
+    if not os.path.isabs(file):
+        file = os.path.join(base or os.getcwd(), file)
+    file = os.path.normpath(os.path.abspath(file))
+    if os.path.splitext(file)[1].lower() != ".py":
+        raise RuleError(f"labeler file: .py 파일이어야 합니다 (받은 값: {os.path.basename(file)})")
+    if not os.path.isfile(file):
+        raise RuleError(f"labeler file이 없습니다: {os.path.basename(file)} (규칙 파일 기준 상대 경로나 절대 경로)")
+    tracks = data.get("tracks")
+    if not isinstance(tracks, list) or not tracks:
+        raise RuleError("labeler가 있으면 tracks에 레인마다 track과 labels(라벨 목록)를 적어야 합니다")
+    out = {"name": str(data.get("name") or ""), "params": segment.params(), "tracks": [],
+           "labeler": {"file": file, "function": fn}}
+    for i, t in enumerate(tracks):
+        where = f"tracks[{i}]"
+        if not isinstance(t, dict):
+            raise RuleError(f"{where}: 표여야 합니다")
+        bad = set(t) - {"track", "labels"}
+        if bad:
+            raise RuleError(f"{where}: 모르는 항목 {', '.join(sorted(map(str, bad)))} (labeler가 있으면 track과 labels만)")
+        name = t.get("track")
+        if name is None or isinstance(name, (bool, list, dict)) or not str(name).strip():
+            raise RuleError(f"{where}: track(레인 이름)이 있어야 합니다")
+        name = str(name).strip()
+        labels = t.get("labels")
+        if not isinstance(labels, list) or not labels:
+            raise RuleError(f"레인 '{name}': labels(라벨 목록)가 있어야 합니다")
+        items = []
+        for j, x in enumerate(labels):
+            w = f"레인 '{name}' labels {j + 1}"
+            if isinstance(x, dict):
+                bad = set(x) - LABEL_KEYS
+                if bad:
+                    raise RuleError(f"{w}: 모르는 항목 {', '.join(sorted(map(str, bad)))} (쓸 수 있는 것: label, name, color)")
+                label = x.get("label")
+            else:
+                label, x = x, {}
+            if label is None or isinstance(label, (bool, list, dict)) or not str(label).strip():
+                raise RuleError(f"{w}: 라벨 이름이 있어야 합니다")
+            color = x.get("color")
+            if color is not None and not COLOR.fullmatch(str(color)):
+                raise RuleError(f"{w}: color는 #rrggbb여야 합니다")
+            items.append({"label": str(label).strip(), "name": str(x.get("name") or ""), "color": color})
+        seen = [d["label"] for d in items]
+        if len(set(seen)) != len(seen):
+            raise RuleError(f"레인 '{name}': 같은 라벨이 두 번 있습니다")
+        out["tracks"].append({"track": name, "labels": items})
     names = [t["track"] for t in out["tracks"]]
     if len(set(names)) != len(names):
         raise RuleError("레인 이름이 겹칩니다: " + ", ".join(names))
@@ -277,6 +372,9 @@ def defined_labels(rules: dict) -> dict[str, list[dict]]:
             m_["color"] = m_["color"] or r["color"]
     out = {}
     for t in rules["tracks"]:
+        if "labels" in t:  # a labeler file's lane: its label list as written
+            out[t["track"]] = [dict(d) for d in t["labels"]]
+            continue
         if "axis" in t:
             vals = [str(v) for v in segment.VALUES[t["axis"]]]
             if t["axis"] == "자세":  # the track also holds the changes between postures (the pairs _values takes)
@@ -304,6 +402,8 @@ def _holds(cond: list[dict], tr: dict, T: int) -> np.ndarray:
 def apply(rules: dict, tr: dict, steps: list) -> list[tuple[str, str, int, int, dict]]:
     """[(lane, label, start frame, end frame exclusive, {name, color})] at segment.FPS; frames no rule
     labels are left out. name and color belong to the label: the first given by any of its rules."""
+    if rules.get("labeler"):
+        raise RuleError("labeler 규칙 파일은 규칙으로 적용하지 않습니다 (retlens.autolabel.label_motion이 라벨러를 부름)")
     T = len(tr["이동"])
     out = []
     meta = {}  # per label, in every lane (axis lanes too): the first name and the first color any of its rules gives
